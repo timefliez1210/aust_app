@@ -20,6 +20,14 @@
 
   const floors = ['EG', '1. OG', '2. OG', '3. OG', '4. OG', '5. OG', 'DG', 'UG'];
 
+  const serviceOptions = [
+    { key: 'Montage', icon: 'build' },
+    { key: 'Demontage', icon: 'handyman' },
+    { key: 'Verpackungsservice', icon: 'inventory_2' },
+    { key: 'Einlagerung', icon: 'warehouse' },
+    { key: 'Entsorgung', icon: 'delete_forever' },
+  ];
+
   function toggleService(s: string) {
     if (services.includes(s)) services = services.filter(x => x !== s);
     else services = [...services, s];
@@ -46,13 +54,11 @@
       if (services.length) formData.append('services', services.join(','));
       if (message) formData.append('message', message);
 
-      // Append captured images
       for (const frame of capture.frames) {
         const blob = base64ToBlob(frame.imageBase64, 'image/jpeg');
         formData.append('images', blob, `capture_${frame.timestamp}.jpg`);
       }
 
-      // Append depth maps if available
       for (const frame of capture.frames) {
         if (frame.depthMapBase64) {
           const blob = base64ToBlob(frame.depthMapBase64, 'image/png');
@@ -60,7 +66,6 @@
         }
       }
 
-      // AR metadata
       if (capture.hasDepth) {
         const metadata = capture.frames
           .filter(f => f.intrinsics)
@@ -84,90 +89,216 @@
     for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
     return new Blob([arr], { type: mime });
   }
+
+  let formEl: HTMLFormElement;
 </script>
 
-<div class="min-h-screen bg-bg px-4 py-6">
-  <h1 class="mb-6 text-2xl font-bold text-primary">Umzugsdetails</h1>
+<!-- Glass header -->
+<header class="fixed top-0 w-full z-50 glass-header flex justify-between items-center px-6 h-16 bento-shadow">
+  <div class="flex items-center gap-3">
+    <button onclick={() => goto('/scan')} class="text-white/80 active:scale-95 transition-all">
+      <span class="material-symbols-outlined">arrow_back</span>
+    </button>
+    <h1 class="text-white text-sm font-bold tracking-tight uppercase">Umzugsdetails</h1>
+  </div>
+  <span class="text-secondary-container text-xs font-bold uppercase tracking-widest">Schritt 2/3</span>
+</header>
 
-  <form onsubmit={submit} class="space-y-6">
-    <!-- Departure -->
-    <section class="rounded-xl bg-surface p-4 shadow-sm">
-      <h2 class="mb-3 text-lg font-semibold text-primary">Auszugsadresse</h2>
-      <input bind:value={departureAddress} required placeholder="Straße Nr., PLZ Ort" class="mb-3 w-full rounded-lg border border-border bg-bg px-4 py-3 text-text outline-none focus:border-accent" />
-      <div class="flex gap-3">
-        <div class="flex-1">
-          <label class="mb-1 block text-xs text-text-muted">Etage</label>
-          <select bind:value={departureFloor} class="w-full rounded-lg border border-border bg-bg px-3 py-2.5 text-text">
-            {#each floors as f}<option>{f}</option>{/each}
-          </select>
-        </div>
-        <label class="flex items-center gap-2 text-sm text-text">
-          <input type="checkbox" bind:checked={departureElevator} class="accent-accent" /> Aufzug
-        </label>
-        <label class="flex items-center gap-2 text-sm text-text">
-          <input type="checkbox" bind:checked={departureParkingBan} class="accent-accent" /> Halteverbot
-        </label>
+<main class="pt-20 pb-32 px-5 max-w-lg mx-auto">
+  <!-- Progress bar -->
+  <div class="mb-7 pt-4">
+    <div class="flex justify-between mb-2">
+      <span class="text-primary font-bold text-xs tracking-widest uppercase">Adressdetails</span>
+      <span class="text-secondary font-bold text-xs tracking-widest uppercase">66%</span>
+    </div>
+    <div class="h-2 w-full bg-primary-fixed rounded-full overflow-hidden">
+      <div class="h-full bg-secondary rounded-full transition-all duration-700 ease-out" style="width: 66%;"></div>
+    </div>
+  </div>
+
+  <form bind:this={formEl} onsubmit={submit} class="space-y-4">
+    <!-- Departure address -->
+    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
+      <div class="flex items-center gap-2 mb-4">
+        <span class="material-symbols-outlined text-primary" style="font-size: 20px;">location_on</span>
+        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">Auszugsadresse</h3>
       </div>
-    </section>
-
-    <!-- Arrival -->
-    <section class="rounded-xl bg-surface p-4 shadow-sm">
-      <h2 class="mb-3 text-lg font-semibold text-primary">Einzugsadresse</h2>
-      <input bind:value={arrivalAddress} required placeholder="Straße Nr., PLZ Ort" class="mb-3 w-full rounded-lg border border-border bg-bg px-4 py-3 text-text outline-none focus:border-accent" />
-      <div class="flex gap-3">
-        <div class="flex-1">
-          <label class="mb-1 block text-xs text-text-muted">Etage</label>
-          <select bind:value={arrivalFloor} class="w-full rounded-lg border border-border bg-bg px-3 py-2.5 text-text">
-            {#each floors as f}<option>{f}</option>{/each}
-          </select>
+      <div class="space-y-3">
+        <div>
+          <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Straße & Hausnr., PLZ Ort</label>
+          <input
+            bind:value={departureAddress}
+            required
+            placeholder="Musterstr. 1, 80331 München"
+            class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all duration-200"
+            style="border: none;"
+          />
         </div>
-        <label class="flex items-center gap-2 text-sm text-text">
-          <input type="checkbox" bind:checked={arrivalElevator} class="accent-accent" /> Aufzug
-        </label>
-        <label class="flex items-center gap-2 text-sm text-text">
-          <input type="checkbox" bind:checked={arrivalParkingBan} class="accent-accent" /> Halteverbot
-        </label>
-      </div>
-    </section>
-
-    <!-- Date -->
-    <section class="rounded-xl bg-surface p-4 shadow-sm">
-      <label class="mb-1 block text-sm font-medium text-text-muted">Wunschtermin</label>
-      <input type="date" bind:value={preferredDate} class="w-full rounded-lg border border-border bg-bg px-4 py-3 text-text outline-none focus:border-accent" />
-    </section>
-
-    <!-- Services -->
-    <section class="rounded-xl bg-surface p-4 shadow-sm">
-      <h2 class="mb-3 text-lg font-semibold text-primary">Zusatzleistungen</h2>
-      <div class="flex flex-wrap gap-2">
-        {#each ['Montage', 'Demontage', 'Verpackungsservice', 'Einlagerung', 'Entsorgung'] as s}
+        <div class="flex items-center gap-2">
+          <div class="flex-1">
+            <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Etage</label>
+            <select
+              bind:value={departureFloor}
+              class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface outline-none transition-all"
+              style="border: none;"
+            >
+              {#each floors as f}<option>{f}</option>{/each}
+            </select>
+          </div>
           <button
             type="button"
-            onclick={() => toggleService(s)}
-            class="rounded-full border px-4 py-2 text-sm transition {services.includes(s) ? 'border-accent bg-accent/10 text-accent font-medium' : 'border-border text-text-muted hover:border-accent/50'}"
+            onclick={() => departureElevator = !departureElevator}
+            class="flex flex-col items-center gap-1 px-4 py-2.5 rounded-xl transition-all duration-200 mt-5 {departureElevator ? 'bg-primary text-white' : 'bg-surface-container text-on-surface-variant'}"
           >
-            {s}
+            <span class="material-symbols-outlined" style="font-size: 18px;">elevator</span>
+            <span class="text-[9px] font-bold uppercase tracking-wide">Aufzug</span>
+          </button>
+          <button
+            type="button"
+            onclick={() => departureParkingBan = !departureParkingBan}
+            class="flex flex-col items-center gap-1 px-3 py-2.5 rounded-xl transition-all duration-200 mt-5 {departureParkingBan ? 'bg-secondary-container text-on-secondary-container' : 'bg-surface-container text-on-surface-variant'}"
+          >
+            <span class="material-symbols-outlined" style="font-size: 18px;">traffic</span>
+            <span class="text-[9px] font-bold uppercase tracking-wide leading-none text-center">Halte-<br/>verbot</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Arrival address -->
+    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
+      <div class="flex items-center gap-2 mb-4">
+        <span class="material-symbols-outlined text-secondary" style="font-size: 20px;">flag</span>
+        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">Einzugsadresse</h3>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Straße & Hausnr., PLZ Ort</label>
+          <input
+            bind:value={arrivalAddress}
+            required
+            placeholder="Zielstr. 2, 80331 München"
+            class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all duration-200"
+            style="border: none;"
+          />
+        </div>
+        <div class="flex items-center gap-2">
+          <div class="flex-1">
+            <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Etage</label>
+            <select
+              bind:value={arrivalFloor}
+              class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface outline-none transition-all"
+              style="border: none;"
+            >
+              {#each floors as f}<option>{f}</option>{/each}
+            </select>
+          </div>
+          <button
+            type="button"
+            onclick={() => arrivalElevator = !arrivalElevator}
+            class="flex flex-col items-center gap-1 px-4 py-2.5 rounded-xl transition-all duration-200 mt-5 {arrivalElevator ? 'bg-primary text-white' : 'bg-surface-container text-on-surface-variant'}"
+          >
+            <span class="material-symbols-outlined" style="font-size: 18px;">elevator</span>
+            <span class="text-[9px] font-bold uppercase tracking-wide">Aufzug</span>
+          </button>
+          <button
+            type="button"
+            onclick={() => arrivalParkingBan = !arrivalParkingBan}
+            class="flex flex-col items-center gap-1 px-3 py-2.5 rounded-xl transition-all duration-200 mt-5 {arrivalParkingBan ? 'bg-secondary-container text-on-secondary-container' : 'bg-surface-container text-on-surface-variant'}"
+          >
+            <span class="material-symbols-outlined" style="font-size: 18px;">traffic</span>
+            <span class="text-[9px] font-bold uppercase tracking-wide leading-none text-center">Halte-<br/>verbot</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Preferred date -->
+    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
+      <div class="flex items-center gap-2 mb-4">
+        <span class="material-symbols-outlined text-primary" style="font-size: 20px;">calendar_today</span>
+        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">Wunschtermin</h3>
+      </div>
+      <input
+        type="date"
+        bind:value={preferredDate}
+        class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface outline-none transition-all"
+        style="border: none;"
+      />
+    </div>
+
+    <!-- Services -->
+    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
+      <div class="flex items-center gap-2 mb-4">
+        <span class="material-symbols-outlined text-primary" style="font-size: 20px;">home_repair_service</span>
+        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">Zusatzleistungen</h3>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        {#each serviceOptions as svc}
+          <button
+            type="button"
+            onclick={() => toggleService(svc.key)}
+            class="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold uppercase tracking-wide transition-all duration-200
+              {services.includes(svc.key)
+                ? 'bg-primary text-white'
+                : 'bg-surface-container text-on-surface-variant hover:bg-surface-container-high'}"
+          >
+            <span class="material-symbols-outlined" style="font-size: 14px;">{svc.icon}</span>
+            {svc.key}
           </button>
         {/each}
       </div>
-    </section>
+    </div>
 
-    <!-- Message -->
-    <section class="rounded-xl bg-surface p-4 shadow-sm">
-      <label class="mb-1 block text-sm font-medium text-text-muted">Nachricht (optional)</label>
-      <textarea bind:value={message} rows="3" class="w-full rounded-lg border border-border bg-bg px-4 py-3 text-text outline-none focus:border-accent" placeholder="Besondere Wünsche oder Hinweise..."></textarea>
-    </section>
+    <!-- Notes -->
+    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
+      <div class="flex items-center gap-2 mb-4">
+        <span class="material-symbols-outlined text-primary" style="font-size: 20px;">edit_note</span>
+        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">
+          Besondere Hinweise
+          <span class="text-outline normal-case font-normal tracking-normal text-xs"> (optional)</span>
+        </h3>
+      </div>
+      <textarea
+        bind:value={message}
+        rows="3"
+        placeholder="Antikes Klavier, empfindliche Kunstwerke, Besonderheiten..."
+        class="w-full px-4 py-3 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all resize-none"
+        style="border: none;"
+      ></textarea>
+    </div>
 
     {#if error}
-      <div class="rounded-lg bg-red-50 p-3 text-sm text-error">{error}</div>
+      <div class="rounded-xl bg-error-container p-4 text-sm text-on-error-container flex items-center gap-2">
+        <span class="material-symbols-outlined text-error" style="font-size: 18px;">error</span>
+        {error}
+      </div>
     {/if}
-
-    <button
-      type="submit"
-      disabled={submitting || !departureAddress || !arrivalAddress}
-      class="w-full rounded-xl bg-accent py-4 text-lg font-semibold text-white shadow-md transition hover:bg-accent-hover disabled:opacity-50"
-    >
-      {submitting ? 'Wird gesendet...' : 'Anfrage senden'}
-    </button>
   </form>
+</main>
+
+<!-- Fixed bottom action bar -->
+<div class="fixed bottom-0 left-0 w-full z-50" style="background: rgba(255,255,255,0.92); backdrop-filter: blur(20px); border-top: 1px solid rgba(196,198,207,0.15);">
+  <div class="max-w-lg mx-auto flex items-center justify-between gap-4 px-5 py-4">
+    <button
+      onclick={() => goto('/scan')}
+      class="text-secondary font-bold text-sm tracking-widest uppercase"
+    >
+      Zurück
+    </button>
+    <button
+      type="button"
+      onclick={() => formEl?.requestSubmit()}
+      disabled={submitting || !departureAddress || !arrivalAddress}
+      class="bg-gradient-to-br from-primary to-primary-container text-white px-8 py-3.5 rounded-xl font-bold text-sm tracking-wide uppercase bento-shadow active:scale-95 transition-all disabled:opacity-50 flex items-center gap-2"
+    >
+      {#if submitting}
+        <div class="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin"></div>
+        Wird gesendet...
+      {:else}
+        Anfrage senden
+        <span class="material-symbols-outlined" style="font-size: 16px;">send</span>
+      {/if}
+    </button>
+  </div>
 </div>

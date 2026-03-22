@@ -4,10 +4,30 @@
   let currentSlide = $state(0);
 
   const slides = [
-    { title: 'Gehen Sie durch jeden Raum', desc: 'Öffnen Sie Schränke und zeigen Sie alle Möbel, die umgezogen werden sollen.' },
-    { title: 'Halten Sie die Kamera ruhig', desc: 'Sorgen Sie für gute Beleuchtung und bewegen Sie die Kamera langsam.' },
-    { title: 'Erfassen Sie alle Möbel', desc: 'Fotografieren Sie Möbel aus verschiedenen Winkeln für eine genaue Berechnung.' },
-    { title: 'Wir berechnen Ihr Volumen', desc: 'Unsere KI analysiert Ihre Fotos und erstellt ein maßgeschneidertes Angebot.' },
+    {
+      icon: 'home',
+      color: 'bg-primary',
+      title: 'Jeden Raum zeigen',
+      desc: 'Öffnen Sie Schränke und zeigen Sie alle Möbel, die umgezogen werden sollen.',
+    },
+    {
+      icon: 'lightbulb',
+      color: 'bg-secondary',
+      title: 'Gute Beleuchtung',
+      desc: 'Schalten Sie alle Lampen ein. Helle Räume liefern der KI präzisere Daten.',
+    },
+    {
+      icon: 'photo_camera',
+      color: 'bg-primary-container',
+      title: 'Kamera ruhig halten',
+      desc: 'Bewegen Sie die Kamera langsam und fotografieren Sie aus verschiedenen Winkeln.',
+    },
+    {
+      icon: 'auto_awesome',
+      color: 'bg-secondary-container',
+      title: 'KI erstellt Ihr Angebot',
+      desc: 'Unsere KI analysiert Ihre Fotos und erstellt ein maßgeschneidertes Umzugsangebot.',
+    },
   ];
 
   function next() {
@@ -21,28 +41,41 @@
   }
 </script>
 
-<div class="flex min-h-screen flex-col items-center justify-between px-6 py-12">
-  <button onclick={finish} class="self-end text-sm text-text-muted hover:text-accent">Überspringen</button>
-
-  <div class="flex flex-1 flex-col items-center justify-center text-center">
-    <div class="mb-4 text-6xl">
-      {['🏠', '📷', '🛋️', '🤖'][currentSlide]}
-    </div>
-    <h2 class="mb-3 text-2xl font-bold text-primary">{slides[currentSlide].title}</h2>
-    <p class="max-w-sm text-text-muted">{slides[currentSlide].desc}</p>
+<div class="min-h-screen bg-surface flex flex-col">
+  <!-- Header -->
+  <div class="flex justify-between items-center px-6 pt-12 pb-4">
+    <span class="text-primary font-black tracking-tighter text-lg uppercase">AUST Umzüge</span>
+    <button onclick={finish} class="text-on-surface-variant text-xs font-bold uppercase tracking-widest hover:text-secondary transition-colors">
+      Überspringen
+    </button>
   </div>
 
-  <div class="flex w-full max-w-xs flex-col items-center gap-4">
+  <!-- Slide content -->
+  <div class="flex-1 flex flex-col items-center justify-center px-8 text-center">
+    <div class="w-28 h-28 rounded-3xl {slides[currentSlide].color} flex items-center justify-center mb-8 bento-shadow transition-all duration-300">
+      <span class="material-symbols-outlined text-white" style="font-size: 52px; font-variation-settings: 'FILL' 1;">{slides[currentSlide].icon}</span>
+    </div>
+    <h2 class="text-2xl font-extrabold text-on-surface tracking-tight mb-3">{slides[currentSlide].title}</h2>
+    <p class="text-on-surface-variant leading-relaxed max-w-xs">{slides[currentSlide].desc}</p>
+  </div>
+
+  <!-- Progress + CTA -->
+  <div class="px-8 pb-14 flex flex-col items-center gap-6">
+    <!-- Dots -->
     <div class="flex gap-2">
       {#each slides as _, i}
-        <div class="h-2 w-2 rounded-full transition {i === currentSlide ? 'bg-accent w-6' : 'bg-border'}"></div>
+        <div class="h-2 rounded-full transition-all duration-300 {i === currentSlide ? 'bg-primary w-6' : 'bg-outline-variant w-2'}"></div>
       {/each}
     </div>
+
     <button
       onclick={next}
-      class="w-full rounded-xl bg-accent px-6 py-3 font-semibold text-white shadow-md transition hover:bg-accent-hover"
+      class="w-full max-w-xs h-14 bg-gradient-to-br from-primary to-primary-container text-white font-bold rounded-xl bento-shadow active:scale-95 transition-all duration-200 flex items-center justify-center gap-2"
     >
-      {currentSlide < slides.length - 1 ? 'Weiter' : 'Los geht\'s'}
+      <span>{currentSlide < slides.length - 1 ? 'Weiter' : "Los geht's"}</span>
+      <span class="material-symbols-outlined" style="font-size: 18px;">
+        {currentSlide < slides.length - 1 ? 'arrow_forward' : 'videocam'}
+      </span>
     </button>
   </div>
 </div>

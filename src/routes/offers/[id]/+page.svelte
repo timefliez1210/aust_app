@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { goto } from '$app/navigation';
   import { apiGet, apiPost } from '$lib/api/client';
 
   const quoteId = $derived($page.params.id);
@@ -78,131 +79,229 @@
   }
 
   $effect(() => { load(); });
+
+  function calcVolumePercent(d: QuoteDetail | null): number {
+    if (!d?.estimated_volume_m3) return 0;
+    return Math.min(100, Math.round((d.estimated_volume_m3 / 20) * 100));
+  }
+  const volumePercent = $derived(calcVolumePercent(detail));
 </script>
 
-<div class="min-h-screen bg-bg px-4 py-6">
+<!-- Glass header -->
+<header class="fixed top-0 w-full z-50 glass-header flex items-center gap-4 px-6 h-16 bento-shadow">
+  <button onclick={() => goto('/offers')} class="text-white/80 active:scale-95 transition-all">
+    <span class="material-symbols-outlined">arrow_back</span>
+  </button>
+  <h1 class="text-white text-sm font-bold tracking-tight uppercase flex-1">Angebotsdetails</h1>
+</header>
+
+<main class="pt-24 pb-10 px-5 max-w-lg mx-auto">
   {#if loading}
-    <div class="flex justify-center py-12">
-      <div class="h-8 w-8 animate-spin rounded-full border-4 border-accent border-t-transparent"></div>
+    <div class="flex justify-center py-20">
+      <div class="w-12 h-12 rounded-2xl bg-primary flex items-center justify-center bento-shadow">
+        <div class="w-5 h-5 border-2 border-primary-fixed/40 border-t-primary-fixed rounded-full animate-spin"></div>
+      </div>
     </div>
+
   {:else if detail}
-    <h1 class="mb-4 text-2xl font-bold text-primary">Angebotsdetails</h1>
-
-    <!-- Addresses -->
-    <section class="mb-4 rounded-xl bg-surface p-4 shadow-sm">
-      <div class="mb-3">
-        <p class="text-xs font-medium text-text-muted">VON</p>
-        <p class="text-text">{detail.origin_address?.street}, {detail.origin_address?.postal_code} {detail.origin_address?.city}</p>
-        {#if detail.origin_address?.floor}<p class="text-sm text-text-muted">{detail.origin_address.floor}</p>{/if}
+    <!-- Hero: volume progress -->
+    <section class="mb-6">
+      <div class="flex justify-between items-end mb-3">
+        <div>
+          <span class="text-secondary font-bold text-xs tracking-widest uppercase">Abschluss</span>
+          <h2 class="text-2xl font-extrabold text-on-surface tracking-tight mt-0.5">Fast fertig.</h2>
+        </div>
+        {#if detail.estimated_volume_m3}
+          <div class="text-right">
+            <span class="block text-on-surface-variant text-xs font-medium">Gesamtvolumen</span>
+            <span class="text-xl font-bold text-primary tracking-tight">{detail.estimated_volume_m3.toFixed(1)} m³</span>
+          </div>
+        {/if}
       </div>
-      <div>
-        <p class="text-xs font-medium text-text-muted">NACH</p>
-        <p class="text-text">{detail.destination_address?.street}, {detail.destination_address?.postal_code} {detail.destination_address?.city}</p>
-        {#if detail.destination_address?.floor}<p class="text-sm text-text-muted">{detail.destination_address.floor}</p>{/if}
-      </div>
-    </section>
-
-    <!-- Volume + Date -->
-    <section class="mb-4 flex gap-3">
       {#if detail.estimated_volume_m3}
-        <div class="flex-1 rounded-xl bg-surface p-4 text-center shadow-sm">
-          <p class="text-2xl font-bold text-accent">{detail.estimated_volume_m3.toFixed(1)}</p>
-          <p class="text-xs text-text-muted">m³ Volumen</p>
+        <div class="h-2.5 w-full bg-primary-fixed rounded-full overflow-hidden">
+          <div class="h-full bg-secondary rounded-full transition-all duration-700" style="width: {volumePercent}%;"></div>
         </div>
-      {/if}
-      {#if detail.distance_km}
-        <div class="flex-1 rounded-xl bg-surface p-4 text-center shadow-sm">
-          <p class="text-2xl font-bold text-accent">{detail.distance_km.toFixed(0)}</p>
-          <p class="text-xs text-text-muted">km Entfernung</p>
-        </div>
-      {/if}
-      {#if detail.preferred_date}
-        <div class="flex-1 rounded-xl bg-surface p-4 text-center shadow-sm">
-          <p class="text-lg font-bold text-accent">{formatDate(detail.preferred_date)}</p>
-          <p class="text-xs text-text-muted">Wunschtermin</p>
-        </div>
+        <p class="text-on-surface-variant text-xs mt-1.5">
+          Ihr Inventar belegt ca. {volumePercent}% eines Standard-Umzugswagens.
+        </p>
       {/if}
     </section>
 
-    <!-- Detected Items -->
+    <!-- Route card -->
+    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow mb-4">
+      <div class="flex justify-between items-center mb-4">
+        <h3 class="font-bold text-xs tracking-widest uppercase text-primary">Umzugsroute</h3>
+        {#if detail.distance_km}
+          <span class="flex items-center gap-1 text-xs text-on-surface-variant font-medium">
+            <span class="material-symbols-outlined" style="font-size: 14px;">route</span>
+            {detail.distance_km.toFixed(0)} km
+          </span>
+        {/if}
+      </div>
+      <div class="flex gap-4">
+        <div class="flex flex-col items-center pt-0.5">
+          <span class="material-symbols-outlined text-primary" style="font-size: 20px; font-variation-settings: 'FILL' 1;">location_on</span>
+          <div class="w-px flex-1 my-1 bg-outline-variant/30 min-h-8"></div>
+          <span class="material-symbols-outlined text-secondary" style="font-size: 20px; font-variation-settings: 'FILL' 1;">flag</span>
+        </div>
+        <div class="flex-1 space-y-5">
+          <div>
+            <p class="text-[10px] font-bold text-on-surface-variant uppercase tracking-widest mb-0.5">Von</p>
+            <p class="font-semibold text-on-surface text-sm">
+              {detail.origin_address?.street}, {detail.origin_address?.postal_code} {detail.origin_address?.city}
+            </p>
+            {#if detail.origin_address?.floor}
+              <p class="text-xs text-on-surface-variant mt-0.5">{detail.origin_address.floor}</p>
+            {/if}
+          </div>
+          <div>
+            <p class="text-[10px] font-bold text-on-surface-variant uppercase tracking-widest mb-0.5">Nach</p>
+            <p class="font-semibold text-on-surface text-sm">
+              {detail.destination_address?.street}, {detail.destination_address?.postal_code} {detail.destination_address?.city}
+            </p>
+            {#if detail.destination_address?.floor}
+              <p class="text-xs text-on-surface-variant mt-0.5">{detail.destination_address.floor}</p>
+            {/if}
+          </div>
+        </div>
+      </div>
+      {#if detail.preferred_date}
+        <div class="mt-4 pt-4 flex items-center gap-3" style="border-top: 1px solid rgba(196,198,207,0.15);">
+          <span class="material-symbols-outlined text-primary" style="font-size: 18px;">calendar_today</span>
+          <div>
+            <p class="text-[10px] font-bold text-on-surface-variant uppercase tracking-widest">Wunschtermin</p>
+            <p class="font-semibold text-on-surface text-sm">{formatDate(detail.preferred_date)}</p>
+          </div>
+        </div>
+      {/if}
+    </div>
+
+    <!-- Detected items -->
     {#if detail.estimation?.items?.length}
-      <section class="mb-4 rounded-xl bg-surface p-4 shadow-sm">
-        <h2 class="mb-3 text-lg font-semibold text-primary">Erfasste Gegenstände</h2>
-        <div class="space-y-1">
+      <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow mb-4">
+        <h3 class="font-bold text-xs tracking-widest uppercase text-primary mb-4">Erfasste Gegenstände</h3>
+        <div class="space-y-2.5">
           {#each detail.estimation.items as item}
-            <div class="flex justify-between text-sm">
-              <span class="text-text">{item.quantity > 1 ? `${item.quantity}x ` : ''}{item.name}</span>
-              <span class="text-text-muted">{item.volume_m3.toFixed(2)} m³</span>
+            <div class="flex justify-between items-center">
+              <span class="text-sm text-on-surface">
+                {item.quantity > 1 ? `${item.quantity}× ` : ''}{item.name}
+              </span>
+              <span class="text-xs font-medium text-on-surface-variant bg-surface-container px-2.5 py-0.5 rounded-full">
+                {item.volume_m3.toFixed(2)} m³
+              </span>
             </div>
           {/each}
         </div>
-      </section>
+      </div>
     {/if}
 
-    <!-- Offers -->
+    <!-- Offer cards -->
     {#each detail.offers as offer}
-      <section class="mb-4 rounded-xl bg-surface p-4 shadow-sm">
-        <div class="mb-3 text-center">
-          <p class="text-3xl font-bold text-primary">{formatPrice(offer.price_cents)}</p>
-          <p class="text-sm text-text-muted">inkl. MwSt.</p>
+      <!-- Price summary (dark) -->
+      <div class="bg-primary rounded-2xl p-6 bento-shadow mb-4">
+        <h3 class="text-on-primary-container font-bold text-xs tracking-widest uppercase mb-4">Angebot</h3>
+        <div class="text-center mb-5">
+          <p class="text-white font-black text-4xl tracking-tight">{formatPrice(offer.price_cents)}</p>
+          <p class="text-on-primary-container text-xs mt-1">inkl. 19% MwSt.</p>
         </div>
-        <div class="mb-4 flex justify-center gap-6 text-sm text-text-muted">
-          {#if offer.persons}<span>{offer.persons} Helfer</span>{/if}
-          {#if offer.hours_estimated}<span>{offer.hours_estimated} Stunden</span>{/if}
-          {#if offer.valid_until}<span>Gültig bis {formatDate(offer.valid_until)}</span>{/if}
+        <div class="flex justify-center gap-5 text-xs text-on-primary-container mb-5">
+          {#if offer.persons}
+            <span class="flex items-center gap-1">
+              <span class="material-symbols-outlined" style="font-size: 14px;">group</span>
+              {offer.persons} Helfer
+            </span>
+          {/if}
+          {#if offer.hours_estimated}
+            <span class="flex items-center gap-1">
+              <span class="material-symbols-outlined" style="font-size: 14px;">schedule</span>
+              {offer.hours_estimated} Std.
+            </span>
+          {/if}
+          {#if offer.valid_until}
+            <span class="flex items-center gap-1">
+              <span class="material-symbols-outlined" style="font-size: 14px;">event</span>
+              bis {formatDate(offer.valid_until)}
+            </span>
+          {/if}
         </div>
-
-        <button onclick={() => downloadPdf(offer.id)} class="mb-3 w-full rounded-lg border border-border py-2.5 text-sm font-medium text-accent transition hover:bg-accent/5">
+        <button
+          onclick={() => downloadPdf(offer.id)}
+          class="w-full py-3 rounded-xl text-white text-xs font-bold uppercase tracking-widest transition-colors flex items-center justify-center gap-2"
+          style="background: rgba(255,255,255,0.1);"
+        >
+          <span class="material-symbols-outlined" style="font-size: 16px;">download</span>
           PDF herunterladen
         </button>
+      </div>
 
-        {#if ['draft', 'sent'].includes(offer.status)}
-          <div class="flex gap-3">
-            <button
-              onclick={() => showConfirm = 'accept'}
-              class="flex-1 rounded-lg bg-success py-3 font-semibold text-white transition hover:opacity-90"
-            >
-              Annehmen
-            </button>
-            <button
-              onclick={() => showConfirm = 'reject'}
-              class="flex-1 rounded-lg bg-error py-3 font-semibold text-white transition hover:opacity-90"
-            >
-              Ablehnen
-            </button>
-          </div>
+      <!-- Accept / Reject -->
+      {#if ['draft', 'sent'].includes(offer.status)}
+        <div class="grid grid-cols-2 gap-3 mb-6">
+          <button
+            onclick={() => showConfirm = 'reject'}
+            class="py-4 rounded-xl font-bold text-sm text-on-surface-variant bg-surface-container-lowest bento-shadow active:scale-95 transition-all"
+            style="border: 1px solid rgba(196,198,207,0.2);"
+          >
+            Ablehnen
+          </button>
+          <button
+            onclick={() => showConfirm = 'accept'}
+            class="py-4 rounded-xl font-bold text-sm text-white bg-gradient-to-br from-primary to-primary-container bento-shadow active:scale-95 transition-all"
+          >
+            Annehmen
+          </button>
+        </div>
 
-          <!-- Confirmation Dialog -->
-          {#if showConfirm}
-            <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6">
-              <div class="w-full max-w-sm rounded-2xl bg-surface p-6 shadow-xl">
-                <p class="mb-4 text-center text-lg font-semibold text-primary">
-                  {showConfirm === 'accept' ? 'Angebot annehmen?' : 'Angebot ablehnen?'}
-                </p>
-                <p class="mb-6 text-center text-sm text-text-muted">
-                  {showConfirm === 'accept' ? 'Damit bestätigen Sie den Umzugsauftrag.' : 'Sind Sie sicher? Diese Aktion kann nicht rückgängig gemacht werden.'}
-                </p>
-                <div class="flex gap-3">
-                  <button onclick={() => showConfirm = null} class="flex-1 rounded-lg border border-border py-2.5 font-medium text-text-muted">
-                    Abbrechen
-                  </button>
-                  <button
-                    onclick={() => showConfirm === 'accept' ? acceptOffer(offer.id) : rejectOffer(offer.id)}
-                    disabled={actionLoading}
-                    class="flex-1 rounded-lg py-2.5 font-semibold text-white {showConfirm === 'accept' ? 'bg-success' : 'bg-error'} disabled:opacity-50"
-                  >
-                    {actionLoading ? '...' : showConfirm === 'accept' ? 'Bestätigen' : 'Ablehnen'}
-                  </button>
+        <!-- Confirm dialog -->
+        {#if showConfirm}
+          <div class="fixed inset-0 z-50 flex items-center justify-center px-6" style="background: rgba(0,0,0,0.5);">
+            <div class="w-full max-w-sm bg-surface-container-lowest rounded-3xl p-6 bento-shadow">
+              <div class="text-center mb-6">
+                <div class="w-16 h-16 mx-auto rounded-2xl flex items-center justify-center mb-4 {showConfirm === 'accept' ? 'bg-primary' : 'bg-error-container'}">
+                  <span class="material-symbols-outlined text-3xl {showConfirm === 'accept' ? 'text-white' : 'text-error'}">
+                    {showConfirm === 'accept' ? 'check_circle' : 'cancel'}
+                  </span>
                 </div>
+                <h3 class="text-lg font-bold text-on-surface mb-1">
+                  {showConfirm === 'accept' ? 'Angebot annehmen?' : 'Angebot ablehnen?'}
+                </h3>
+                <p class="text-sm text-on-surface-variant leading-relaxed">
+                  {showConfirm === 'accept'
+                    ? 'Damit bestätigen Sie den Umzugsauftrag verbindlich.'
+                    : 'Diese Aktion kann nicht rückgängig gemacht werden.'}
+                </p>
+              </div>
+              <div class="flex gap-3">
+                <button
+                  onclick={() => showConfirm = null}
+                  class="flex-1 py-3.5 rounded-xl font-medium text-sm text-on-surface-variant bg-surface-container"
+                >
+                  Abbrechen
+                </button>
+                <button
+                  onclick={() => showConfirm === 'accept' ? acceptOffer(offer.id) : rejectOffer(offer.id)}
+                  disabled={actionLoading}
+                  class="flex-1 py-3.5 rounded-xl font-bold text-sm text-white disabled:opacity-50 {showConfirm === 'accept' ? 'bg-gradient-to-br from-primary to-primary-container' : 'bg-error'}"
+                >
+                  {actionLoading ? '...' : showConfirm === 'accept' ? 'Bestätigen' : 'Ablehnen'}
+                </button>
               </div>
             </div>
-          {/if}
-        {:else if offer.status === 'accepted'}
-          <div class="rounded-lg bg-green-50 py-3 text-center font-semibold text-success">Angenommen</div>
-        {:else if offer.status === 'rejected'}
-          <div class="rounded-lg bg-red-50 py-3 text-center font-semibold text-error">Abgelehnt</div>
+          </div>
         {/if}
-      </section>
+
+      {:else if offer.status === 'accepted'}
+        <div class="rounded-2xl bg-surface-container p-5 text-center mb-4">
+          <span class="material-symbols-outlined text-secondary block mb-1" style="font-size: 28px; font-variation-settings: 'FILL' 1;">check_circle</span>
+          <p class="font-bold text-on-surface text-sm">Angebot angenommen</p>
+        </div>
+      {:else if offer.status === 'rejected'}
+        <div class="rounded-2xl bg-error-container p-5 text-center mb-4">
+          <span class="material-symbols-outlined text-error block mb-1" style="font-size: 28px;">cancel</span>
+          <p class="font-bold text-error text-sm">Angebot abgelehnt</p>
+        </div>
+      {/if}
     {/each}
   {/if}
-</div>
+</main>

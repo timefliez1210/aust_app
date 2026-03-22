@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { auth } from '$lib/stores/auth.svelte';
+  import BottomNav from '$lib/components/BottomNav.svelte';
 
   function startScan() {
     if (auth.isAuthenticated) {
@@ -15,40 +16,131 @@
     if (auth.isAuthenticated) goto('/offers');
     else goto('/auth?redirect=/offers');
   }
+
+  const tips = [
+    { icon: 'lightbulb', title: 'Gutes Licht', desc: 'Alle Lampen einschalten.' },
+    { icon: 'door_open', title: 'Türen öffnen', desc: 'Schränke und Lager zeigen.' },
+    { icon: 'cleaning_services', title: 'Freie Wege', desc: 'Möbel gut zugänglich halten.' },
+  ];
 </script>
 
-<div class="flex min-h-screen flex-col items-center justify-center px-6 text-center">
-  <div class="mb-8">
-    <div class="mx-auto mb-4 flex h-20 w-20 items-center justify-center rounded-2xl bg-primary text-3xl font-bold text-white">
-      A
-    </div>
-    <h1 class="mb-2 text-3xl font-bold text-primary">Aust Umzüge</h1>
-    <p class="text-lg text-text-muted">Ihr Umzug, einfach geplant</p>
-  </div>
-
-  <p class="mb-12 max-w-sm text-text-muted">
-    Fotografieren Sie Ihre Wohnung — wir erstellen Ihr persönliches Angebot innerhalb weniger Minuten.
-  </p>
-
-  <div class="flex w-full max-w-xs flex-col gap-4">
-    <button
-      onclick={startScan}
-      class="rounded-xl bg-accent px-6 py-4 text-lg font-semibold text-white shadow-md transition hover:bg-accent-hover active:scale-[0.98]"
-    >
-      Jetzt scannen
+<!-- Glass header -->
+<header class="fixed top-0 w-full z-50 glass-header flex justify-between items-center px-6 h-16 bento-shadow">
+  <h1 class="text-white text-base font-black tracking-tighter uppercase">AUST Umzüge</h1>
+  {#if auth.isAuthenticated}
+    <button onclick={() => auth.logout()} class="flex items-center gap-1.5 text-on-primary-container text-xs font-bold uppercase tracking-wide hover:text-white transition-colors">
+      <span class="material-symbols-outlined" style="font-size: 18px;">logout</span>
     </button>
-    <button
-      onclick={viewOffers}
-      class="rounded-xl border border-border bg-surface px-6 py-4 text-lg font-semibold text-primary shadow-sm transition hover:bg-bg active:scale-[0.98]"
-    >
-      Meine Angebote
+  {:else}
+    <button onclick={() => goto('/auth')} class="text-on-primary-container text-xs font-bold uppercase tracking-widest hover:text-white transition-colors">
+      Anmelden
     </button>
-  </div>
-
-  {#if auth.isAuthenticated && auth.customer}
-    <p class="mt-8 text-sm text-text-muted">
-      Angemeldet als {auth.customer.email}
-      <button onclick={() => auth.logout()} class="ml-2 text-accent hover:underline">Abmelden</button>
-    </p>
   {/if}
-</div>
+</header>
+
+<main class="pt-24 px-5 pb-28 max-w-lg mx-auto">
+  <!-- Welcome -->
+  <section class="mb-8">
+    <p class="text-secondary font-bold tracking-widest uppercase text-xs mb-1.5">Bereit zum Umzug?</p>
+    <h2 class="text-3xl font-extrabold text-on-surface tracking-tight leading-tight">
+      {#if auth.isAuthenticated && auth.customer}
+        Willkommen zurück.
+      {:else}
+        Ihr Umzug, einfach geplant.
+      {/if}
+    </h2>
+    <p class="text-on-surface-variant mt-2 text-sm leading-relaxed max-w-xs">
+      Fotografieren Sie Ihre Wohnung — wir erstellen Ihr persönliches Angebot in Minuten.
+    </p>
+  </section>
+
+  <!-- Bento grid -->
+  <div class="space-y-4">
+    <!-- Hero card -->
+    <div class="relative overflow-hidden rounded-3xl bg-primary text-white p-7 min-h-[220px] flex flex-col justify-end bento-shadow">
+      <div class="absolute inset-0 bg-gradient-to-t from-primary via-primary-container/50 to-primary-container/10"></div>
+      <div class="relative z-10">
+        <div class="inline-flex items-center bg-secondary-container text-on-secondary-container px-3 py-1 rounded-full text-[10px] font-black tracking-widest uppercase mb-3">
+          KI-Scan · Schritt 1
+        </div>
+        <h3 class="text-2xl font-extrabold mb-1.5 tracking-tight">Raumscan starten</h3>
+        <p class="text-primary-fixed/75 text-sm mb-5 max-w-xs leading-relaxed">
+          KI analysiert Ihre Räume per Foto und erstellt ein präzises Angebot.
+        </p>
+        <button
+          onclick={startScan}
+          class="bg-gradient-to-br from-secondary to-secondary/80 text-white font-bold py-3.5 px-7 rounded-xl active:scale-95 transition-all duration-200 shadow-lg text-sm"
+        >
+          Jetzt scannen
+        </button>
+      </div>
+    </div>
+
+    <!-- Two smaller cards -->
+    <div class="grid grid-cols-2 gap-4">
+      <!-- Prep tips -->
+      <div class="rounded-3xl bg-surface-container-lowest p-5 flex flex-col gap-4 bento-shadow">
+        <h4 class="text-on-surface font-bold text-xs uppercase tracking-wider">Vorbereitung</h4>
+        <div class="space-y-3">
+          {#each tips as tip}
+            <div class="flex items-start gap-2.5">
+              <div class="w-7 h-7 rounded-xl bg-surface-container flex items-center justify-center text-primary shrink-0">
+                <span class="material-symbols-outlined" style="font-size: 14px;">{tip.icon}</span>
+              </div>
+              <div>
+                <p class="font-bold text-[11px] text-on-surface leading-tight">{tip.title}</p>
+                <p class="text-[10px] text-on-surface-variant leading-tight mt-0.5">{tip.desc}</p>
+              </div>
+            </div>
+          {/each}
+        </div>
+        <div class="mt-auto pt-3 border-t border-outline-variant/10">
+          <p class="text-[9px] font-bold uppercase tracking-widest text-on-surface-variant">Dauer ca.</p>
+          <div class="flex items-center gap-1.5 mt-0.5">
+            <span class="material-symbols-outlined text-secondary" style="font-size: 14px;">schedule</span>
+            <span class="font-bold text-on-surface text-xs">15–20 Min.</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Offers card -->
+      <div class="rounded-3xl bg-primary-container p-5 flex flex-col justify-between text-white">
+        <span class="material-symbols-outlined text-on-primary-container" style="font-size: 36px;">description</span>
+        <div>
+          <h4 class="font-bold text-sm mb-1">Meine Angebote</h4>
+          <p class="text-[10px] text-on-primary-container leading-tight mb-3">Alle Ihre Umzugsangebote auf einen Blick.</p>
+          <button onclick={viewOffers} class="flex items-center gap-1 text-secondary-container text-[10px] font-black uppercase tracking-widest">
+            Ansehen <span class="material-symbols-outlined" style="font-size: 14px;">arrow_forward</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Status timeline (authenticated) -->
+    {#if auth.isAuthenticated}
+      <section>
+        <h5 class="text-[10px] font-bold tracking-widest uppercase text-on-surface-variant mb-3">Ihr Umzugsstatus</h5>
+        <div class="space-y-2.5">
+          <div class="flex items-center gap-4 bg-surface-container-high/50 p-4 rounded-2xl">
+            <div class="w-2 h-2 rounded-full bg-secondary shrink-0"></div>
+            <div class="flex-grow">
+              <p class="text-sm font-bold text-on-surface">Angemeldet</p>
+              <p class="text-xs text-on-surface-variant">{auth.customer?.email}</p>
+            </div>
+            <span class="material-symbols-outlined text-secondary" style="font-size: 18px; font-variation-settings: 'FILL' 1;">check_circle</span>
+          </div>
+          <div class="flex items-center gap-4 bg-surface-container-lowest p-4 rounded-2xl" style="border: 1px solid rgba(196,198,207,0.1);">
+            <div class="w-2 h-2 rounded-full bg-primary animate-pulse shrink-0"></div>
+            <div class="flex-grow">
+              <p class="text-sm font-bold text-on-surface">Inventurscan</p>
+              <p class="text-xs text-on-surface-variant">Ausstehend — Scan jetzt starten</p>
+            </div>
+            <span class="material-symbols-outlined text-outline-variant" style="font-size: 18px;">pending</span>
+          </div>
+        </div>
+      </section>
+    {/if}
+  </div>
+</main>
+
+<BottomNav />
