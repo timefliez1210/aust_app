@@ -1,0 +1,83 @@
+workflows:
+  ios-distribution:
+    name: iOS — TestFlight
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+
+    environment:
+      vars:
+        BUNDLE_ID: com.aust.umzuege
+        XCODE_WORKSPACE: ios/App/App.xcworkspace
+        XCODE_SCHEME: App
+      node: 20
+      xcode: latest
+      cocoapods: default
+
+    scripts:
+      - name: Install dependencies
+        script: npm ci
+
+      - name: Build web app
+        script: npm run build
+        env:
+          VITE_API_BASE: $VITE_API_BASE
+
+      - name: Capacitor — add & sync iOS
+        script: |
+          npx cap add ios
+          npx cap sync ios
+
+      - name: Install CocoaPods
+        script: cd ios/App && pod install
+
+      - name: Set build number
+        script: |
+          agvtool new-version -all $PROJECT_BUILD_NUMBER
+        working_directory: ios/App
+
+      - name: Build IPA
+        script: |
+          xcode-project use-profiles
+          xcode-project build-ipa \
+            --workspace "$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+
+    publishing:
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        submit_to_testflight: true
+
+  android-build:
+    name: Android — APK
+    max_build_duration: 30
+    instance_type: linux_x2
+
+    environment:
+      node: 20
+      java: 17
+
+    scripts:
+      - name: Install dependencies
+        script: npm ci
+
+      - name: Build web app
+        script: npm run build
+        env:
+          VITE_API_BASE: $VITE_API_BASE
+
+      - name: Capacitor — add & sync Android
+        script: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Build debug APK
+        script: cd android && ./gradlew assembleDebug
+
+    artifacts:
+      - android/app/build/outputs/apk/debug/*.apk
