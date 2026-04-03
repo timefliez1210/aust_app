@@ -32,8 +32,8 @@ workflows:
 
       - name: Set build number
         script: |
-          agvtool new-version -all $PROJECT_BUILD_NUMBER
-        working_directory: ios/App
+          cd ios/App
+          agvtool new-version -all $(($(app-store-connect get-latest-build-number "$BUNDLE_ID") + 1))
 
       - name: Set up code signing
         script: |
