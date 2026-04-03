@@ -25,6 +25,10 @@ workflows:
         script: |
           npx cap add ios
           npx cap sync ios
+          /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string 'Diese App benötigt Zugriff auf die Kamera, um Fotos Ihrer Möbel für die Umzugsplanung aufzunehmen.'" ios/App/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryUsageDescription string 'Diese App benötigt Zugriff auf Ihre Fotos, um Bilder für die Umzugsplanung hochzuladen.'" ios/App/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryAddUsageDescription string 'Diese App speichert aufgenommene Fotos in Ihrer Fotobibliothek.'" ios/App/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'Diese App benötigt Zugriff auf das Mikrofon für die Videoaufnahme.'" ios/App/App/Info.plist
 
       - name: Set build number
         script: |
