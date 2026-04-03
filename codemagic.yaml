@@ -11,7 +11,7 @@ workflows:
         BUNDLE_ID: com.aust.umzuege
         XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_SCHEME: App
-      node: 20
+      node: 22
       xcode: latest
       cocoapods: default
 
@@ -61,7 +61,7 @@ workflows:
     environment:
       groups:
         - app-stuff
-      node: 20
+      node: 22
       java: 17
 
     scripts:
