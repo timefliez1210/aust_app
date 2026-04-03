@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import { apiGet, apiPost } from '$lib/api/client';
+  import { apiGet, apiPost, apiGetBlob } from '$lib/api/client';
 
   const quoteId = $derived($page.params.id);
 
@@ -45,15 +45,15 @@
   async function load() {
     loading = true;
     try {
-      detail = await apiGet<QuoteDetail>(`/api/v1/customer/quotes/${quoteId}`);
+      detail = await apiGet<QuoteDetail>(`/api/v1/customer/inquiries/${quoteId}`);
     } catch { /* ignore */ }
     loading = false;
   }
 
-  async function acceptOffer(offerId: string) {
+  async function acceptOffer() {
     actionLoading = true;
     try {
-      await apiPost(`/api/v1/customer/offers/${offerId}/accept`);
+      await apiPost(`/api/v1/customer/inquiries/${quoteId}/accept`);
       showConfirm = null;
       await load();
     } finally {
@@ -61,10 +61,10 @@
     }
   }
 
-  async function rejectOffer(offerId: string) {
+  async function rejectOffer() {
     actionLoading = true;
     try {
-      await apiPost(`/api/v1/customer/offers/${offerId}/reject`);
+      await apiPost(`/api/v1/customer/inquiries/${quoteId}/reject`);
       showConfirm = null;
       await load();
     } finally {
@@ -72,10 +72,16 @@
     }
   }
 
-  function downloadPdf(offerId: string) {
-    const token = localStorage.getItem('aust_customer_token');
-    const base = import.meta.env.VITE_API_BASE || 'http://localhost:8080';
-    window.open(`${base}/api/v1/customer/offers/${offerId}/pdf?token=${token}`, '_blank');
+  async function downloadPdf() {
+    try {
+      const blob = await apiGetBlob(`/api/v1/customer/inquiries/${quoteId}/pdf`);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Angebot_${quoteId}.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch { /* ignore */ }
   }
 
   $effect(() => { load(); });
@@ -226,7 +232,7 @@
           {/if}
         </div>
         <button
-          onclick={() => downloadPdf(offer.id)}
+          onclick={() => downloadPdf()}
           class="w-full py-3 rounded-xl text-white text-xs font-bold uppercase tracking-widest transition-colors flex items-center justify-center gap-2"
           style="background: rgba(255,255,255,0.1);"
         >
@@ -280,7 +286,7 @@
                   Abbrechen
                 </button>
                 <button
-                  onclick={() => showConfirm === 'accept' ? acceptOffer(offer.id) : rejectOffer(offer.id)}
+                  onclick={() => showConfirm === 'accept' ? acceptOffer() : rejectOffer()}
                   disabled={actionLoading}
                   class="flex-1 py-3.5 rounded-xl font-bold text-sm text-white disabled:opacity-50 {showConfirm === 'accept' ? 'bg-gradient-to-br from-primary to-primary-container' : 'bg-error'}"
                 >

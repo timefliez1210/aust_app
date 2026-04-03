@@ -25,3 +25,11 @@ vite.config.ts.timestamp-*
 # Capacitor native
 ios/
 android/
+
+# Certificates & keys (never commit these)
+*.p12
+*.pem
+*.key
+*.cer
+*.csr
+*.mobileprovision

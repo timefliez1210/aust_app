@@ -73,9 +73,9 @@
         formData.append('ar_metadata', JSON.stringify(metadata));
       }
 
-      const result = await apiPostForm<{ quote_id: string }>('/api/v1/inquiries/mobile', formData);
+      const result = await apiPostForm<{ inquiry_id: string }>('/api/v1/submit/mobile', formData);
       capture.clear();
-      goto(`/scan/processing?quote_id=${result.quote_id}`);
+      goto(`/scan/processing?inquiry_id=${result.inquiry_id}`);
     } catch (e: any) {
       error = e.message || 'Fehler beim Senden';
     } finally {

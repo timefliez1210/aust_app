@@ -1,0 +1,9 @@
+app_identifier("com.aust.umzuege")
+
+# Set these via environment variables or fill in after Apple Developer account is active:
+#   FASTLANE_USER        — your Apple ID email
+#   FASTLANE_TEAM_ID     — 10-character Developer Portal team ID (found in developer.apple.com)
+#   FASTLANE_ITC_TEAM_ID — App Store Connect team ID (numeric, found in appstoreconnect.apple.com)
+apple_id(ENV["FASTLANE_USER"] || "")
+team_id(ENV["FASTLANE_TEAM_ID"] || "")
+itc_team_id(ENV["FASTLANE_ITC_TEAM_ID"] || "")

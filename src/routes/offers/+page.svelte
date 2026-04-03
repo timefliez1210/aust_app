@@ -19,23 +19,29 @@
 
   const statusLabels: Record<string, string> = {
     pending: 'In Bearbeitung',
-    volume_estimated: 'Volumen berechnet',
-    offer_generated: 'Angebot erstellt',
+    info_requested: 'Info angefordert',
+    estimating: 'Wird berechnet',
+    estimated: 'Volumen berechnet',
+    offer_ready: 'Angebot erstellt',
     offer_sent: 'Angebot gesendet',
     accepted: 'Angenommen',
     rejected: 'Abgelehnt',
-    done: 'Erledigt',
+    expired: 'Abgelaufen',
+    cancelled: 'Storniert',
+    scheduled: 'Geplant',
+    completed: 'Abgeschlossen',
+    invoiced: 'Berechnet',
     paid: 'Bezahlt',
   };
 
   function statusStyle(status: string): string {
-    if (['pending', 'volume_estimated'].includes(status))
+    if (['pending', 'info_requested', 'estimating', 'estimated'].includes(status))
       return 'bg-primary-fixed text-primary';
-    if (['offer_generated', 'offer_sent'].includes(status))
+    if (['offer_ready', 'offer_sent'].includes(status))
       return 'bg-secondary-fixed text-secondary';
     if (status === 'accepted')
       return 'bg-surface-container-high text-on-surface';
-    if (status === 'rejected')
+    if (['rejected', 'expired', 'cancelled'].includes(status))
       return 'bg-error-container text-error';
     return 'bg-surface-container text-on-surface-variant';
   }
@@ -53,7 +59,7 @@
   async function load() {
     loading = true;
     try {
-      quotes = await apiGet<QuoteSummary[]>('/api/v1/customer/quotes');
+      quotes = await apiGet<QuoteSummary[]>('/api/v1/customer/inquiries');
     } catch { /* empty */ }
     loading = false;
   }

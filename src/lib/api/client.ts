@@ -70,4 +70,16 @@ export function apiPostForm<T>(path: string, formData: FormData): Promise<T> {
   });
 }
 
+export async function apiGetBlob(path: string): Promise<Blob> {
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const response = await fetch(`${API_BASE}${path}`, { headers });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ message: response.statusText }));
+    throw new ApiError(response.status, body.message || body.error || response.statusText);
+  }
+  return response.blob();
+}
+
 export { ApiError };

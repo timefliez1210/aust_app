@@ -3,34 +3,34 @@
   import { page } from '$app/stores';
   import { apiGet } from '$lib/api/client';
 
-  const quoteId = $derived($page.url.searchParams.get('quote_id'));
+  const inquiryId = $derived($page.url.searchParams.get('inquiry_id'));
 
-  interface QuoteStatus {
+  interface InquiryStatus {
     id: string;
     status: string;
     estimated_volume_m3: number | null;
   }
 
-  let status: QuoteStatus | null = $state(null);
+  let status: InquiryStatus | null = $state(null);
   let pollTimer: ReturnType<typeof setInterval>;
 
   const steps = [
     { key: 'pending', label: 'Bilder hochgeladen', icon: 'cloud_upload' },
-    { key: 'volume_estimated', label: 'Volumen berechnet', icon: 'calculate' },
-    { key: 'offer_generated', label: 'Angebot erstellt', icon: 'description' },
+    { key: 'estimated', label: 'Volumen berechnet', icon: 'calculate' },
+    { key: 'offer_ready', label: 'Angebot erstellt', icon: 'description' },
   ];
 
   function stepDone(stepKey: string): boolean {
     if (!status) return false;
-    const order = ['pending', 'volume_estimated', 'offer_generated', 'offer_sent', 'accepted'];
+    const order = ['pending', 'info_requested', 'estimating', 'estimated', 'offer_ready', 'offer_sent', 'accepted'];
     return order.indexOf(status.status) >= order.indexOf(stepKey);
   }
 
   async function pollStatus() {
-    if (!quoteId) return;
+    if (!inquiryId) return;
     try {
-      status = await apiGet<QuoteStatus>(`/api/v1/customer/quotes/${quoteId}`);
-      if (status && ['offer_generated', 'offer_sent', 'accepted'].includes(status.status)) {
+      status = await apiGet<InquiryStatus>(`/api/v1/customer/inquiries/${inquiryId}`);
+      if (status && ['offer_ready', 'offer_sent', 'accepted'].includes(status.status)) {
         clearInterval(pollTimer);
       }
     } catch { /* keep polling */ }
@@ -43,7 +43,7 @@
   });
 
   const isReady = $derived(
-    status !== null && ['offer_generated', 'offer_sent'].includes((status as QuoteStatus).status)
+    status !== null && ['offer_ready', 'offer_sent'].includes((status as InquiryStatus).status)
   );
 </script>
 
@@ -86,7 +86,7 @@
 
   {#if isReady}
     <button
-      onclick={() => goto(`/offers/${quoteId}`)}
+      onclick={() => goto(`/offers/${inquiryId}`)}
       class="w-full max-w-xs h-14 bg-gradient-to-br from-primary to-primary-container text-white font-bold rounded-xl bento-shadow active:scale-95 transition-all flex items-center justify-center gap-2"
     >
       Angebot ansehen

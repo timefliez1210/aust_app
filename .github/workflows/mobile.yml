@@ -1,0 +1,171 @@
+name: Mobile CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel in-flight runs for the same branch on new push
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. Build the SvelteKit web app ──────────────────────────────────────────
+  web:
+    name: Web build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Build
+        run: npm run build
+        env:
+          # Override in repo Settings → Variables → Actions
+          VITE_API_BASE: ${{ vars.VITE_API_BASE || 'https://api.aust-umzuege.de' }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: build/
+          retention-days: 1
+
+  # ── 2. Android ──────────────────────────────────────────────────────────────
+  android:
+    name: Android build
+    needs: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - run: npm ci
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-build
+          path: build/
+
+      # ios/ and android/ are gitignored — generate fresh each run
+      - run: npx cap add android
+      - run: npx cap sync android
+
+      # ── Release build (main branch only) ──
+      - name: Decode keystore
+        if: github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > android/app/keystore.jks
+
+      - name: Build release AAB
+        if: github.ref == 'refs/heads/main'
+        working-directory: android
+        run: |
+          ./gradlew bundleRelease \
+            -Pandroid.injected.signing.store.file=keystore.jks \
+            -Pandroid.injected.signing.store.password=${{ secrets.ANDROID_STORE_PASSWORD }} \
+            -Pandroid.injected.signing.key.alias=${{ secrets.ANDROID_KEY_ALIAS }} \
+            -Pandroid.injected.signing.key.password=${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      # ── Debug build (PRs) ──
+      - name: Build debug APK
+        if: github.ref != 'refs/heads/main'
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ github.ref == 'refs/heads/main' && 'release' || 'debug' }}
+          path: |
+            android/app/build/outputs/bundle/release/*.aab
+            android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+  # ── 3. iOS ───────────────────────────────────────────────────────────────────
+  ios:
+    name: iOS build
+    needs: web
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-build
+          path: build/
+
+      # Generate the iOS Capacitor project (gitignored, created fresh each run)
+      - run: npx cap add ios
+      - name: Install CocoaPods dependencies
+        working-directory: ios/App
+        run: pod install
+
+      # Set up Ruby + Fastlane (Gemfile.lock ensures reproducible gem versions)
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+
+      # ── Release build + TestFlight upload (main branch only) ──
+      - name: Import signing certificate
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.IOS_CERTIFICATE_BASE64 }}" | base64 --decode > certificate.p12
+          security create-keychain -p "" build.keychain
+          security import certificate.p12 \
+            -k build.keychain \
+            -P "${{ secrets.IOS_CERTIFICATE_PASSWORD }}" \
+            -T /usr/bin/codesign
+          security list-keychains -s build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+          rm certificate.p12
+
+      - name: Install provisioning profile
+        if: github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}" \
+            | base64 --decode \
+            > ~/Library/MobileDevice/Provisioning\ Profiles/aust.mobileprovision
+
+      - name: Build & upload to TestFlight
+        if: github.ref == 'refs/heads/main'
+        run: bundle exec fastlane ios beta
+        env:
+          APPLE_API_KEY_ID:     ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER:     ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          GITHUB_RUN_NUMBER:    ${{ github.run_number }}
+
+      # ── Debug simulator build (PRs) ──
+      - name: Build debug (simulator)
+        if: github.ref != 'refs/heads/main'
+        run: bundle exec fastlane ios build_debug
