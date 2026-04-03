@@ -19,8 +19,6 @@ workflows:
 
       - name: Build web app
         script: npm run build
-        env:
-          VITE_API_BASE: $VITE_API_BASE
 
       - name: Capacitor — add & sync iOS
         script: |
@@ -68,8 +66,6 @@ workflows:
 
       - name: Build web app
         script: npm run build
-        env:
-          VITE_API_BASE: $VITE_API_BASE
 
       - name: Capacitor — add & sync Android
         script: |
