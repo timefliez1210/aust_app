@@ -240,18 +240,32 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - YOLO
 
     private func loadYOLOModel() {
-        // SPM bundles resources into Bundle.module; also check Bundle.main as fallback
-        guard let modelURL = Bundle.module.url(forResource: "YOLOv11n", withExtension: "mlmodelc")
-                          ?? Bundle.module.url(forResource: "YOLOv11n", withExtension: "mlpackage")
-                          ?? Bundle.main.url(forResource: "YOLOv11n", withExtension: "mlmodelc")
-                          ?? Bundle.main.url(forResource: "YOLOv11n", withExtension: "mlpackage") else {
-            print("[DepthCapture] YOLOv11n model not found — detection disabled")
+        // Try multiple names and bundle locations:
+        // - Bundle.module = SPM plugin resources
+        // - Bundle.main   = app bundle (injected by CI)
+        let names = ["yolov8n", "YOLOv8n", "YOLOv11n"]
+        let bundles = [Bundle.module, Bundle.main]
+        var modelURL: URL?
+
+        for name in names {
+            for bundle in bundles {
+                if let url = bundle.url(forResource: name, withExtension: "mlmodelc")
+                          ?? bundle.url(forResource: name, withExtension: "mlpackage") {
+                    modelURL = url
+                    break
+                }
+            }
+            if modelURL != nil { break }
+        }
+
+        guard let url = modelURL else {
+            print("[DepthCapture] YOLO model not found — detection disabled")
             return
         }
         do {
-            let mlModel = try MLModel(contentsOf: modelURL)
+            let mlModel = try MLModel(contentsOf: url)
             visionModel = try VNCoreMLModel(for: mlModel)
-            print("[DepthCapture] YOLO model loaded from \(modelURL.lastPathComponent)")
+            print("[DepthCapture] YOLO model loaded: \(url.lastPathComponent)")
         } catch {
             print("[DepthCapture] Failed to load YOLO model: \(error)")
         }

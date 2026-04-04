@@ -15,11 +15,11 @@ from ultralytics import YOLO
 PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugins" / "capacitor-depth-capture" / "ios" / "Plugin"
 
 def main():
-    model = YOLO("yolo11n.pt")
+    model = YOLO("yolov8n.pt")
     output = model.export(format="coreml", nms=True, imgsz=640)
 
     src = Path(output)
-    dst = PLUGIN_DIR / "YOLOv11n.mlpackage"
+    dst = PLUGIN_DIR / "yolov8n.mlpackage"
 
     if dst.exists():
         import shutil

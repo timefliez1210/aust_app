@@ -23,10 +23,10 @@ workflows:
 
       - name: Export YOLO model to CoreML
         script: |
-          pip3 install ultralytics
+          pip3 install ultralytics coremltools==7.2
           python3 -c "
           from ultralytics import YOLO
-          model = YOLO('yolo11n.pt')
+          model = YOLO('yolov8n.pt')
           model.export(format='coreml', nms=True, imgsz=640)
           "
 
@@ -39,13 +39,13 @@ workflows:
           npx cap sync ios
 
           # Compile YOLO model and add to iOS app resources
-          xcrun coremlcompiler compile yolo11n.mlpackage ios/App/App/
+          xcrun coremlcompiler compile yolov8n.mlpackage ios/App/App/
           ruby -e "
           require 'xcodeproj'
           proj = Xcodeproj::Project.open('ios/App/App.xcodeproj')
           target = proj.targets.find { |t| t.name == 'App' }
           group = proj.main_group.find_subpath('App/App', true)
-          ref = group.new_reference('YOLOv11n.mlmodelc')
+          ref = group.new_reference('yolov8n.mlmodelc')
           target.resources_build_phase.add_file_reference(ref)
           proj.save
           "
