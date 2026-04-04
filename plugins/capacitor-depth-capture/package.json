@@ -23,10 +23,10 @@
     }
   },
   "peerDependencies": {
-    "@capacitor/core": "^6.0.0"
+    "@capacitor/core": ">=6.0.0"
   },
   "devDependencies": {
-    "@capacitor/core": "^6.0.0",
+    "@capacitor/core": ">=6.0.0",
     "typescript": "^5.0.0"
   }
 }
