@@ -34,7 +34,7 @@ workflows:
       - name: Set build number
         script: |
           cd ios/App
-          agvtool new-version -all $BUILD_NUMBER
+          agvtool new-version -all $(git rev-list --count HEAD)
 
       - name: Set up code signing
         script: |
