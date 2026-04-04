@@ -61,7 +61,7 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     private var visionModel: VNCoreMLModel?
     private var furnitureLabels: [String: String] = [:]
     private var currentDetections: [DetectionBox] = []
-    private var detectionLayers: [CAShapeLayer] = []
+    private var detectionLayers: [CALayer] = []
 
     // ── Arc sweep state ───────────────────────────────────────────────────
     private var scanActive = false
