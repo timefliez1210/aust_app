@@ -52,11 +52,6 @@ workflows:
             --project "$XCODE_PROJECT" \
             --scheme "$XCODE_SCHEME"
 
-      - name: Upload to TestFlight
-        script: |
-          app-store-connect publish \
-            --path "$(find build/ios/ipa -name '*.ipa' | head -1)"
-
     artifacts:
       - build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log
