@@ -27,6 +27,8 @@
   let sessionStarted = $state(false);
 
   let hasSupport = $state(false);
+  let rootEl: HTMLDivElement;
+  const savedAncestorBgs: { el: HTMLElement; bg: string }[] = [];
 
   // ── RE catalogue suggestions ──────────────────────────────────────────────
   const CATALOGUE = [
@@ -52,6 +54,16 @@
 
     // Make entire HTML tree transparent so native ARSCNView behind WebView is visible
     document.documentElement.classList.add('ar-mode');
+
+    // Force ALL ancestor backgrounds transparent via inline styles (CSS selectors
+    // can miss SvelteKit wrapper layers). Save originals to restore on destroy.
+    document.body.style.setProperty('background', 'transparent', 'important');
+    let ancestor: HTMLElement | null = rootEl?.parentElement ?? null;
+    while (ancestor && ancestor !== document.documentElement) {
+      savedAncestorBgs.push({ el: ancestor, bg: ancestor.style.background });
+      ancestor.style.setProperty('background', 'transparent', 'important');
+      ancestor = ancestor.parentElement;
+    }
 
     try {
       const support = await DepthCapture.checkSupport();
@@ -99,6 +111,10 @@
 
   onDestroy(() => {
     document.documentElement.classList.remove('ar-mode');
+    document.body.style.background = '';
+    for (const { el, bg } of savedAncestorBgs) {
+      el.style.background = bg;
+    }
     detectHandle?.remove();
     arcHandle?.remove();
     savedHandle?.remove();
@@ -185,7 +201,7 @@
 </script>
 
 <!-- Root: transparent so ARSCNView shows through from behind the WebView -->
-<div class="fixed inset-0" style="background: transparent;">
+<div bind:this={rootEl} class="fixed inset-0 z-[9999]" style="background: transparent;">
 
   <!-- Detection tap targets — invisible divs positioned over native bounding boxes -->
   {#if pageState === 'detection_idle'}
@@ -211,7 +227,7 @@
     class="absolute top-0 left-0 right-0 flex items-center justify-between px-5 z-20"
     style="padding-top: max(20px, env(safe-area-inset-top)); padding-bottom: 12px;"
   >
-    <div class="flex items-center gap-2 bg-black/50 px-3.5 py-1.5 rounded-full backdrop-blur-sm">
+    <div class="flex items-center gap-2 bg-black/70 px-3.5 py-1.5 rounded-full">
       <div class="w-2 h-2 rounded-full {capture.itemCount > 0 ? 'bg-green-400' : 'bg-white/30'}"></div>
       <span class="text-white text-xs font-bold tracking-wider uppercase">
         {capture.itemCount} {capture.itemCount === 1 ? 'Objekt' : 'Objekte'}
@@ -219,7 +235,7 @@
     </div>
     <button
       onclick={closeCapture}
-      class="w-10 h-10 flex items-center justify-center bg-black/50 rounded-full backdrop-blur-sm text-white active:scale-90 transition-transform"
+      class="w-10 h-10 flex items-center justify-center bg-black/70 rounded-full text-white active:scale-90 transition-transform"
       aria-label="Schließen"
     >
       <span class="material-symbols-outlined">close</span>
@@ -243,7 +259,7 @@
     >
       <button
         onclick={cancelDrawMode}
-        class="px-6 py-3 bg-white/20 backdrop-blur-sm rounded-xl text-white font-bold text-sm"
+        class="px-6 py-3 bg-white/20  rounded-xl text-white font-bold text-sm"
       >
         Abbrechen
       </button>
@@ -265,7 +281,7 @@
           von {ARC_MAX}°
         </text>
       </svg>
-      <div class="mt-4 px-5 py-2.5 bg-black/50 backdrop-blur-sm rounded-full">
+      <div class="mt-4 px-5 py-2.5 bg-black/70  rounded-full">
         <span class="text-white text-sm font-medium">
           {#if arcDirection === 'left'}← langsam nach links bewegen
           {:else if arcDirection === 'right'}→ langsam nach rechts bewegen
@@ -280,7 +296,7 @@
     >
       <button
         onclick={cancelArcSweep}
-        class="px-6 py-3 bg-white/20 backdrop-blur-sm rounded-xl text-white font-bold text-sm active:scale-95"
+        class="px-6 py-3 bg-white/20  rounded-xl text-white font-bold text-sm active:scale-95"
       >
         Abbrechen
       </button>
@@ -332,7 +348,7 @@
 
   <!-- ── Manual label input ─────────────────────────────────────────────── -->
   {#if pageState === 'label_input'}
-    <button class="absolute inset-0 z-20 bg-black/40" onclick={cancelItemSelection} aria-label="Schließen"></button>
+    <button class="absolute inset-0 z-20 bg-black/60" onclick={cancelItemSelection} aria-label="Schließen"></button>
     <div
       class="absolute bottom-0 left-0 right-0 z-30 bg-surface-container rounded-t-3xl p-6 shadow-2xl"
       style="padding-bottom: max(24px, env(safe-area-inset-bottom));"
@@ -385,13 +401,13 @@
     >
       {#if detections.length > 0}
         <div class="flex justify-center mb-4">
-          <p class="text-white/70 text-xs bg-black/40 px-3 py-1.5 rounded-full backdrop-blur-sm">
+          <p class="text-white/70 text-xs bg-black/60 px-3 py-1.5 rounded-full">
             Tippe auf ein erkanntes Objekt
           </p>
         </div>
       {:else if sessionStarted}
         <div class="flex justify-center mb-4">
-          <p class="text-white/50 text-xs bg-black/40 px-3 py-1.5 rounded-full backdrop-blur-sm">
+          <p class="text-white/50 text-xs bg-black/60 px-3 py-1.5 rounded-full">
             Richte die Kamera auf Möbel...
           </p>
         </div>
@@ -399,7 +415,7 @@
       <div class="flex items-center justify-between">
         <button
           onclick={enterDrawMode}
-          class="w-12 h-12 flex items-center justify-center bg-black/50 backdrop-blur-sm rounded-xl text-white active:scale-90 transition-transform"
+          class="w-12 h-12 flex items-center justify-center bg-black/70  rounded-xl text-white active:scale-90 transition-transform"
           aria-label="Objekt manuell markieren"
         >
           <span class="material-symbols-outlined">add</span>
