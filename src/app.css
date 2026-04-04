@@ -87,6 +87,15 @@
   box-shadow: 0 32px 32px -4px rgba(2, 36, 72, 0.08);
 }
 
+/* AR camera mode — make entire HTML/body/layout-wrapper transparent
+   so the native ARSCNView behind the WebView is visible.
+   Applied by scan page via document.documentElement.classList.add('ar-mode') */
+html.ar-mode,
+html.ar-mode body,
+html.ar-mode body > div {
+  background: transparent !important;
+}
+
 /* Scrollbar hide */
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }

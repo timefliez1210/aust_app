@@ -47,6 +47,9 @@
   onMount(async () => {
     capture.clear();
 
+    // Make entire HTML tree transparent so native ARSCNView behind WebView is visible
+    document.documentElement.classList.add('ar-mode');
+
     detectHandle = await DepthCapture.addListener('detections', ({ detections: d }) => {
       detections = d;
     });
@@ -84,6 +87,7 @@
   });
 
   onDestroy(() => {
+    document.documentElement.classList.remove('ar-mode');
     detectHandle?.remove();
     arcHandle?.remove();
     savedHandle?.remove();
