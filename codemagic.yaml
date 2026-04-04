@@ -18,6 +18,9 @@ workflows:
       - name: Install dependencies
         script: npm ci
 
+      - name: Build depth-capture plugin
+        script: cd plugins/capacitor-depth-capture && npx tsc
+
       - name: Build web app
         script: npm run build
 
