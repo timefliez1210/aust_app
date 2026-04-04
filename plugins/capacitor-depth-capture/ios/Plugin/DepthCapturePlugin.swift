@@ -1,6 +1,7 @@
 import Foundation
 import Capacitor
 import ARKit
+import AVFoundation
 import Vision
 import UIKit
 import simd
@@ -87,12 +88,20 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func startSession(_ call: CAPPluginCall) {
-        DispatchQueue.main.async { [weak self] in
+        // Request camera permission first — ARKit needs it, and if previously
+        // denied the session would start but show a black feed with no error.
+        AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
             guard let self else { return }
-            self.setupARView()
-            self.loadFurnitureLabels()
-            self.loadYOLOModel()
-            call.resolve()
+            guard granted else {
+                call.reject("Camera permission denied")
+                return
+            }
+            DispatchQueue.main.async {
+                self.setupARView()
+                self.loadFurnitureLabels()
+                self.loadYOLOModel()
+                call.resolve()
+            }
         }
     }
 
