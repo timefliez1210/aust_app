@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { goto } from '$app/navigation';
+  import { Capacitor } from '@capacitor/core';
   import { capture } from '$lib/stores/capture.svelte';
   import { DepthCapture } from '$lib/plugins/depth-capture';
   import type { Detection, BoundingBox, ArcProgress } from '$lib/plugins/depth-capture';
@@ -24,6 +25,9 @@
   let labelInput = $state('');
   let pendingBbox: BoundingBox | null = $state(null);
   let sessionStarted = $state(false);
+
+  // ── Debug diagnostics (remove after camera works) ────────────────────────
+  let debugInfo = $state('');
 
   // ── RE catalogue suggestions ──────────────────────────────────────────────
   const CATALOGUE = [
@@ -50,39 +54,58 @@
     // Make entire HTML tree transparent so native ARSCNView behind WebView is visible
     document.documentElement.classList.add('ar-mode');
 
-    detectHandle = await DepthCapture.addListener('detections', ({ detections: d }) => {
-      detections = d;
-    });
+    // ── Diagnostics ──────────────────────────────────────────────────────
+    const platform = Capacitor.getPlatform();
+    const isNative = Capacitor.isNativePlatform();
+    let diag = `platform=${platform} native=${isNative}`;
 
-    arcHandle = await DepthCapture.addListener('arcProgress', (data: ArcProgress) => {
-      arcDegrees = data.degrees;
-      arcDirection = data.direction;
-    });
+    try {
+      const support = await DepthCapture.checkSupport();
+      diag += ` supported=${support.supported} lidar=${support.hasLidar}`;
+    } catch (e: any) {
+      diag += ` checkSupport_err=${e.message || e}`;
+    }
 
-    savedHandle = await DepthCapture.addListener('itemSaved', async (evt) => {
-      const { items } = await DepthCapture.getAllItems();
-      const latest = items[items.length - 1];
-      if (latest) capture.addItem(latest);
+    try {
+      detectHandle = await DepthCapture.addListener('detections', ({ detections: d }) => {
+        detections = d;
+      });
 
-      if (!capture.intrinsics) {
-        capture.intrinsics = await DepthCapture.getIntrinsics();
-      }
+      arcHandle = await DepthCapture.addListener('arcProgress', (data: ArcProgress) => {
+        arcDegrees = data.degrees;
+        arcDirection = data.direction;
+      });
 
-      savedLabel = evt.label;
-      pageState = 'item_saved';
-      setTimeout(() => {
-        pageState = 'detection_idle';
-        arcDegrees = 0;
-      }, 1500);
-    });
+      savedHandle = await DepthCapture.addListener('itemSaved', async (evt) => {
+        const { items } = await DepthCapture.getAllItems();
+        const latest = items[items.length - 1];
+        if (latest) capture.addItem(latest);
 
-    drawnHandle = await DepthCapture.addListener('boxDrawn', (box) => {
-      pendingBbox = { x: box.x, y: box.y, w: box.w, h: box.h };
-      labelInput = '';
-      pageState = 'label_input';
-    });
+        if (!capture.intrinsics) {
+          capture.intrinsics = await DepthCapture.getIntrinsics();
+        }
 
-    await DepthCapture.startSession();
+        savedLabel = evt.label;
+        pageState = 'item_saved';
+        setTimeout(() => {
+          pageState = 'detection_idle';
+          arcDegrees = 0;
+        }, 1500);
+      });
+
+      drawnHandle = await DepthCapture.addListener('boxDrawn', (box) => {
+        pendingBbox = { x: box.x, y: box.y, w: box.w, h: box.h };
+        labelInput = '';
+        pageState = 'label_input';
+      });
+
+      await DepthCapture.startSession();
+      diag += ' session=OK';
+    } catch (e: any) {
+      diag += ` session_err=${e.message || e}`;
+    }
+
+    debugInfo = diag;
     sessionStarted = true;
   });
 
@@ -193,6 +216,13 @@
         aria-label="Objekt auswählen: {det.germanLabel || det.label}"
       ></button>
     {/each}
+  {/if}
+
+  <!-- ── Debug banner (remove after camera works) ──────────────────────── -->
+  {#if debugInfo}
+    <div class="absolute top-0 left-0 right-0 z-50 bg-red-600 text-white text-[10px] font-mono px-2 py-1 break-all" style="padding-top: env(safe-area-inset-top, 0px);">
+      {debugInfo}
+    </div>
   {/if}
 
   <!-- ── Top bar — safe area aware ─────────────────────────────────────── -->
