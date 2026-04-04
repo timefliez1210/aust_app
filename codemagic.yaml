@@ -21,6 +21,15 @@ workflows:
       - name: Build depth-capture plugin
         script: cd plugins/capacitor-depth-capture && npx tsc
 
+      - name: Export YOLO model to CoreML
+        script: |
+          pip3 install ultralytics
+          python3 -c "
+          from ultralytics import YOLO
+          model = YOLO('yolo11n.pt')
+          model.export(format='coreml', nms=True, imgsz=640)
+          "
+
       - name: Build web app
         script: npm run build
 
@@ -28,6 +37,18 @@ workflows:
         script: |
           npx cap add ios
           npx cap sync ios
+
+          # Compile YOLO model and add to iOS app resources
+          xcrun coremlcompiler compile yolo11n.mlpackage ios/App/App/
+          ruby -e "
+          require 'xcodeproj'
+          proj = Xcodeproj::Project.open('ios/App/App.xcodeproj')
+          target = proj.targets.find { |t| t.name == 'App' }
+          group = proj.main_group.find_subpath('App/App', true)
+          ref = group.new_reference('YOLOv11n.mlmodelc')
+          target.resources_build_phase.add_file_reference(ref)
+          proj.save
+          "
 
           /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string 'Diese App benötigt Zugriff auf die Kamera, um Fotos Ihrer Möbel für die Umzugsplanung aufzunehmen.'" ios/App/App/Info.plist
           /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryUsageDescription string 'Diese App benötigt Zugriff auf Ihre Fotos, um Bilder für die Umzugsplanung hochzuladen.'" ios/App/App/Info.plist
