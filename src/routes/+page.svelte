@@ -25,7 +25,8 @@
 </script>
 
 <!-- Glass header -->
-<header class="fixed top-0 w-full z-50 glass-header flex justify-between items-center px-6 h-16 bento-shadow">
+<header class="fixed top-0 w-full z-50 glass-header bento-shadow" style="padding-top: env(safe-area-inset-top, 0px);">
+  <div class="h-16 flex justify-between items-center px-6">
   <h1 class="text-white text-base font-black tracking-tighter uppercase">AUST Umzüge</h1>
   {#if auth.isAuthenticated}
     <button onclick={() => auth.logout()} class="flex items-center gap-1.5 text-on-primary-container text-xs font-bold uppercase tracking-wide hover:text-white transition-colors">
@@ -36,9 +37,10 @@
       Anmelden
     </button>
   {/if}
+  </div>
 </header>
 
-<main class="pt-24 px-5 pb-28 max-w-lg mx-auto">
+<main class="px-5 max-w-lg mx-auto" style="padding-top: calc(4rem + env(safe-area-inset-top, 0px) + 2rem); padding-bottom: calc(7rem + env(safe-area-inset-bottom, 0px));">
   <!-- Welcome -->
   <section class="mb-8">
     <p class="text-secondary font-bold tracking-widest uppercase text-xs mb-1.5">Bereit zum Umzug?</p>

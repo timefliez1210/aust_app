@@ -94,14 +94,16 @@
 </script>
 
 <!-- Glass header -->
-<header class="fixed top-0 w-full z-50 glass-header flex items-center gap-4 px-6 h-16 bento-shadow">
+<header class="fixed top-0 w-full z-50 glass-header bento-shadow" style="padding-top: env(safe-area-inset-top, 0px);">
+  <div class="h-16 flex items-center gap-4 px-6">
   <button onclick={() => goto('/offers')} class="text-white/80 active:scale-95 transition-all">
     <span class="material-symbols-outlined">arrow_back</span>
   </button>
   <h1 class="text-white text-sm font-bold tracking-tight uppercase flex-1">Angebotsdetails</h1>
+  </div>
 </header>
 
-<main class="pt-24 pb-10 px-5 max-w-lg mx-auto">
+<main class="px-5 max-w-lg mx-auto" style="padding-top: calc(4rem + env(safe-area-inset-top, 0px) + 2rem); padding-bottom: calc(2.5rem + env(safe-area-inset-bottom, 0px));">
   {#if loading}
     <div class="flex justify-center py-20">
       <div class="w-12 h-12 rounded-2xl bg-primary flex items-center justify-center bento-shadow">

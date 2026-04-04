@@ -2,8 +2,9 @@
   import { page } from '$app/stores';
 </script>
 
-<nav class="fixed bottom-0 left-0 w-full h-20 bg-white/90 backdrop-blur-xl flex justify-around items-center px-4 rounded-t-3xl z-50"
-  style="box-shadow: 0 -10px 40px rgba(2, 36, 72, 0.05);">
+<nav class="fixed bottom-0 left-0 w-full bg-white/90 backdrop-blur-xl px-4 rounded-t-3xl z-50"
+  style="padding-bottom: env(safe-area-inset-bottom, 0px); box-shadow: 0 -10px 40px rgba(2, 36, 72, 0.05);">
+  <div class="h-20 flex justify-around items-center">
   <a
     href="/"
     class="flex flex-col items-center justify-center px-5 py-2 rounded-xl transition-all duration-200
@@ -36,4 +37,5 @@
     <span class="material-symbols-outlined" style="font-size: 22px;">description</span>
     <span class="mt-1 text-[10px] font-bold tracking-widest uppercase">Angebote</span>
   </a>
+  </div>
 </nav>

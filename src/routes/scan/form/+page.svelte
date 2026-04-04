@@ -100,17 +100,19 @@
 </script>
 
 <!-- Glass header -->
-<header class="fixed top-0 w-full z-50 glass-header flex justify-between items-center px-6 h-16 bento-shadow">
-  <div class="flex items-center gap-3">
-    <button onclick={() => goto('/scan')} class="text-white/80 active:scale-95 transition-all">
-      <span class="material-symbols-outlined">arrow_back</span>
-    </button>
-    <h1 class="text-white text-sm font-bold tracking-tight uppercase">Umzugsdetails</h1>
+<header class="fixed top-0 w-full z-50 glass-header bento-shadow" style="padding-top: env(safe-area-inset-top, 0px);">
+  <div class="h-16 flex justify-between items-center px-6">
+    <div class="flex items-center gap-3">
+      <button onclick={() => goto('/scan')} class="text-white/80 active:scale-95 transition-all">
+        <span class="material-symbols-outlined">arrow_back</span>
+      </button>
+      <h1 class="text-white text-sm font-bold tracking-tight uppercase">Umzugsdetails</h1>
+    </div>
+    <span class="text-secondary-container text-xs font-bold uppercase tracking-widest">Schritt 2/3</span>
   </div>
-  <span class="text-secondary-container text-xs font-bold uppercase tracking-widest">Schritt 2/3</span>
 </header>
 
-<main class="pt-20 pb-32 px-5 max-w-lg mx-auto">
+<main class="px-5 max-w-lg mx-auto" style="padding-top: calc(4rem + env(safe-area-inset-top, 0px) + 1rem); padding-bottom: calc(8rem + env(safe-area-inset-bottom, 0px));">
   <!-- Progress bar -->
   <div class="mb-7 pt-4">
     <div class="flex justify-between mb-2">
@@ -284,7 +286,7 @@
 </main>
 
 <!-- Fixed bottom action bar -->
-<div class="fixed bottom-0 left-0 w-full z-50" style="background: rgba(255,255,255,0.92); backdrop-filter: blur(20px); border-top: 1px solid rgba(196,198,207,0.15);">
+<div class="fixed bottom-0 left-0 w-full z-50" style="background: rgba(255,255,255,0.92); backdrop-filter: blur(20px); border-top: 1px solid rgba(196,198,207,0.15); padding-bottom: env(safe-area-inset-bottom, 0px);">
   <div class="max-w-lg mx-auto flex items-center justify-between gap-4 px-5 py-4">
     <button
       onclick={() => goto('/scan')}

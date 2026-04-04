@@ -68,7 +68,8 @@
 </script>
 
 <!-- Glass header -->
-<header class="fixed top-0 w-full z-50 glass-header flex justify-between items-center px-6 h-16 bento-shadow">
+<header class="fixed top-0 w-full z-50 glass-header bento-shadow" style="padding-top: env(safe-area-inset-top, 0px);">
+  <div class="h-16 flex justify-between items-center px-6">
   <h1 class="text-white text-base font-black tracking-tight uppercase">Meine Angebote</h1>
   <button
     onclick={() => goto('/scan')}
@@ -77,9 +78,10 @@
     <span class="material-symbols-outlined" style="font-size: 16px;">add</span>
     Neu
   </button>
+  </div>
 </header>
 
-<main class="pt-24 pb-28 px-5 max-w-lg mx-auto">
+<main class="px-5 max-w-lg mx-auto" style="padding-top: calc(4rem + env(safe-area-inset-top, 0px) + 2rem); padding-bottom: calc(7rem + env(safe-area-inset-bottom, 0px));">
   {#if loading}
     <div class="flex justify-center py-20">
       <div class="w-12 h-12 rounded-2xl bg-primary flex items-center justify-center bento-shadow">
