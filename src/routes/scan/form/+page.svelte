@@ -54,26 +54,32 @@
       if (services.length) formData.append('services', services.join(','));
       if (message) formData.append('message', message);
 
-      for (const frame of capture.frames) {
-        const blob = base64ToBlob(frame.imageBase64, 'image/jpeg');
-        formData.append('images', blob, `capture_${frame.timestamp}.jpg`);
+      // AR item manifest — tells the backend which frames belong to which item
+      formData.append('item_manifest', JSON.stringify(
+        capture.items.map(item => ({ label: item.label, frame_count: item.frames.length }))
+      ));
+      if (capture.intrinsics) {
+        formData.append('intrinsics', JSON.stringify(capture.intrinsics));
       }
+      // Flat list of poses in the same order as images[]
+      formData.append('poses', JSON.stringify(
+        capture.items.flatMap(item => item.frames.map(f => f.pose ?? null))
+      ));
 
-      for (const frame of capture.frames) {
-        if (frame.depthMapBase64) {
-          const blob = base64ToBlob(frame.depthMapBase64, 'image/png');
-          formData.append('depth_maps', blob, `depth_${frame.timestamp}.png`);
+      let idx = 0;
+      for (const item of capture.items) {
+        for (const frame of item.frames) {
+          const blob = base64ToBlob(frame.imageBase64, 'image/jpeg');
+          formData.append('images', blob, `item_${item.id}_frame_${idx}.jpg`);
+          if (frame.depthMapBase64) {
+            const dBlob = base64ToBlob(frame.depthMapBase64, 'image/png');
+            formData.append('depth_maps', dBlob, `item_${item.id}_depth_${idx}.png`);
+          }
+          idx++;
         }
       }
 
-      if (capture.hasDepth) {
-        const metadata = capture.frames
-          .filter(f => f.intrinsics)
-          .map(f => ({ timestamp: f.timestamp, intrinsics: f.intrinsics, width: f.width, height: f.height }));
-        formData.append('ar_metadata', JSON.stringify(metadata));
-      }
-
-      const result = await apiPostForm<{ inquiry_id: string }>('/api/v1/submit/mobile', formData);
+      const result = await apiPostForm<{ inquiry_id: string }>('/api/v1/submit/mobile/ar', formData);
       capture.clear();
       goto(`/scan/processing?inquiry_id=${result.inquiry_id}`);
     } catch (e: any) {
