@@ -213,6 +213,9 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         webView.isOpaque = false
         webView.backgroundColor = .clear
         webView.scrollView.backgroundColor = .clear
+        if #available(iOS 15.0, *) {
+            webView.underPageBackgroundColor = .clear
+        }
 
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = []

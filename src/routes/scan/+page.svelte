@@ -200,22 +200,26 @@
   let arcPath = $derived(describeArc(arcDegrees));
 </script>
 
-<!-- Root: transparent so ARSCNView shows through from behind the WebView -->
-<div bind:this={rootEl} class="fixed inset-0 z-[9999]" style="background: transparent;">
+<!-- Root: transparent, with translateZ(0) to force GPU compositing layer in WKWebView -->
+<div
+  bind:this={rootEl}
+  style="position: fixed; inset: 0; z-index: 9999; background: transparent; -webkit-transform: translateZ(0); transform: translateZ(0);"
+>
 
   <!-- Detection tap targets — invisible divs positioned over native bounding boxes -->
   {#if pageState === 'detection_idle'}
     {#each detections as det}
       <button
         onclick={() => tapDetection(det)}
-        class="absolute"
         style="
+          position: absolute;
           left: {det.bbox.x * 100}%;
           top: {det.bbox.y * 100}%;
           width: {det.bbox.w * 100}%;
           height: {det.bbox.h * 100}%;
           background: transparent;
           border: none;
+          -webkit-transform: translateZ(0);
         "
         aria-label="Objekt auswählen: {det.germanLabel || det.label}"
       ></button>
@@ -223,19 +227,27 @@
   {/if}
 
   <!-- ── Top bar — safe area aware ─────────────────────────────────────── -->
-  <div
-    class="absolute top-0 left-0 right-0 flex items-center justify-between px-5 z-20"
-    style="padding-top: max(20px, env(safe-area-inset-top)); padding-bottom: 12px;"
-  >
-    <div class="flex items-center gap-2 bg-black/70 px-3.5 py-1.5 rounded-full">
-      <div class="w-2 h-2 rounded-full {capture.itemCount > 0 ? 'bg-green-400' : 'bg-white/30'}"></div>
-      <span class="text-white text-xs font-bold tracking-wider uppercase">
+  <div style="
+    position: absolute; top: 0; left: 0; right: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: max(20px, env(safe-area-inset-top)) 20px 12px 20px;
+    -webkit-transform: translateZ(0);
+  ">
+    <div style="
+      display: flex; align-items: center; gap: 8px;
+      background: rgba(0,0,0,0.8); padding: 6px 14px; border-radius: 999px;
+    ">
+      <div style="width: 8px; height: 8px; border-radius: 50%; background: {capture.itemCount > 0 ? '#4ade80' : 'rgba(255,255,255,0.3)'};"></div>
+      <span style="color: white; font-size: 12px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;">
         {capture.itemCount} {capture.itemCount === 1 ? 'Objekt' : 'Objekte'}
       </span>
     </div>
     <button
       onclick={closeCapture}
-      class="w-10 h-10 flex items-center justify-center bg-black/70 rounded-full text-white active:scale-90 transition-transform"
+      style="
+        width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+        background: rgba(0,0,0,0.8); border-radius: 50%; border: none; color: white;
+      "
       aria-label="Schließen"
     >
       <span class="material-symbols-outlined">close</span>
@@ -244,23 +256,18 @@
 
   <!-- ── Draw mode ──────────────────────────────────────────────────────── -->
   {#if pageState === 'draw_mode'}
-    <div class="absolute inset-0 z-10 pointer-events-none" style="background: rgba(0,0,0,0.3);">
-      <div class="absolute inset-8" style="
+    <div style="position: absolute; inset: 0; z-index: 10; pointer-events: none; background: rgba(0,0,0,0.3); -webkit-transform: translateZ(0);">
+      <div style="
+        position: absolute; inset: 32px;
         background-image: radial-gradient(circle, rgba(255,255,255,0.35) 1px, transparent 1px);
         background-size: 24px 24px;
       "></div>
-      <p class="absolute bottom-36 left-0 right-0 text-white/80 text-sm font-medium text-center px-8">
+      <p style="position: absolute; bottom: 144px; left: 0; right: 0; color: rgba(255,255,255,0.8); font-size: 14px; font-weight: 500; text-align: center; padding: 0 32px;">
         Ziehe ein Rechteck um das Objekt
       </p>
     </div>
-    <div
-      class="absolute bottom-0 left-0 right-0 flex justify-center z-20 pointer-events-auto"
-      style="padding-bottom: max(24px, env(safe-area-inset-bottom));"
-    >
-      <button
-        onclick={cancelDrawMode}
-        class="px-6 py-3 bg-white/20  rounded-xl text-white font-bold text-sm"
-      >
+    <div style="position: absolute; bottom: 0; left: 0; right: 0; display: flex; justify-content: center; z-index: 20; pointer-events: auto; padding-bottom: max(24px, env(safe-area-inset-bottom)); -webkit-transform: translateZ(0);">
+      <button onclick={cancelDrawMode} style="padding: 12px 24px; background: rgba(255,255,255,0.2); border-radius: 12px; border: none; color: white; font-weight: 700; font-size: 14px;">
         Abbrechen
       </button>
     </div>
@@ -268,21 +275,17 @@
 
   <!-- ── Arc sweep overlay ──────────────────────────────────────────────── -->
   {#if pageState === 'arc_sweep'}
-    <div class="absolute inset-0 flex flex-col items-center justify-center z-10 pointer-events-none">
-      <svg width="300" height="300" class="drop-shadow-lg">
+    <div style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; pointer-events: none; -webkit-transform: translateZ(0);">
+      <svg width="300" height="300">
         <circle cx="150" cy="150" r={ARC_R} fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="4" />
         {#if arcPath}
           <path d={arcPath} fill="none" stroke="white" stroke-width="5" stroke-linecap="round" />
         {/if}
-        <text x="150" y="155" text-anchor="middle" fill="white" font-size="28" font-weight="bold" font-family="system-ui">
-          {Math.round(arcDegrees)}°
-        </text>
-        <text x="150" y="178" text-anchor="middle" fill="rgba(255,255,255,0.6)" font-size="13" font-family="system-ui">
-          von {ARC_MAX}°
-        </text>
+        <text x="150" y="155" text-anchor="middle" fill="white" font-size="28" font-weight="bold" font-family="system-ui">{Math.round(arcDegrees)}°</text>
+        <text x="150" y="178" text-anchor="middle" fill="rgba(255,255,255,0.6)" font-size="13" font-family="system-ui">von {ARC_MAX}°</text>
       </svg>
-      <div class="mt-4 px-5 py-2.5 bg-black/70  rounded-full">
-        <span class="text-white text-sm font-medium">
+      <div style="margin-top: 16px; padding: 10px 20px; background: rgba(0,0,0,0.7); border-radius: 999px;">
+        <span style="color: white; font-size: 14px; font-weight: 500;">
           {#if arcDirection === 'left'}← langsam nach links bewegen
           {:else if arcDirection === 'right'}→ langsam nach rechts bewegen
           {:else if arcDirection === 'up'}↑ langsam nach oben bewegen
@@ -290,14 +293,8 @@
         </span>
       </div>
     </div>
-    <div
-      class="absolute bottom-0 left-0 right-0 flex justify-center z-20"
-      style="padding-bottom: max(24px, env(safe-area-inset-bottom));"
-    >
-      <button
-        onclick={cancelArcSweep}
-        class="px-6 py-3 bg-white/20  rounded-xl text-white font-bold text-sm active:scale-95"
-      >
+    <div style="position: absolute; bottom: 0; left: 0; right: 0; display: flex; justify-content: center; z-index: 20; padding-bottom: max(24px, env(safe-area-inset-bottom)); -webkit-transform: translateZ(0);">
+      <button onclick={cancelArcSweep} style="padding: 12px 24px; background: rgba(255,255,255,0.2); border-radius: 12px; border: none; color: white; font-weight: 700; font-size: 14px;">
         Abbrechen
       </button>
     </div>
@@ -305,41 +302,37 @@
 
   <!-- ── Item saved flash ────────────────────────────────────────────────── -->
   {#if pageState === 'item_saved'}
-    <div class="absolute inset-0 flex flex-col items-center justify-center z-30" style="background: rgba(0,0,0,0.6);">
-      <div class="w-20 h-20 rounded-full bg-green-500 flex items-center justify-center mb-4">
-        <span class="material-symbols-outlined text-white" style="font-size: 40px; font-variation-settings: 'FILL' 1;">check</span>
+    <div style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 30; background: rgba(0,0,0,0.6); -webkit-transform: translateZ(0);">
+      <div style="width: 80px; height: 80px; border-radius: 50%; background: #22c55e; display: flex; align-items: center; justify-content: center; margin-bottom: 16px;">
+        <span class="material-symbols-outlined" style="color: white; font-size: 40px; font-variation-settings: 'FILL' 1;">check</span>
       </div>
-      <p class="text-white text-xl font-bold">{savedLabel}</p>
-      <p class="text-white/70 text-sm mt-1">gespeichert</p>
+      <p style="color: white; font-size: 20px; font-weight: 700;">{savedLabel}</p>
+      <p style="color: rgba(255,255,255,0.7); font-size: 14px; margin-top: 4px;">gespeichert</p>
     </div>
   {/if}
 
   <!-- ── Item selected bottom sheet ─────────────────────────────────────── -->
   {#if pageState === 'item_selected' && selectedDetection}
-    <button class="absolute inset-0 z-20" onclick={cancelItemSelection} aria-label="Schließen"></button>
-    <div
-      class="absolute bottom-0 left-0 right-0 z-30 bg-surface-container rounded-t-3xl p-6 shadow-2xl"
-      style="padding-bottom: max(24px, env(safe-area-inset-bottom));"
-    >
-      <div class="w-10 h-1 rounded-full bg-outline/30 mx-auto mb-5"></div>
-      <p class="text-xs font-bold uppercase tracking-widest text-outline mb-1">Erkanntes Objekt</p>
-      <p class="text-on-surface text-xl font-bold mb-1">
+    <button style="position: absolute; inset: 0; z-index: 20; background: transparent; border: none;" onclick={cancelItemSelection} aria-label="Schließen"></button>
+    <div style="
+      position: absolute; bottom: 0; left: 0; right: 0; z-index: 30;
+      background: #eceef0; border-radius: 24px 24px 0 0; padding: 24px;
+      padding-bottom: max(24px, env(safe-area-inset-bottom));
+      -webkit-transform: translateZ(0);
+    ">
+      <div style="width: 40px; height: 4px; border-radius: 2px; background: rgba(116,119,127,0.3); margin: 0 auto 20px;"></div>
+      <p style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #74777f; margin-bottom: 4px;">Erkanntes Objekt</p>
+      <p style="font-size: 20px; font-weight: 700; color: #191c1e; margin-bottom: 4px;">
         {selectedDetection.germanLabel || selectedDetection.label}
       </p>
-      <p class="text-outline text-sm mb-6">
-        {Math.round(selectedDetection.confidence * 100)}% Konfidenz · 28° Sweep
+      <p style="font-size: 14px; color: #74777f; margin-bottom: 24px;">
+        {Math.round(selectedDetection.confidence * 100)}% Konfidenz
       </p>
-      <div class="flex gap-3">
-        <button
-          onclick={cancelItemSelection}
-          class="flex-1 py-3.5 rounded-xl bg-surface-container-high text-on-surface-variant font-bold text-sm"
-        >
+      <div style="display: flex; gap: 12px;">
+        <button onclick={cancelItemSelection} style="flex: 1; padding: 14px; border-radius: 12px; background: #e6e8ea; border: none; color: #43474e; font-weight: 700; font-size: 14px;">
           Abbrechen
         </button>
-        <button
-          onclick={confirmItem}
-          class="flex-1 py-3.5 rounded-xl bg-primary text-white font-bold text-sm active:scale-95 transition-transform"
-        >
+        <button onclick={confirmItem} style="flex: 1; padding: 14px; border-radius: 12px; background: #022448; border: none; color: white; font-weight: 700; font-size: 14px;">
           Erfassen →
         </button>
       </div>
@@ -348,45 +341,36 @@
 
   <!-- ── Manual label input ─────────────────────────────────────────────── -->
   {#if pageState === 'label_input'}
-    <button class="absolute inset-0 z-20 bg-black/60" onclick={cancelItemSelection} aria-label="Schließen"></button>
-    <div
-      class="absolute bottom-0 left-0 right-0 z-30 bg-surface-container rounded-t-3xl p-6 shadow-2xl"
-      style="padding-bottom: max(24px, env(safe-area-inset-bottom));"
-    >
-      <div class="w-10 h-1 rounded-full bg-outline/30 mx-auto mb-5"></div>
-      <p class="text-xs font-bold uppercase tracking-widest text-outline mb-3">Objekt benennen</p>
+    <button style="position: absolute; inset: 0; z-index: 20; background: rgba(0,0,0,0.4); border: none;" onclick={cancelItemSelection} aria-label="Schließen"></button>
+    <div style="
+      position: absolute; bottom: 0; left: 0; right: 0; z-index: 30;
+      background: #eceef0; border-radius: 24px 24px 0 0; padding: 24px;
+      padding-bottom: max(24px, env(safe-area-inset-bottom));
+      -webkit-transform: translateZ(0);
+    ">
+      <div style="width: 40px; height: 4px; border-radius: 2px; background: rgba(116,119,127,0.3); margin: 0 auto 20px;"></div>
+      <p style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #74777f; margin-bottom: 12px;">Objekt benennen</p>
       <!-- svelte-ignore a11y_autofocus -->
       <input
         bind:value={labelInput}
         placeholder="z.B. Schrank, Sofa, Bett..."
-        class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none mb-3"
-        style="border: none;"
+        style="width: 100%; height: 48px; padding: 0 16px; background: #e6e8ea; border-radius: 12px; border: none; color: #191c1e; font-size: 16px; outline: none; margin-bottom: 12px; box-sizing: border-box;"
         autofocus
       />
       {#if catalogueSuggestions.length > 0}
-        <div class="flex flex-wrap gap-2 mb-4">
+        <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;">
           {#each catalogueSuggestions as sug}
-            <button
-              onclick={() => { labelInput = sug; }}
-              class="px-3 py-1.5 rounded-lg bg-surface-container-high text-on-surface text-sm font-medium active:bg-primary active:text-white transition-colors"
-            >
+            <button onclick={() => { labelInput = sug; }} style="padding: 6px 12px; border-radius: 8px; background: #e6e8ea; border: none; color: #191c1e; font-size: 14px; font-weight: 500;">
               {sug}
             </button>
           {/each}
         </div>
       {/if}
-      <div class="flex gap-3">
-        <button
-          onclick={cancelItemSelection}
-          class="flex-1 py-3.5 rounded-xl bg-surface-container-high text-on-surface-variant font-bold text-sm"
-        >
+      <div style="display: flex; gap: 12px;">
+        <button onclick={cancelItemSelection} style="flex: 1; padding: 14px; border-radius: 12px; background: #e6e8ea; border: none; color: #43474e; font-weight: 700; font-size: 14px;">
           Abbrechen
         </button>
-        <button
-          onclick={confirmManualLabel}
-          disabled={!labelInput.trim()}
-          class="flex-1 py-3.5 rounded-xl bg-primary text-white font-bold text-sm active:scale-95 transition-transform disabled:opacity-50"
-        >
+        <button onclick={confirmManualLabel} disabled={!labelInput.trim()} style="flex: 1; padding: 14px; border-radius: 12px; background: {labelInput.trim() ? '#022448' : 'rgba(2,36,72,0.4)'}; border: none; color: white; font-weight: 700; font-size: 14px;">
           Erfassen →
         </button>
       </div>
@@ -395,27 +379,31 @@
 
   <!-- ── Bottom action bar (detection_idle only) ────────────────────────── -->
   {#if pageState === 'detection_idle'}
-    <div
-      class="absolute bottom-0 left-0 right-0 z-20 px-5"
-      style="padding-bottom: max(24px, env(safe-area-inset-bottom));"
-    >
+    <div style="
+      position: absolute; bottom: 0; left: 0; right: 0; z-index: 20; padding: 0 20px;
+      padding-bottom: max(24px, env(safe-area-inset-bottom));
+      -webkit-transform: translateZ(0);
+    ">
       {#if detections.length > 0}
-        <div class="flex justify-center mb-4">
-          <p class="text-white/70 text-xs bg-black/60 px-3 py-1.5 rounded-full">
+        <div style="display: flex; justify-content: center; margin-bottom: 16px;">
+          <p style="color: rgba(255,255,255,0.7); font-size: 12px; background: rgba(0,0,0,0.7); padding: 6px 12px; border-radius: 999px;">
             Tippe auf ein erkanntes Objekt
           </p>
         </div>
       {:else if sessionStarted}
-        <div class="flex justify-center mb-4">
-          <p class="text-white/50 text-xs bg-black/60 px-3 py-1.5 rounded-full">
+        <div style="display: flex; justify-content: center; margin-bottom: 16px;">
+          <p style="color: rgba(255,255,255,0.5); font-size: 12px; background: rgba(0,0,0,0.7); padding: 6px 12px; border-radius: 999px;">
             Richte die Kamera auf Möbel...
           </p>
         </div>
       {/if}
-      <div class="flex items-center justify-between">
+      <div style="display: flex; align-items: center; justify-content: space-between;">
         <button
           onclick={enterDrawMode}
-          class="w-12 h-12 flex items-center justify-center bg-black/70  rounded-xl text-white active:scale-90 transition-transform"
+          style="
+            width: 48px; height: 48px; display: flex; align-items: center; justify-content: center;
+            background: rgba(0,0,0,0.8); border-radius: 12px; border: none; color: white;
+          "
           aria-label="Objekt manuell markieren"
         >
           <span class="material-symbols-outlined">add</span>
@@ -423,8 +411,12 @@
         <button
           onclick={finish}
           disabled={capture.itemCount === 0}
-          class="px-7 py-3.5 rounded-xl font-bold text-sm transition-all active:scale-95 disabled:opacity-40
-            {capture.itemCount > 0 ? 'bg-primary text-white' : 'bg-white/10 text-white/40'}"
+          style="
+            padding: 14px 28px; border-radius: 12px; font-weight: 700; font-size: 14px; border: none;
+            background: {capture.itemCount > 0 ? '#022448' : 'rgba(255,255,255,0.1)'};
+            color: {capture.itemCount > 0 ? 'white' : 'rgba(255,255,255,0.4)'};
+            opacity: {capture.itemCount === 0 ? '0.4' : '1'};
+          "
         >
           Fertig{capture.itemCount > 0 ? ` (${capture.itemCount})` : ''}
         </button>
