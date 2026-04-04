@@ -254,9 +254,11 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private func loadFurnitureLabels() {
-        guard let url = Bundle.main.url(forResource: "furniture_labels", withExtension: "json"),
+        // SPM bundles resources into Bundle.module, not Bundle.main
+        guard let url = Bundle.module.url(forResource: "furniture_labels", withExtension: "json"),
               let data = try? Data(contentsOf: url),
               let map = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            print("[DepthCapture] furniture_labels.json not found in bundle")
             return
         }
         furnitureLabels = map
