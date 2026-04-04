@@ -26,8 +26,7 @@
   let pendingBbox: BoundingBox | null = $state(null);
   let sessionStarted = $state(false);
 
-  // ── Debug diagnostics (remove after camera works) ────────────────────────
-  let debugInfo = $state('');
+  let hasSupport = $state(false);
 
   // ── RE catalogue suggestions ──────────────────────────────────────────────
   const CATALOGUE = [
@@ -54,17 +53,10 @@
     // Make entire HTML tree transparent so native ARSCNView behind WebView is visible
     document.documentElement.classList.add('ar-mode');
 
-    // ── Diagnostics ──────────────────────────────────────────────────────
-    const platform = Capacitor.getPlatform();
-    const isNative = Capacitor.isNativePlatform();
-    let diag = `platform=${platform} native=${isNative}`;
-
     try {
       const support = await DepthCapture.checkSupport();
-      diag += ` supported=${support.supported} lidar=${support.hasLidar}`;
-    } catch (e: any) {
-      diag += ` checkSupport_err=${e.message || e}`;
-    }
+      hasSupport = support.supported;
+    } catch { /* non-native platform */ }
 
     try {
       detectHandle = await DepthCapture.addListener('detections', ({ detections: d }) => {
@@ -100,12 +92,8 @@
       });
 
       await DepthCapture.startSession();
-      diag += ' session=OK';
-    } catch (e: any) {
-      diag += ` session_err=${e.message || e}`;
-    }
+    } catch { /* session start failed */ }
 
-    debugInfo = diag;
     sessionStarted = true;
   });
 
@@ -216,13 +204,6 @@
         aria-label="Objekt auswählen: {det.germanLabel || det.label}"
       ></button>
     {/each}
-  {/if}
-
-  <!-- ── Debug banner (remove after camera works) ──────────────────────── -->
-  {#if debugInfo}
-    <div class="absolute top-0 left-0 right-0 z-50 bg-red-600 text-white text-[10px] font-mono px-2 py-1 break-all" style="padding-top: env(safe-area-inset-top, 0px);">
-      {debugInfo}
-    </div>
   {/if}
 
   <!-- ── Top bar — safe area aware ─────────────────────────────────────── -->
