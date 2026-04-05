@@ -1,7 +1,7 @@
 import { WebPlugin } from '@capacitor/core';
 /**
  * Web fallback. Uses getUserMedia — no AR, no YOLO, no depth.
- * Simulates the event-based API so the scan page can run in a browser for dev.
+ * Simulates the native session flow so the scan page runs in a browser for dev.
  */
 export class DepthCaptureWeb extends WebPlugin {
     constructor() {
@@ -9,7 +9,6 @@ export class DepthCaptureWeb extends WebPlugin {
         this.stream = null;
         this.video = null;
         this.items = [];
-        this.sessionIntrinsics = null;
     }
     async checkSupport() {
         const hasCamera = !!(navigator.mediaDevices?.getUserMedia);
@@ -32,35 +31,7 @@ export class DepthCaptureWeb extends WebPlugin {
         }
         this.video = null;
     }
-    async startItemScan(options) {
-        // Web fallback: capture a single frame immediately and fake a completed arc.
-        if (!this.video)
-            return;
-        const frame = await this._captureWebFrame();
-        const item = {
-            label: options.label,
-            frames: [frame],
-            arcDegrees: 28,
-            hasDepth: false,
-        };
-        this.items.push(item);
-        const evt = {
-            label: options.label,
-            frameCount: 1,
-            arcDegrees: 28,
-            hasDepth: false,
-        };
-        this.notifyListeners('itemSaved', evt);
-    }
-    async cancelItemScan() {
-        // no-op on web
-    }
-    async setDrawMode(_options) {
-        // no-op on web — draw mode is a native-only feature
-    }
     async getIntrinsics() {
-        if (this.sessionIntrinsics)
-            return this.sessionIntrinsics;
         const w = this.video?.videoWidth ?? 1920;
         const h = this.video?.videoHeight ?? 1080;
         return { fx: 0, fy: 0, cx: w / 2, cy: h / 2, width: w, height: h };
@@ -74,12 +45,19 @@ export class DepthCaptureWeb extends WebPlugin {
     addListener(event, handler) {
         return super.addListener(event, handler);
     }
-    // ── Private helpers ───────────────────────────────────────────────────────
-    async _captureWebFrame() {
+    // ── Web-only helpers (for dev testing) ───────────────────────────────────
+    /** Simulate capturing one item (call from browser devtools for testing). */
+    async simulateCapture(label) {
+        const frame = await this._captureFrame();
+        const item = { label, frames: [frame], arcDegrees: 28, hasDepth: false };
+        this.items.push(item);
+        this.notifyListeners('itemSaved', { label, frameCount: 1, arcDegrees: 28, hasDepth: false });
+    }
+    async _captureFrame() {
         const canvas = document.createElement('canvas');
-        canvas.width = this.video.videoWidth;
-        canvas.height = this.video.videoHeight;
-        canvas.getContext('2d').drawImage(this.video, 0, 0);
+        canvas.width = this.video?.videoWidth ?? 640;
+        canvas.height = this.video?.videoHeight ?? 480;
+        canvas.getContext('2d')?.drawImage(this.video, 0, 0);
         const imageBase64 = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
         return { imageBase64, depthMapBase64: null, pose: null };
     }

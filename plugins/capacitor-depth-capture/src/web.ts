@@ -1,24 +1,22 @@
 import { WebPlugin } from '@capacitor/core';
+import type { PluginListenerHandle } from '@capacitor/core';
 import type {
   DepthCapturePlugin,
   DepthSupportResult,
   CameraIntrinsics,
   ItemScan,
-  ArcProgress,
   ItemSavedEvent,
-  DrawnBox,
-  Detection,
+  ItemFrame,
 } from './definitions';
 
 /**
  * Web fallback. Uses getUserMedia — no AR, no YOLO, no depth.
- * Simulates the event-based API so the scan page can run in a browser for dev.
+ * Simulates the native session flow so the scan page runs in a browser for dev.
  */
 export class DepthCaptureWeb extends WebPlugin implements DepthCapturePlugin {
   private stream: MediaStream | null = null;
   private video: HTMLVideoElement | null = null;
   private items: ItemScan[] = [];
-  private sessionIntrinsics: CameraIntrinsics | null = null;
 
   async checkSupport(): Promise<DepthSupportResult> {
     const hasCamera = !!(navigator.mediaDevices?.getUserMedia);
@@ -44,36 +42,7 @@ export class DepthCaptureWeb extends WebPlugin implements DepthCapturePlugin {
     this.video = null;
   }
 
-  async startItemScan(options: { label: string }): Promise<void> {
-    // Web fallback: capture a single frame immediately and fake a completed arc.
-    if (!this.video) return;
-    const frame = await this._captureWebFrame();
-    const item: ItemScan = {
-      label: options.label,
-      frames: [frame],
-      arcDegrees: 28,
-      hasDepth: false,
-    };
-    this.items.push(item);
-    const evt: ItemSavedEvent = {
-      label: options.label,
-      frameCount: 1,
-      arcDegrees: 28,
-      hasDepth: false,
-    };
-    this.notifyListeners('itemSaved', evt);
-  }
-
-  async cancelItemScan(): Promise<void> {
-    // no-op on web
-  }
-
-  async setDrawMode(_options: { enabled: boolean }): Promise<void> {
-    // no-op on web — draw mode is a native-only feature
-  }
-
   async getIntrinsics(): Promise<CameraIntrinsics> {
-    if (this.sessionIntrinsics) return this.sessionIntrinsics;
     const w = this.video?.videoWidth ?? 1920;
     const h = this.video?.videoHeight ?? 1080;
     return { fx: 0, fy: 0, cx: w / 2, cy: h / 2, width: w, height: h };
@@ -87,23 +56,30 @@ export class DepthCaptureWeb extends WebPlugin implements DepthCapturePlugin {
     this.items = [];
   }
 
-  // ── Typed event stubs so the web class satisfies the interface ────────────
+  // ── Typed event stubs ────────────────────────────────────────────────────
 
-  addListener(event: 'detections', handler: (data: { detections: Detection[] }) => void): any;
-  addListener(event: 'arcProgress', handler: (data: ArcProgress) => void): any;
-  addListener(event: 'itemSaved', handler: (data: ItemSavedEvent) => void): any;
-  addListener(event: 'boxDrawn', handler: (data: DrawnBox) => void): any;
-  addListener(event: string, handler: (data: any) => void): any {
+  addListener(event: 'itemSaved', handler: (data: ItemSavedEvent) => void): Promise<PluginListenerHandle>;
+  addListener(event: 'sessionComplete', handler: (data: { itemCount: number }) => void): Promise<PluginListenerHandle>;
+  addListener(event: 'sessionCancelled', handler: (data: Record<string, never>) => void): Promise<PluginListenerHandle>;
+  addListener(event: string, handler: (data: any) => void): Promise<PluginListenerHandle> {
     return super.addListener(event, handler);
   }
 
-  // ── Private helpers ───────────────────────────────────────────────────────
+  // ── Web-only helpers (for dev testing) ───────────────────────────────────
 
-  private async _captureWebFrame() {
+  /** Simulate capturing one item (call from browser devtools for testing). */
+  async simulateCapture(label: string): Promise<void> {
+    const frame = await this._captureFrame();
+    const item: ItemScan = { label, frames: [frame], arcDegrees: 28, hasDepth: false };
+    this.items.push(item);
+    this.notifyListeners('itemSaved', { label, frameCount: 1, arcDegrees: 28, hasDepth: false });
+  }
+
+  private async _captureFrame(): Promise<ItemFrame> {
     const canvas = document.createElement('canvas');
-    canvas.width = this.video!.videoWidth;
-    canvas.height = this.video!.videoHeight;
-    canvas.getContext('2d')!.drawImage(this.video!, 0, 0);
+    canvas.width = this.video?.videoWidth ?? 640;
+    canvas.height = this.video?.videoHeight ?? 480;
+    canvas.getContext('2d')?.drawImage(this.video!, 0, 0);
     const imageBase64 = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
     return { imageBase64, depthMapBase64: null, pose: null };
   }

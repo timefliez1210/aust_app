@@ -1,34 +1,28 @@
 import { WebPlugin } from '@capacitor/core';
-import type { DepthCapturePlugin, DepthSupportResult, CameraIntrinsics, ItemScan, ArcProgress, ItemSavedEvent, DrawnBox, Detection } from './definitions';
+import type { PluginListenerHandle } from '@capacitor/core';
+import type { DepthCapturePlugin, DepthSupportResult, CameraIntrinsics, ItemScan, ItemSavedEvent } from './definitions';
 /**
  * Web fallback. Uses getUserMedia — no AR, no YOLO, no depth.
- * Simulates the event-based API so the scan page can run in a browser for dev.
+ * Simulates the native session flow so the scan page runs in a browser for dev.
  */
 export declare class DepthCaptureWeb extends WebPlugin implements DepthCapturePlugin {
     private stream;
     private video;
     private items;
-    private sessionIntrinsics;
     checkSupport(): Promise<DepthSupportResult>;
     startSession(): Promise<void>;
     stopSession(): Promise<void>;
-    startItemScan(options: {
-        label: string;
-    }): Promise<void>;
-    cancelItemScan(): Promise<void>;
-    setDrawMode(_options: {
-        enabled: boolean;
-    }): Promise<void>;
     getIntrinsics(): Promise<CameraIntrinsics>;
     getAllItems(): Promise<{
         items: ItemScan[];
     }>;
     clearItems(): Promise<void>;
-    addListener(event: 'detections', handler: (data: {
-        detections: Detection[];
-    }) => void): any;
-    addListener(event: 'arcProgress', handler: (data: ArcProgress) => void): any;
-    addListener(event: 'itemSaved', handler: (data: ItemSavedEvent) => void): any;
-    addListener(event: 'boxDrawn', handler: (data: DrawnBox) => void): any;
-    private _captureWebFrame;
+    addListener(event: 'itemSaved', handler: (data: ItemSavedEvent) => void): Promise<PluginListenerHandle>;
+    addListener(event: 'sessionComplete', handler: (data: {
+        itemCount: number;
+    }) => void): Promise<PluginListenerHandle>;
+    addListener(event: 'sessionCancelled', handler: (data: Record<string, never>) => void): Promise<PluginListenerHandle>;
+    /** Simulate capturing one item (call from browser devtools for testing). */
+    simulateCapture(label: string): Promise<void>;
+    private _captureFrame;
 }

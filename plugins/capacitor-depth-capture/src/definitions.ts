@@ -5,31 +5,17 @@ export interface DepthCapturePlugin {
   checkSupport(): Promise<DepthSupportResult>;
 
   /**
-   * Start an AR session. On iOS: sets up ARSCNView behind the WebView (which becomes
-   * transparent) and starts YOLO inference loop. On web: starts getUserMedia.
+   * Start an AR session with fully native UI.
+   * On iOS: hides the WebView, sets up ARSCNView + native overlay controls,
+   * starts YOLO inference loop. All user interaction (detection taps, draw mode,
+   * arc sweep, item management) is handled natively.
+   *
+   * Emits sessionComplete when user taps "Fertig", sessionCancelled on close.
    */
   startSession(): Promise<void>;
 
-  /** Stop the AR session and release resources. Restores WebView opacity on iOS. */
+  /** Stop the AR session, release resources, and restore WebView visibility. */
   stopSession(): Promise<void>;
-
-  /**
-   * Begin capturing frames for one item (arc sweep mode).
-   * Records ARKit poses + JPEG + depth per frame until 28° of rotation is accumulated
-   * or until cancelItemScan() is called.
-   * Emits arcProgress events during sweep, itemSaved when complete.
-   */
-  startItemScan(options: { label: string; bbox: BoundingBox }): Promise<void>;
-
-  /** Cancel the current item scan without saving. Re-enables detection. */
-  cancelItemScan(): Promise<void>;
-
-  /**
-   * Enable or disable draw mode.
-   * true:  native layer captures drag gesture, emits boxDrawn event, then disables.
-   * false: restore normal WebView touch handling.
-   */
-  setDrawMode(options: { enabled: boolean }): Promise<void>;
 
   /** Return camera intrinsics captured from the current ARFrame. */
   getIntrinsics(): Promise<CameraIntrinsics>;
@@ -42,31 +28,22 @@ export interface DepthCapturePlugin {
 
   // ── Event listeners ──────────────────────────────────────────────────────
 
-  /** Fired every ~10 ARFrames with current YOLO detections. */
-  addListener(
-    event: 'detections',
-    handler: (data: { detections: Detection[] }) => void,
-  ): Promise<PluginListenerHandle>;
-
-  /** Fired each ARFrame during an active arc sweep. */
-  addListener(
-    event: 'arcProgress',
-    handler: (data: ArcProgress) => void,
-  ): Promise<PluginListenerHandle>;
-
   /** Fired when an item scan auto-completes (≥28° accumulated, ≥4 frames). */
   addListener(
     event: 'itemSaved',
     handler: (data: ItemSavedEvent) => void,
   ): Promise<PluginListenerHandle>;
 
-  /**
-   * Fired after the user completes a drag in draw mode.
-   * Coordinates are normalized 0–1 relative to screen dimensions.
-   */
+  /** Fired when the user taps "Fertig" in the native overlay. */
   addListener(
-    event: 'boxDrawn',
-    handler: (data: DrawnBox) => void,
+    event: 'sessionComplete',
+    handler: (data: { itemCount: number }) => void,
+  ): Promise<PluginListenerHandle>;
+
+  /** Fired when the user taps the close button in the native overlay. */
+  addListener(
+    event: 'sessionCancelled',
+    handler: (data: Record<string, never>) => void,
   ): Promise<PluginListenerHandle>;
 
   removeAllListeners(): Promise<void>;
@@ -85,12 +62,6 @@ export interface BoundingBox {
   y: number;
   w: number;
   h: number;
-}
-
-/** A bounding box returned from draw mode, includes absolute screen dimensions. */
-export interface DrawnBox extends BoundingBox {
-  screenW: number;
-  screenH: number;
 }
 
 export interface Detection {
