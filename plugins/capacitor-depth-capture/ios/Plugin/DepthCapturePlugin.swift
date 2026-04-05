@@ -61,7 +61,8 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     private var visionModel: VNCoreMLModel?
     private var furnitureLabels: [String: String] = [:]
     private var currentDetections: [DetectionBox] = []
-    private var detectionLayers: [CALayer] = []
+    // Reusable layer pool — avoids clear+recreate flicker every YOLO tick
+    private var detectionLayerPool: [(CAShapeLayer, CATextLayer)] = []
 
     // ── Arc sweep ─────────────────────────────────────────────────────────
     private var scanActive = false
@@ -347,11 +348,14 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         guard let model = visionModel else { return }
         let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
             guard let self, let results = req.results as? [VNRecognizedObjectObservation] else { return }
-            let boxes = results.prefix(5).compactMap { obs -> DetectionBox? in
-                guard let top = obs.labels.first, top.confidence > 0.35 else { return nil }
+            let boxes = results.compactMap { obs -> DetectionBox? in
+                guard let top = obs.labels.first, top.confidence > 0.45 else { return nil }
+                let german = self.furnitureLabels[top.identifier] ?? ""
+                // Skip non-furniture items (person, handbag, etc.)
+                guard !german.isEmpty else { return nil }
                 let bb = obs.boundingBox
                 return DetectionBox(label: top.identifier,
-                                    germanLabel: self.furnitureLabels[top.identifier] ?? "",
+                                    germanLabel: german,
                                     confidence: top.confidence,
                                     x: Float(bb.minX), y: Float(1.0 - bb.maxY),
                                     w: Float(bb.width), h: Float(bb.height))
@@ -370,32 +374,56 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
 
     private func updateDetectionLayers(_ boxes: [DetectionBox]) {
         guard let sceneView = arView else { return }
-        clearDetectionLayers()
         let bounds = sceneView.bounds
-        for box in boxes {
-            let rect = CGRect(x: CGFloat(box.x) * bounds.width, y: CGFloat(box.y) * bounds.height,
-                              width: CGFloat(box.w) * bounds.width, height: CGFloat(box.h) * bounds.height)
-            let layer = CAShapeLayer()
-            layer.path = UIBezierPath(roundedRect: rect, cornerRadius: 8).cgPath
-            layer.strokeColor = UIColor.white.withAlphaComponent(0.85).cgColor
-            layer.fillColor = UIColor.white.withAlphaComponent(0.08).cgColor
-            layer.lineWidth = 2
-            let label = CATextLayer()
-            let name = box.germanLabel.isEmpty ? box.label : box.germanLabel
-            label.string = "\(name)  \(Int(box.confidence * 100))%"
-            label.fontSize = 12; label.foregroundColor = UIColor.white.cgColor
-            label.backgroundColor = UIColor.black.withAlphaComponent(0.55).cgColor
-            label.cornerRadius = 4; label.contentsScale = UIScreen.main.scale
-            label.frame = CGRect(x: rect.minX + 6, y: rect.minY + 6, width: rect.width - 12, height: 20)
-            sceneView.layer.addSublayer(layer)
-            sceneView.layer.addSublayer(label)
-            detectionLayers.append(contentsOf: [layer, label])
+
+        // Grow pool if we need more layers than we have
+        while detectionLayerPool.count < boxes.count {
+            let shape = CAShapeLayer()
+            let text = CATextLayer()
+            sceneView.layer.addSublayer(shape)
+            sceneView.layer.addSublayer(text)
+            detectionLayerPool.append((shape, text))
         }
+
+        // Update all layers in one transaction — no implicit animations, no flicker
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (i, (shape, text)) in detectionLayerPool.enumerated() {
+            if i < boxes.count {
+                let box = boxes[i]
+                let rect = CGRect(x: CGFloat(box.x) * bounds.width,
+                                  y: CGFloat(box.y) * bounds.height,
+                                  width: CGFloat(box.w) * bounds.width,
+                                  height: CGFloat(box.h) * bounds.height)
+                shape.path = UIBezierPath(roundedRect: rect, cornerRadius: 8).cgPath
+                shape.strokeColor = UIColor.white.withAlphaComponent(0.85).cgColor
+                shape.fillColor = UIColor.white.withAlphaComponent(0.08).cgColor
+                shape.lineWidth = 2
+                shape.isHidden = false
+
+                text.string = "\(box.germanLabel)  \(Int(box.confidence * 100))%"
+                text.fontSize = 12
+                text.foregroundColor = UIColor.white.cgColor
+                text.backgroundColor = UIColor.black.withAlphaComponent(0.55).cgColor
+                text.cornerRadius = 4
+                text.contentsScale = UIScreen.main.scale
+                text.frame = CGRect(x: rect.minX + 6, y: rect.minY + 6,
+                                    width: rect.width - 12, height: 20)
+                text.isHidden = false
+            } else {
+                shape.isHidden = true
+                text.isHidden = true
+            }
+        }
+        CATransaction.commit()
     }
 
     private func clearDetectionLayers() {
-        detectionLayers.forEach { $0.removeFromSuperlayer() }
-        detectionLayers.removeAll()
+        detectionLayerPool.forEach { shape, text in
+            shape.removeFromSuperlayer()
+            text.removeFromSuperlayer()
+        }
+        detectionLayerPool.removeAll()
     }
 
     // MARK: - Math helpers
