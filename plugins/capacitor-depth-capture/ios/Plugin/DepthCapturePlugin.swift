@@ -149,17 +149,21 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - AR setup / teardown
 
     private func setupARView() {
-        guard let rootVC = bridge?.viewController else { return }
+        guard let rootVC = bridge?.viewController,
+              let window = rootVC.view.window ?? UIApplication.shared.connectedScenes
+                  .compactMap({ ($0 as? UIWindowScene)?.keyWindow }).first
+        else { return }
 
         hasLidar = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
 
-        let sceneView = ARSCNView(frame: rootVC.view.bounds)
+        let sceneView = ARSCNView(frame: window.bounds)
         sceneView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         sceneView.delegate = self
         sceneView.automaticallyUpdatesLighting = true
         sceneView.isUserInteractionEnabled = false
 
-        rootVC.view.addSubview(sceneView)
+        // Add to window (not rootVC.view, which IS the WKWebView in Capacitor)
+        window.addSubview(sceneView)
         arView = sceneView
 
         // Hide WebView entirely — native UI takes over
@@ -172,10 +176,10 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private func setupNativeOverlay() {
-        guard let rootVC = bridge?.viewController,
-              let arView = arView else { return }
+        guard let arView = arView,
+              let window = arView.superview else { return }
 
-        let ov = ScanOverlayView(frame: rootVC.view.bounds)
+        let ov = ScanOverlayView(frame: window.bounds)
         ov.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 
         // Wire callbacks
@@ -203,7 +207,7 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
             self?.overlay?.setState(.idle)
         }
 
-        rootVC.view.insertSubview(ov, aboveSubview: arView)
+        window.addSubview(ov)
         overlay = ov
     }
 
@@ -285,10 +289,10 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Draw mode
 
     private func enterNativeDrawMode() {
-        guard let rootVC = bridge?.viewController,
-              let ov = overlay else { return }
+        guard let ov = overlay,
+              let window = ov.superview else { return }
         ov.setState(.drawMode)
-        let draw = DrawOverlayView(frame: rootVC.view.bounds)
+        let draw = DrawOverlayView(frame: window.bounds)
         draw.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         draw.onBoxDrawn = { [weak self] rect, screenSize in
             guard let self else { return }
@@ -305,7 +309,7 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
             draw.removeFromSuperview()
             self?.overlay?.setState(.idle)
         }
-        rootVC.view.insertSubview(draw, aboveSubview: ov)
+        window.addSubview(draw)
     }
 
     // MARK: - YOLO
