@@ -291,20 +291,31 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
 
     private func enterNativeDrawMode() {
         guard let ov = overlay,
-              let window = ov.superview else { return }
+              let window = ov.superview,
+              let rootVC = bridge?.viewController else { return }
         ov.setState(.drawMode)
         let draw = DrawOverlayView(frame: window.bounds)
         draw.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         draw.onBoxDrawn = { [weak self] rect, screenSize in
             guard let self else { return }
-            draw.removeFromSuperview()
-            self.overlay?.showLabelInput { [weak self] label in
-                guard let self, let label else {
-                    self?.overlay?.setState(.idle)
-                    return
-                }
-                self.beginArcSweep(label: label)
+            // Keep draw view alive (box stays visible) while alert is on screen
+            let alert = UIAlertController(title: "Objekt benennen", message: nil, preferredStyle: .alert)
+            alert.addTextField { tf in
+                tf.placeholder = "z.B. Schrank, Sofa, Bett..."
+                tf.autocapitalizationType = .sentences
             }
+            alert.addAction(UIAlertAction(title: "Abbrechen", style: .cancel) { _ in
+                draw.removeFromSuperview()
+                self.overlay?.setState(.idle)
+            })
+            alert.addAction(UIAlertAction(title: "Erfassen →", style: .default) { _ in
+                let label = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespaces) ?? ""
+                draw.removeFromSuperview()
+                guard !label.isEmpty else { self.overlay?.setState(.idle); return }
+                self.beginArcSweep(label: label)
+            })
+            // Present from the bridge VC — overlay has no VC parent (it's on UIWindow directly)
+            rootVC.present(alert, animated: true)
         }
         draw.onCancelled = { [weak self] in
             draw.removeFromSuperview()
