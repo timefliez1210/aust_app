@@ -81,6 +81,7 @@
 
       const result = await apiPostForm<{ inquiry_id: string }>('/api/v1/submit/mobile/ar', formData);
       capture.clear();
+      localStorage.setItem('aust_pending_inquiry', result.inquiry_id);
       goto(`/scan/processing?inquiry_id=${result.inquiry_id}`);
     } catch (e: any) {
       error = e.message || 'Fehler beim Senden';

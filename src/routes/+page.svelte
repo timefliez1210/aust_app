@@ -1,7 +1,64 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { auth } from '$lib/stores/auth.svelte';
+  import { apiGet } from '$lib/api/client';
   import BottomNav from '$lib/components/BottomNav.svelte';
+
+  interface LatestInquiry {
+    id: string;
+    status: string;
+    origin_city: string | null;
+    destination_city: string | null;
+    price_cents: number | null;
+  }
+
+  let latestInquiry: LatestInquiry | null = $state(null);
+
+  const IN_PROGRESS = ['pending','info_requested','estimating','estimated'];
+  const OFFER_READY = ['offer_ready','offer_sent'];
+
+  function inquiryStatusLabel(s: string): string {
+    if (IN_PROGRESS.includes(s)) return 'KI analysiert Ihren Umzug...';
+    if (OFFER_READY.includes(s)) return 'Angebot bereit — jetzt ansehen';
+    if (s === 'accepted') return 'Umzug bestätigt';
+    return '';
+  }
+
+  function inquiryStatusIcon(s: string): string {
+    if (IN_PROGRESS.includes(s)) return 'pending';
+    if (OFFER_READY.includes(s)) return 'check_circle';
+    if (s === 'accepted') return 'celebration';
+    return 'pending';
+  }
+
+  function inquiryStatusColor(s: string): string {
+    if (OFFER_READY.includes(s) || s === 'accepted') return 'text-secondary';
+    return 'text-primary';
+  }
+
+  function inquiryTarget(inquiry: LatestInquiry): string {
+    if (IN_PROGRESS.includes(inquiry.status)) {
+      const pending = localStorage.getItem('aust_pending_inquiry');
+      if (pending === inquiry.id) return `/scan/processing?inquiry_id=${inquiry.id}`;
+    }
+    return `/offers/${inquiry.id}`;
+  }
+
+  async function loadLatestInquiry() {
+    if (!auth.isAuthenticated) return;
+    try {
+      const list = await apiGet<LatestInquiry[]>('/api/v1/customer/inquiries');
+      const active = list.find(i =>
+        [...IN_PROGRESS, ...OFFER_READY, 'accepted'].includes(i.status)
+      );
+      latestInquiry = active ?? list[0] ?? null;
+    } catch { /* ignore */ }
+  }
+
+  $effect(() => {
+    if (auth.isAuthenticated) loadLatestInquiry();
+    else latestInquiry = null;
+  });
 
   function startScan() {
     if (auth.isAuthenticated) {
@@ -123,6 +180,7 @@
       <section>
         <h5 class="text-[10px] font-bold tracking-widest uppercase text-on-surface-variant mb-3">Ihr Umzugsstatus</h5>
         <div class="space-y-2.5">
+          <!-- Logged-in row -->
           <div class="flex items-center gap-4 bg-surface-container-high/50 p-4 rounded-2xl">
             <div class="w-2 h-2 rounded-full bg-secondary shrink-0"></div>
             <div class="flex-grow">
@@ -131,14 +189,40 @@
             </div>
             <span class="material-symbols-outlined text-secondary" style="font-size: 18px; font-variation-settings: 'FILL' 1;">check_circle</span>
           </div>
-          <div class="flex items-center gap-4 bg-surface-container-lowest p-4 rounded-2xl" style="border: 1px solid rgba(196,198,207,0.1);">
-            <div class="w-2 h-2 rounded-full bg-primary animate-pulse shrink-0"></div>
-            <div class="flex-grow">
-              <p class="text-sm font-bold text-on-surface">Inventurscan</p>
-              <p class="text-xs text-on-surface-variant">Ausstehend — Scan jetzt starten</p>
+
+          <!-- Latest inquiry status -->
+          {#if latestInquiry && inquiryStatusLabel(latestInquiry.status)}
+            <button
+              onclick={() => goto(inquiryTarget(latestInquiry!))}
+              class="w-full flex items-center gap-4 bg-surface-container-lowest p-4 rounded-2xl active:scale-[0.99] transition-all text-left"
+              style="border: 1px solid rgba(196,198,207,0.1);"
+            >
+              {#if IN_PROGRESS.includes(latestInquiry.status)}
+                <div class="w-2 h-2 rounded-full bg-primary animate-pulse shrink-0"></div>
+              {:else}
+                <div class="w-2 h-2 rounded-full bg-secondary shrink-0"></div>
+              {/if}
+              <div class="flex-grow min-w-0">
+                <p class="text-sm font-bold text-on-surface truncate">
+                  {latestInquiry.origin_city || '?'} → {latestInquiry.destination_city || '?'}
+                </p>
+                <p class="text-xs text-on-surface-variant">{inquiryStatusLabel(latestInquiry.status)}</p>
+              </div>
+              <span class="material-symbols-outlined shrink-0 {inquiryStatusColor(latestInquiry.status)}"
+                style="font-size: 18px; font-variation-settings: 'FILL' 1;"
+              >{inquiryStatusIcon(latestInquiry.status)}</span>
+            </button>
+          {:else}
+            <!-- No active inquiry -->
+            <div class="flex items-center gap-4 bg-surface-container-lowest p-4 rounded-2xl" style="border: 1px solid rgba(196,198,207,0.1);">
+              <div class="w-2 h-2 rounded-full bg-primary animate-pulse shrink-0"></div>
+              <div class="flex-grow">
+                <p class="text-sm font-bold text-on-surface">Inventurscan</p>
+                <p class="text-xs text-on-surface-variant">Ausstehend — Scan jetzt starten</p>
+              </div>
+              <span class="material-symbols-outlined text-outline-variant" style="font-size: 18px;">pending</span>
             </div>
-            <span class="material-symbols-outlined text-outline-variant" style="font-size: 18px;">pending</span>
-          </div>
+          {/if}
         </div>
       </section>
     {/if}
