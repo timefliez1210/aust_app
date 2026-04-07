@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { auth } from '$lib/stores/auth.svelte';
+  import { capture } from '$lib/stores/capture.svelte';
   import { apiGet } from '$lib/api/client';
   import BottomNav from '$lib/components/BottomNav.svelte';
 
@@ -60,7 +61,13 @@
     else latestInquiry = null;
   });
 
-  function startScan() {
+  async function startScan() {
+    // If a previous scan was interrupted, offer to resume it instead.
+    await capture.waitReady();
+    if (capture.items.length > 0) {
+      goto('/scan/resume');
+      return;
+    }
     if (auth.isAuthenticated) {
       const seen = localStorage.getItem('tutorialSeen');
       goto(seen ? '/scan' : '/tutorial');
