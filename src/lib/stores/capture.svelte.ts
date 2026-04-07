@@ -85,21 +85,30 @@ const JPEG_QUALITY = 0.75;
 
 function compressFrame(base64: string, mime: 'image/jpeg' | 'image/png'): Promise<string> {
   return new Promise((resolve) => {
+    // Fallback: if canvas/image loading hangs (e.g. WebView not yet fully active),
+    // resolve with the original base64 after 4 seconds so the caller is never stuck.
+    const timeout = setTimeout(() => resolve(base64), 4000);
+
     const img = new Image();
     img.onload = () => {
-      const scale = Math.min(1, MAX_WIDTH / img.width);
-      const w = Math.round(img.width * scale);
-      const h = Math.round(img.height * scale);
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      canvas.getContext('2d')!.drawImage(img, 0, 0, w, h);
-      // Keep depth maps as PNG (lossless — JPEG would corrupt depth values).
-      // RGB frames → JPEG for significant size reduction.
-      const dataUrl = canvas.toDataURL(mime, mime === 'image/jpeg' ? JPEG_QUALITY : undefined);
-      resolve(dataUrl.split(',')[1]); // strip data:…;base64, prefix
+      clearTimeout(timeout);
+      try {
+        const scale = Math.min(1, MAX_WIDTH / img.width);
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext('2d')!.drawImage(img, 0, 0, w, h);
+        // Keep depth maps as PNG (lossless — JPEG would corrupt depth values).
+        // RGB frames → JPEG for significant size reduction.
+        const dataUrl = canvas.toDataURL(mime, mime === 'image/jpeg' ? JPEG_QUALITY : undefined);
+        resolve(dataUrl.split(',')[1]); // strip data:…;base64, prefix
+      } catch {
+        resolve(base64); // canvas failed — keep original
+      }
     };
-    img.onerror = () => resolve(base64); // fallback: keep original
+    img.onerror = () => { clearTimeout(timeout); resolve(base64); };
     img.src = `data:${mime};base64,${base64}`;
   });
 }
