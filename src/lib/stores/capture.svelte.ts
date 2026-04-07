@@ -123,13 +123,20 @@ class CaptureStore {
 
   private _readyPromise: Promise<void>;
   private _resolveReady!: () => void;
+  /**
+   * Set to true the first time clear() is called. Prevents _restore() from
+   * overwriting in-memory state if it completes after clear() has run — which
+   * happens when the scan page calls capture.clear() in onMount while IDB is
+   * still reading from the previous session.
+   */
+  private _clearedOnce = false;
 
   constructor() {
     this._readyPromise = new Promise(res => { this._resolveReady = res; });
     this._restore();
   }
 
-  /** Resolves when IndexedDB restore is complete (use in onMount before checking items). */
+  /** Resolves when IndexedDB restore is complete. */
   waitReady(): Promise<void> {
     return this._readyPromise;
   }
@@ -138,8 +145,13 @@ class CaptureStore {
     try {
       const stored = await dbGetAll<StoredItem>(STORE_ITEMS);
       const meta = await dbGet<CameraIntrinsics>(STORE_META, 'intrinsics');
-      this.items = stored;
-      this.intrinsics = meta ?? null;
+      // Only apply restored data if clear() hasn't been called yet.
+      // If clear() ran first, the app has already moved on and we must not
+      // overwrite the current (empty or freshly populated) in-memory state.
+      if (!this._clearedOnce) {
+        this.items = stored;
+        this.intrinsics = meta ?? null;
+      }
     } catch {
       // First run or private browsing — silently ignore.
     }
@@ -199,6 +211,7 @@ class CaptureStore {
   }
 
   clear() {
+    this._clearedOnce = true;
     this.items = [];
     this.intrinsics = null;
     dbClearStore(STORE_ITEMS).catch(() => {});
