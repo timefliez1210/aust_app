@@ -147,27 +147,50 @@ class CaptureStore {
     this._resolveReady();
   }
 
-  async addItem(raw: ItemScan): Promise<void> {
-    const frames = await Promise.all(
-      raw.frames.map(async f => ({
-        imageBase64: await compressFrame(f.imageBase64, 'image/jpeg'),
-        depthMapBase64: f.depthMapBase64
-          ? await compressFrame(f.depthMapBase64, 'image/png')
-          : null,
-        pose: f.pose ?? null,
-      }))
-    );
-
+  addItem(raw: ItemScan): void {
+    // Push raw frames into memory immediately — this is synchronous so navigation
+    // (goto) is never blocked. Compression + IDB persist happen in the background.
     const item: StoredItem = {
       id: crypto.randomUUID(),
       label: raw.label,
-      frames,
+      frames: raw.frames.map(f => ({
+        imageBase64: f.imageBase64,
+        depthMapBase64: f.depthMapBase64 ?? null,
+        pose: f.pose ?? null,
+      })),
       arcDegrees: raw.arcDegrees,
       hasDepth: raw.hasDepth,
     };
 
     this.items.push(item);
-    dbPut(STORE_ITEMS, item).catch(() => {}); // fire-and-forget
+
+    // Background: compress then persist to IDB. Does not block the caller.
+    this._compressAndPersist(item);
+  }
+
+  private async _compressAndPersist(item: StoredItem): Promise<void> {
+    try {
+      const compressed: StoredItem = {
+        ...item,
+        frames: await Promise.all(
+          item.frames.map(async f => ({
+            ...f,
+            imageBase64: await compressFrame(f.imageBase64, 'image/jpeg'),
+            depthMapBase64: f.depthMapBase64
+              ? await compressFrame(f.depthMapBase64, 'image/png')
+              : null,
+          }))
+        ),
+      };
+      // Also update in-memory frames with compressed versions to reduce RAM.
+      const idx = this.items.findIndex(i => i.id === item.id);
+      if (idx !== -1) this.items[idx] = compressed;
+
+      await dbPut(STORE_ITEMS, compressed);
+    } catch {
+      // Compression or IDB failed — item remains in memory with raw frames.
+      dbPut(STORE_ITEMS, item).catch(() => {});
+    }
   }
 
   removeItem(id: string) {

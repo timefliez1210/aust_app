@@ -26,8 +26,7 @@
       await DepthCapture.stopSession();
 
       capture.clear();
-      // Compress + persist all items in parallel.
-      await Promise.all(items.map(item => capture.addItem(item)));
+      for (const item of items) capture.addItem(item);
       await capture.setIntrinsics(intrinsics);
 
       goto('/scan/form');
