@@ -4,6 +4,9 @@
   import { auth } from '$lib/stores/auth.svelte';
   import { apiPostForm } from '$lib/api/client';
 
+  let name = $state(auth.customer?.name || '');
+  let email = $state(auth.customer?.email || '');
+  let phone = $state(auth.customer?.phone || '');
   let departureAddress = $state('');
   let departureFloor = $state('EG');
   let departureElevator = $state(false);
@@ -39,9 +42,9 @@
     error = null;
     try {
       const formData = new FormData();
-      formData.append('name', auth.customer?.name || '');
-      formData.append('email', auth.customer?.email || '');
-      formData.append('phone', auth.customer?.phone || '');
+      formData.append('name', name);
+      formData.append('email', email);
+      if (phone) formData.append('phone', phone);
       formData.append('departure_address', departureAddress);
       formData.append('departure_floor', departureFloor);
       formData.append('departure_elevator', String(departureElevator));
@@ -126,6 +129,47 @@
   </div>
 
   <form bind:this={formEl} onsubmit={submit} class="space-y-4">
+    <!-- Contact info -->
+    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
+      <div class="flex items-center gap-2 mb-4">
+        <span class="material-symbols-outlined text-primary" style="font-size: 20px;">person</span>
+        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">Kontaktdaten</h3>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Name *</label>
+          <input
+            bind:value={name}
+            required
+            placeholder="Max Mustermann"
+            class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all duration-200"
+            style="border: none;"
+          />
+        </div>
+        <div>
+          <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">E-Mail *</label>
+          <input
+            type="email"
+            bind:value={email}
+            required
+            placeholder="max@beispiel.de"
+            class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all duration-200"
+            style="border: none;"
+          />
+        </div>
+        <div>
+          <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Telefon <span class="normal-case font-normal tracking-normal">(optional)</span></label>
+          <input
+            type="tel"
+            bind:value={phone}
+            placeholder="+49 151 12345678"
+            class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all duration-200"
+            style="border: none;"
+          />
+        </div>
+      </div>
+    </div>
+
     <!-- Departure address -->
     <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
       <div class="flex items-center gap-2 mb-4">
@@ -298,7 +342,7 @@
     <button
       type="button"
       onclick={() => formEl?.requestSubmit()}
-      disabled={submitting || !departureAddress || !arrivalAddress}
+      disabled={submitting || !name || !email || !departureAddress || !arrivalAddress}
       class="bg-gradient-to-br from-primary to-primary-container text-white px-8 py-3.5 rounded-xl font-bold text-sm tracking-wide uppercase bento-shadow active:scale-95 transition-all disabled:opacity-50 flex items-center gap-2"
     >
       {#if submitting}
