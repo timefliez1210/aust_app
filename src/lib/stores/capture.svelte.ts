@@ -205,10 +205,10 @@ class CaptureStore {
     dbClearStore(STORE_META).catch(() => {});
   }
 
-  async setIntrinsics(v: CameraIntrinsics | null) {
-    this.intrinsics = v;
-    if (v) {
-      dbPut(STORE_META, v, 'intrinsics').catch(() => {});
+  /** Persist the current intrinsics value to IDB (fire-and-forget). */
+  persistIntrinsics() {
+    if (this.intrinsics) {
+      dbPut(STORE_META, this.intrinsics, 'intrinsics').catch(() => {});
     } else {
       dbDelete(STORE_META, 'intrinsics').catch(() => {});
     }

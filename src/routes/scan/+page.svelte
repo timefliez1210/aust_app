@@ -16,19 +16,16 @@
     capture.clear();
 
     completeHandle = await DepthCapture.addListener('sessionComplete', async () => {
-      // Fetch items and intrinsics while native session is still alive.
       const { items } = await DepthCapture.getAllItems();
-      let intrinsics = null;
-      try { intrinsics = await DepthCapture.getIntrinsics(); } catch { /* non-LiDAR */ }
-
-      // Dismiss native overlay BEFORE canvas compression so the WebView
-      // is fully active when Image/canvas APIs run (avoids onload hanging).
-      await DepthCapture.stopSession();
-
       capture.clear();
       for (const item of items) capture.addItem(item);
-      await capture.setIntrinsics(intrinsics);
 
+      try {
+        capture.intrinsics = await DepthCapture.getIntrinsics();
+        capture.persistIntrinsics(); // fire-and-forget IDB write
+      } catch { /* non-LiDAR or intrinsics unavailable */ }
+
+      await DepthCapture.stopSession();
       goto('/scan/form');
     });
 
