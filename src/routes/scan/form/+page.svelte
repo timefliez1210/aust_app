@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { capture } from '$lib/stores/capture.svelte';
   import { auth } from '$lib/stores/auth.svelte';
-  import { apiPostForm } from '$lib/api/client';
+  import { apiPostForm, ApiError } from '$lib/api/client';
 
   let name = $state(auth.customer?.name || '');
   let email = $state(auth.customer?.email || '');
@@ -20,6 +20,7 @@
   let message = $state('');
   let submitting = $state(false);
   let error: string | null = $state(null);
+  let errorDetail: string | null = $state(null);
 
   const floors = ['EG', '1. OG', '2. OG', '3. OG', '4. OG', '5. OG', 'DG', 'UG'];
 
@@ -40,6 +41,7 @@
     e.preventDefault();
     submitting = true;
     error = null;
+    errorDetail = null;
     try {
       const formData = new FormData();
       formData.append('name', name);
@@ -87,7 +89,37 @@
       localStorage.setItem('aust_pending_inquiry', result.inquiry_id);
       goto(`/scan/processing?inquiry_id=${result.inquiry_id}`);
     } catch (e: any) {
-      error = e.message || 'Fehler beim Senden';
+      const isApi = e instanceof ApiError;
+      const safeMeta = (() => {
+        // Don't expose the full API base URL on the off-chance this is a
+        // production build, but keep the path so we know *which* endpoint failed.
+        try {
+          const u = new URL(`${(import.meta.env.VITE_API_BASE || 'http://localhost:8080').replace(/\/$/, '')}/api/v1/submit/mobile/ar`);
+          return u.pathname;
+        } catch { return '/api/v1/submit/mobile/ar'; }
+      })();
+
+      if (isApi) {
+        if (e.status === 0) {
+          error = e.message;
+          errorDetail = `Endpoint: ${safeMeta}`;
+        } else if (e.status === 401) {
+          error = 'Sitzung abgelaufen — bitte erneut anmelden.';
+          errorDetail = `HTTP 401 · ${safeMeta}`;
+        } else if (e.status === 413) {
+          error = 'Die hochgeladenen Daten sind zu groß. Bitte weniger Bilder verwenden.';
+          errorDetail = `HTTP 413 · ${safeMeta}`;
+        } else if (e.status >= 500) {
+          error = `Serverfehler (${e.status}). Bitte versuchen Sie es später erneut.`;
+          errorDetail = `HTTP ${e.status} · ${safeMeta}\n${e.message}`;
+        } else {
+          error = e.message || 'Fehler beim Senden.';
+          errorDetail = `HTTP ${e.status} · ${safeMeta}\n${e.message}`;
+        }
+      } else {
+        error = e.message || 'Unerwarteter Fehler beim Senden.';
+        errorDetail = `Non-API error\n${e?.constructor?.name || 'Error'}: ${e?.message}`;
+      }
     } finally {
       submitting = false;
     }
@@ -322,9 +354,14 @@
     </div>
 
     {#if error}
-      <div class="rounded-xl bg-error-container p-4 text-sm text-on-error-container flex items-center gap-2">
-        <span class="material-symbols-outlined text-error" style="font-size: 18px;">error</span>
-        {error}
+      <div class="rounded-xl bg-error-container p-4 text-sm text-on-error-container">
+        <div class="flex items-center gap-2 mb-1">
+          <span class="material-symbols-outlined text-error" style="font-size: 18px;">error</span>
+          <span class="font-bold">{error}</span>
+        </div>
+        {#if errorDetail}
+          <pre class="mt-2 p-2 bg-error/10 rounded-lg text-[11px] text-on-error-container/70 whitespace-pre-wrap break-all font-mono overflow-x-auto">{errorDetail}</pre>
+        {/if}
       </div>
     {/if}
   </form>
