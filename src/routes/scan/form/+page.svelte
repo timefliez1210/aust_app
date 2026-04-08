@@ -37,12 +37,52 @@
     else services = [...services, s];
   }
 
+  /** Resize + compress a base64 image via canvas. Falls back to original on error. */
+  function compressBase64(base64: string, mime: 'image/jpeg' | 'image/png', maxWidth = 800, quality = 0.75): Promise<string> {
+    return new Promise(resolve => {
+      const img = new Image();
+      const timeout = setTimeout(() => resolve(base64), 5000);
+      img.onload = () => {
+        clearTimeout(timeout);
+        try {
+          const scale = Math.min(1, maxWidth / img.width);
+          const w = Math.round(img.width * scale);
+          const h = Math.round(img.height * scale);
+          const canvas = document.createElement('canvas');
+          canvas.width = w; canvas.height = h;
+          canvas.getContext('2d')!.drawImage(img, 0, 0, w, h);
+          // Depth maps stay PNG (lossless); RGB frames → JPEG
+          const out = canvas.toDataURL(mime, mime === 'image/jpeg' ? quality : undefined);
+          resolve(out.split(',')[1]);
+        } catch { resolve(base64); }
+      };
+      img.onerror = () => { clearTimeout(timeout); resolve(base64); };
+      img.src = `data:${mime};base64,${base64}`;
+    });
+  }
+
   async function submit(e: SubmitEvent) {
     e.preventDefault();
     submitting = true;
     error = null;
     errorDetail = null;
     try {
+      // Compress all frames before building FormData.
+      // Raw camera frames can be 3-4 MB each; compress to ~100 KB so the
+      // multipart upload doesn't time out on mobile connections.
+      const compressedItems = await Promise.all(
+        capture.items.map(async item => ({
+          ...item,
+          frames: await Promise.all(item.frames.map(async f => ({
+            ...f,
+            imageBase64: await compressBase64(f.imageBase64, 'image/jpeg'),
+            depthMapBase64: f.depthMapBase64
+              ? await compressBase64(f.depthMapBase64, 'image/png')
+              : null,
+          }))),
+        }))
+      );
+
       const formData = new FormData();
       formData.append('name', name);
       formData.append('email', email);
