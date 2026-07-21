@@ -1,92 +1,302 @@
 @import 'tailwindcss';
 
+/* ────────────────────────────────────────────────────────────────────────────
+   iOS design language, AUST brand.
+   Runtime-switchable light/dark via CSS vars; Tailwind utilities map onto them.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Brand */
+  --aust-navy: #022448;
+  --aust-orange: #fc6018;
+
+  /* iOS system grouped background + elevated card */
+  --ios-bg: #f2f2f7;
+  --ios-card: #ffffff;
+  --ios-card-2: #f7f7fa;
+
+  /* Fills (iOS tertiary/quaternary system fills) */
+  --ios-fill: rgba(120, 120, 128, 0.12);
+  --ios-fill-strong: rgba(120, 120, 128, 0.2);
+
+  /* Labels */
+  --ios-label: #0b0b0f;
+  --ios-label-2: rgba(60, 60, 67, 0.6);
+  --ios-label-3: rgba(60, 60, 67, 0.3);
+
+  /* Hairlines */
+  --ios-separator: rgba(60, 60, 67, 0.29);
+
+  /* Tint = brand navy in light mode */
+  --ios-tint: var(--aust-navy);
+  --ios-on-tint: #ffffff;
+  --ios-tint-soft: rgba(2, 36, 72, 0.1);
+
+  --ios-accent: var(--aust-orange);
+  --ios-accent-soft: rgba(252, 96, 24, 0.12);
+
+  --ios-green: #34c759;
+  --ios-red: #ff3b30;
+  --ios-red-soft: rgba(255, 59, 48, 0.12);
+
+  --ios-bar: rgba(242, 242, 247, 0.82);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ios-bg: #000000;
+    --ios-card: #1c1c1e;
+    --ios-card-2: #2c2c2e;
+
+    --ios-fill: rgba(120, 120, 128, 0.24);
+    --ios-fill-strong: rgba(120, 120, 128, 0.36);
+
+    --ios-label: #ffffff;
+    --ios-label-2: rgba(235, 235, 245, 0.6);
+    --ios-label-3: rgba(235, 235, 245, 0.3);
+
+    --ios-separator: rgba(84, 84, 88, 0.6);
+
+    /* Navy is too dark on black — lift it while staying on-brand */
+    --ios-tint: #4d7fb8;
+    --ios-on-tint: #ffffff;
+    --ios-tint-soft: rgba(77, 127, 184, 0.18);
+
+    --ios-accent: #ff7a3d;
+    --ios-accent-soft: rgba(255, 122, 61, 0.16);
+
+    --ios-green: #30d158;
+    --ios-red: #ff453a;
+    --ios-red-soft: rgba(255, 69, 58, 0.16);
+
+    --ios-bar: rgba(22, 22, 24, 0.8);
+  }
+}
+
 @theme {
-  /* Primary */
-  --color-primary: #022448;
-  --color-primary-container: #1e3a5f;
-  --color-primary-fixed: #d5e3ff;
-  --color-primary-fixed-dim: #adc8f5;
-  --color-on-primary: #ffffff;
-  --color-on-primary-container: #8aa4cf;
-  --color-on-primary-fixed: #001c3b;
-  --color-on-primary-fixed-variant: #2d486d;
-  --color-inverse-primary: #adc8f5;
+  --color-bg: var(--ios-bg);
+  --color-card: var(--ios-card);
+  --color-card-2: var(--ios-card-2);
+  --color-fill: var(--ios-fill);
+  --color-fill-strong: var(--ios-fill-strong);
+  --color-label: var(--ios-label);
+  --color-label-2: var(--ios-label-2);
+  --color-label-3: var(--ios-label-3);
+  --color-separator: var(--ios-separator);
+  --color-tint: var(--ios-tint);
+  --color-on-tint: var(--ios-on-tint);
+  --color-tint-soft: var(--ios-tint-soft);
+  --color-accent: var(--ios-accent);
+  --color-accent-soft: var(--ios-accent-soft);
+  --color-green: var(--ios-green);
+  --color-red: var(--ios-red);
+  --color-red-soft: var(--ios-red-soft);
 
-  /* Secondary */
-  --color-secondary: #a83900;
-  --color-secondary-container: #fc6018;
-  --color-secondary-fixed: #ffdbcf;
-  --color-secondary-fixed-dim: #ffb59a;
-  --color-on-secondary: #ffffff;
-  --color-on-secondary-container: #531800;
-  --color-on-secondary-fixed: #380d00;
-  --color-on-secondary-fixed-variant: #802a00;
-
-  /* Tertiary */
-  --color-tertiary: #242424;
-  --color-tertiary-container: #3a3939;
-  --color-on-tertiary: #ffffff;
-  --color-on-tertiary-container: #a5a2a2;
-
-  /* Surfaces */
-  --color-surface: #f7f9fb;
-  --color-surface-dim: #d8dadc;
-  --color-surface-bright: #f7f9fb;
-  --color-surface-container-lowest: #ffffff;
-  --color-surface-container-low: #f2f4f6;
-  --color-surface-container: #eceef0;
-  --color-surface-container-high: #e6e8ea;
-  --color-surface-container-highest: #e0e3e5;
-  --color-surface-variant: #e0e3e5;
-  --color-surface-tint: #455f87;
-  --color-on-surface: #191c1e;
-  --color-on-surface-variant: #43474e;
-
-  /* Background */
-  --color-background: #f7f9fb;
-  --color-on-background: #191c1e;
-
-  /* Outline */
-  --color-outline: #74777f;
-  --color-outline-variant: #c4c6cf;
-
-  /* Inverse */
-  --color-inverse-surface: #2d3133;
-  --color-inverse-on-surface: #eff1f3;
-
-  /* Error */
-  --color-error: #ba1a1a;
-  --color-error-container: #ffdad6;
-  --color-on-error: #ffffff;
-  --color-on-error-container: #93000a;
-
-  /* Typography */
-  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI',
+    Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 
-/* Material Symbols */
-.material-symbols-outlined {
-  font-family: 'Material Symbols Outlined';
-  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
-  font-size: 24px;
-  line-height: 1;
-  display: inline-block;
-  vertical-align: middle;
-  user-select: none;
+html,
+body {
+  background: var(--ios-bg);
+  color: var(--ios-label);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior-y: none;
 }
 
-/* Glassmorphism header */
-.glass-header {
-  background: rgba(30, 58, 95, 0.85);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+/* ── Navigation bar (UINavigationBar) ─────────────────────────────────────── */
+.nav-bar {
+  background: var(--ios-bar);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 0.5px solid var(--ios-separator);
 }
 
-/* Ambient bento shadow */
-.bento-shadow {
-  box-shadow: 0 32px 32px -4px rgba(2, 36, 72, 0.08);
+/* ── Tab bar (UITabBar) ───────────────────────────────────────────────────── */
+.tab-bar {
+  background: var(--ios-bar);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-top: 0.5px solid var(--ios-separator);
 }
 
-/* Scrollbar hide */
-.no-scrollbar::-webkit-scrollbar { display: none; }
-.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+/* ── Grouped inset card (UITableView insetGrouped) ────────────────────────── */
+.ios-card {
+  background: var(--ios-card);
+  border-radius: 14px;
+}
+@media (prefers-color-scheme: light) {
+  .ios-card {
+    box-shadow: 0 0 0 0.5px rgba(60, 60, 67, 0.06);
+  }
+}
+
+/* Rows inside a grouped card, separated by inset hairlines */
+.ios-row {
+  position: relative;
+}
+.ios-row + .ios-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 16px;
+  right: 0;
+  height: 0.5px;
+  background: var(--ios-separator);
+}
+
+/* Section header above a grouped card */
+.ios-section-header {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: var(--ios-label-2);
+  padding: 0 16px 7px;
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+.btn-filled {
+  background: var(--ios-tint);
+  color: var(--ios-on-tint);
+  border-radius: 14px;
+  height: 50px;
+  font-size: 17px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: opacity 0.15s ease;
+}
+.btn-filled:active {
+  opacity: 0.75;
+}
+.btn-filled:disabled {
+  opacity: 0.4;
+}
+
+.btn-tinted {
+  background: var(--ios-tint-soft);
+  color: var(--ios-tint);
+  border-radius: 14px;
+  height: 50px;
+  font-size: 17px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: opacity 0.15s ease;
+}
+.btn-tinted:active {
+  opacity: 0.65;
+}
+
+.btn-gray {
+  background: var(--ios-fill);
+  color: var(--ios-label);
+  border-radius: 14px;
+  height: 50px;
+  font-size: 17px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: opacity 0.15s ease;
+}
+.btn-gray:active {
+  opacity: 0.65;
+}
+
+/* Plain tappable rows/cells highlight like UITableViewCell selection */
+.tappable {
+  transition: background-color 0.12s ease;
+}
+.tappable:active {
+  background-color: var(--ios-fill);
+}
+
+/* ── Inputs (grouped-list style) ──────────────────────────────────────────── */
+.ios-input {
+  width: 100%;
+  background: transparent;
+  font-size: 17px;
+  color: var(--ios-label);
+  outline: none;
+  border: none;
+  min-height: 44px;
+}
+.ios-input::placeholder {
+  color: var(--ios-label-3);
+}
+
+/* iOS switch */
+.ios-switch {
+  position: relative;
+  width: 51px;
+  height: 31px;
+  border-radius: 16px;
+  background: var(--ios-fill-strong);
+  transition: background-color 0.2s ease;
+  flex-shrink: 0;
+}
+.ios-switch[data-on='true'] {
+  background: var(--ios-green);
+}
+.ios-switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.15), 0 1px 1px rgba(0, 0, 0, 0.16);
+  transition: transform 0.2s ease;
+}
+.ios-switch[data-on='true']::after {
+  transform: translateX(20px);
+}
+
+/* ── Misc ─────────────────────────────────────────────────────────────────── */
+.ios-spinner {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2.5px solid var(--ios-fill-strong);
+  border-top-color: var(--ios-label-2);
+  animation: ios-spin 0.8s linear infinite;
+}
+@keyframes ios-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Fade-and-rise entrance for page content */
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.rise-in {
+  animation: rise-in 0.35s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}

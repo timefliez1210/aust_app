@@ -3,6 +3,9 @@
   import { capture } from '$lib/stores/capture.svelte';
   import { auth } from '$lib/stores/auth.svelte';
   import { apiPostForm, ApiError } from '$lib/api/client';
+  import NavBar from '$lib/components/NavBar.svelte';
+  import { tapHaptic, successHaptic, errorHaptic } from '$lib/haptics';
+  import { Box, CircleAlert, Ruler } from 'lucide-svelte';
 
   let name = $state(auth.customer?.name || '');
   let email = $state(auth.customer?.email || '');
@@ -22,17 +25,12 @@
   let error: string | null = $state(null);
   let errorDetail: string | null = $state(null);
 
-  const floors = ['EG', '1. OG', '2. OG', '3. OG', '4. OG', '5. OG', 'DG', 'UG'];
+  const floors = ['UG', 'EG', '1. OG', '2. OG', '3. OG', '4. OG', '5. OG', 'DG'];
 
-  const serviceOptions = [
-    { key: 'Montage', icon: 'build' },
-    { key: 'Demontage', icon: 'handyman' },
-    { key: 'Verpackungsservice', icon: 'inventory_2' },
-    { key: 'Einlagerung', icon: 'warehouse' },
-    { key: 'Entsorgung', icon: 'delete_forever' },
-  ];
+  const serviceOptions = ['Montage', 'Demontage', 'Verpackungsservice', 'Einlagerung', 'Entsorgung'];
 
   function toggleService(s: string) {
+    tapHaptic();
     if (services.includes(s)) services = services.filter(x => x !== s);
     else services = [...services, s];
   }
@@ -99,9 +97,17 @@
       if (services.length) formData.append('services', services.join(','));
       if (message) formData.append('message', message);
 
-      // AR item manifest — tells the backend which frames belong to which item
+      // AR item manifest — which frames belong to which item, plus on-device
+      // LiDAR volumes when available (backend skips server-side vision if every
+      // item carries one).
       formData.append('item_manifest', JSON.stringify(
-        capture.items.map(item => ({ label: item.label, frame_count: item.frames.length }))
+        capture.items.map(item => ({
+          label: item.label,
+          frame_count: item.frames.length,
+          ...(item.volumeM3 != null ? { device_volume_m3: item.volumeM3 } : {}),
+          ...(item.dimsM ? { dims_m: item.dimsM } : {}),
+          ...(item.deviceConfidence != null ? { device_confidence: item.deviceConfidence } : {}),
+        }))
       ));
       if (capture.intrinsics) {
         formData.append('intrinsics', JSON.stringify(capture.intrinsics));
@@ -112,7 +118,7 @@
       ));
 
       let idx = 0;
-      for (const item of capture.items) {
+      for (const item of compressedItems) {
         for (const frame of item.frames) {
           const blob = base64ToBlob(frame.imageBase64, 'image/jpeg');
           formData.append('images', blob, `item_${item.id}_frame_${idx}.jpg`);
@@ -125,10 +131,12 @@
       }
 
       const result = await apiPostForm<{ inquiry_id: string }>('/api/v1/submit/mobile/ar', formData);
+      successHaptic();
       capture.clear();
       localStorage.setItem('aust_pending_inquiry', result.inquiry_id);
       goto(`/scan/processing?inquiry_id=${result.inquiry_id}`);
     } catch (e: any) {
+      errorHaptic();
       const isApi = e instanceof ApiError;
       const safeMeta = (() => {
         // Don't expose the full API base URL on the off-chance this is a
@@ -172,262 +180,179 @@
     return new Blob([arr], { type: mime });
   }
 
-  let formEl: HTMLFormElement;
+  let formEl: HTMLFormElement | undefined = $state();
 </script>
 
-<!-- Glass header -->
-<header class="fixed top-0 w-full z-50 glass-header bento-shadow" style="padding-top: env(safe-area-inset-top, 0px);">
-  <div class="h-16 flex justify-between items-center px-6">
-    <div class="flex items-center gap-3">
-      <button onclick={() => goto('/scan')} class="text-white/80 active:scale-95 transition-all">
-        <span class="material-symbols-outlined">arrow_back</span>
-      </button>
-      <h1 class="text-white text-sm font-bold tracking-tight uppercase">Umzugsdetails</h1>
-    </div>
-    <span class="text-secondary-container text-xs font-bold uppercase tracking-widest">Schritt 2/3</span>
-  </div>
-</header>
+<NavBar title="Umzugsdetails" back="/scan" />
 
-<main class="px-5 max-w-lg mx-auto" style="padding-top: calc(4rem + env(safe-area-inset-top, 0px) + 1rem); padding-bottom: calc(8rem + env(safe-area-inset-bottom, 0px));">
-  <!-- Progress bar -->
-  <div class="mb-7 pt-4">
-    <div class="flex justify-between mb-2">
-      <span class="text-primary font-bold text-xs tracking-widest uppercase">Adressdetails</span>
-      <span class="text-secondary font-bold text-xs tracking-widest uppercase">66%</span>
-    </div>
-    <div class="h-2 w-full bg-primary-fixed rounded-full overflow-hidden">
-      <div class="h-full bg-secondary rounded-full transition-all duration-700 ease-out" style="width: 66%;"></div>
-    </div>
-  </div>
-
-  <form bind:this={formEl} onsubmit={submit} class="space-y-4">
-    <!-- Contact info -->
-    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
-      <div class="flex items-center gap-2 mb-4">
-        <span class="material-symbols-outlined text-primary" style="font-size: 20px;">person</span>
-        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">Kontaktdaten</h3>
-      </div>
-      <div class="space-y-3">
-        <div>
-          <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Name *</label>
-          <input
-            bind:value={name}
-            required
-            placeholder="Max Mustermann"
-            class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all duration-200"
-            style="border: none;"
-          />
-        </div>
-        <div>
-          <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">E-Mail *</label>
-          <input
-            type="email"
-            bind:value={email}
-            required
-            placeholder="max@beispiel.de"
-            class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all duration-200"
-            style="border: none;"
-          />
-        </div>
-        <div>
-          <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Telefon <span class="normal-case font-normal tracking-normal">(optional)</span></label>
-          <input
-            type="tel"
-            bind:value={phone}
-            placeholder="+49 151 12345678"
-            class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all duration-200"
-            style="border: none;"
-          />
-        </div>
-      </div>
-    </div>
-
-    <!-- Departure address -->
-    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
-      <div class="flex items-center gap-2 mb-4">
-        <span class="material-symbols-outlined text-primary" style="font-size: 20px;">location_on</span>
-        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">Auszugsadresse</h3>
-      </div>
-      <div class="space-y-3">
-        <div>
-          <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Straße & Hausnr., PLZ Ort</label>
-          <input
-            bind:value={departureAddress}
-            required
-            placeholder="Musterstr. 1, 80331 München"
-            class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all duration-200"
-            style="border: none;"
-          />
-        </div>
-        <div class="flex items-center gap-2">
-          <div class="flex-1">
-            <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Etage</label>
-            <select
-              bind:value={departureFloor}
-              class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface outline-none transition-all"
-              style="border: none;"
-            >
-              {#each floors as f}<option>{f}</option>{/each}
-            </select>
+<main
+  class="px-4 max-w-lg mx-auto rise-in"
+  style="padding-top: calc(3rem + env(safe-area-inset-top, 0px) + 1rem); padding-bottom: calc(7.5rem + env(safe-area-inset-bottom, 0px));"
+>
+  <form bind:this={formEl} onsubmit={submit}>
+    <!-- Scanned items summary -->
+    {#if capture.items.length > 0}
+      <p class="ios-section-header">Erfasste Objekte</p>
+      <div class="ios-card mb-6">
+        {#each capture.items as item}
+          <div class="ios-row flex items-center gap-3 px-4 py-2.5">
+            <div class="w-8 h-8 rounded-lg bg-tint-soft flex items-center justify-center shrink-0 text-tint">
+              <Box size={15} strokeWidth={2} />
+            </div>
+            <span class="flex-1 text-[15px] text-label">{item.label}</span>
+            {#if item.volumeM3 != null}
+              <span class="inline-flex items-center gap-1 text-[13px] text-label-2">
+                <Ruler size={12} />
+                ≈ {item.volumeM3.toFixed(1)} m³
+              </span>
+            {:else}
+              <span class="text-[13px] text-label-3">{item.frames.length} Fotos</span>
+            {/if}
           </div>
-          <button
-            type="button"
-            onclick={() => departureElevator = !departureElevator}
-            class="flex flex-col items-center gap-1 px-4 py-2.5 rounded-xl transition-all duration-200 mt-5 {departureElevator ? 'bg-primary text-white' : 'bg-surface-container text-on-surface-variant'}"
-          >
-            <span class="material-symbols-outlined" style="font-size: 18px;">elevator</span>
-            <span class="text-[9px] font-bold uppercase tracking-wide">Aufzug</span>
-          </button>
-          <button
-            type="button"
-            onclick={() => departureParkingBan = !departureParkingBan}
-            class="flex flex-col items-center gap-1 px-3 py-2.5 rounded-xl transition-all duration-200 mt-5 {departureParkingBan ? 'bg-secondary-container text-on-secondary-container' : 'bg-surface-container text-on-surface-variant'}"
-          >
-            <span class="material-symbols-outlined" style="font-size: 18px;">traffic</span>
-            <span class="text-[9px] font-bold uppercase tracking-wide leading-none text-center">Halte-<br/>verbot</span>
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Arrival address -->
-    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
-      <div class="flex items-center gap-2 mb-4">
-        <span class="material-symbols-outlined text-secondary" style="font-size: 20px;">flag</span>
-        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">Einzugsadresse</h3>
-      </div>
-      <div class="space-y-3">
-        <div>
-          <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Straße & Hausnr., PLZ Ort</label>
-          <input
-            bind:value={arrivalAddress}
-            required
-            placeholder="Zielstr. 2, 80331 München"
-            class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all duration-200"
-            style="border: none;"
-          />
-        </div>
-        <div class="flex items-center gap-2">
-          <div class="flex-1">
-            <label class="text-[10px] font-bold uppercase tracking-wider text-outline block mb-1 ml-1">Etage</label>
-            <select
-              bind:value={arrivalFloor}
-              class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface outline-none transition-all"
-              style="border: none;"
-            >
-              {#each floors as f}<option>{f}</option>{/each}
-            </select>
+        {/each}
+        {#if capture.deviceVolumeM3 != null}
+          <div class="ios-row flex items-center justify-between px-4 py-2.5">
+            <span class="text-[15px] font-semibold text-label">Gesamtvolumen</span>
+            <span class="text-[15px] font-semibold text-tint">≈ {capture.deviceVolumeM3.toFixed(1)} m³</span>
           </div>
-          <button
-            type="button"
-            onclick={() => arrivalElevator = !arrivalElevator}
-            class="flex flex-col items-center gap-1 px-4 py-2.5 rounded-xl transition-all duration-200 mt-5 {arrivalElevator ? 'bg-primary text-white' : 'bg-surface-container text-on-surface-variant'}"
-          >
-            <span class="material-symbols-outlined" style="font-size: 18px;">elevator</span>
-            <span class="text-[9px] font-bold uppercase tracking-wide">Aufzug</span>
-          </button>
-          <button
-            type="button"
-            onclick={() => arrivalParkingBan = !arrivalParkingBan}
-            class="flex flex-col items-center gap-1 px-3 py-2.5 rounded-xl transition-all duration-200 mt-5 {arrivalParkingBan ? 'bg-secondary-container text-on-secondary-container' : 'bg-surface-container text-on-surface-variant'}"
-          >
-            <span class="material-symbols-outlined" style="font-size: 18px;">traffic</span>
-            <span class="text-[9px] font-bold uppercase tracking-wide leading-none text-center">Halte-<br/>verbot</span>
-          </button>
-        </div>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- Contact -->
+    <p class="ios-section-header">Kontakt</p>
+    <div class="ios-card mb-6">
+      <div class="ios-row flex items-center px-4">
+        <span class="w-20 text-[15px] text-label-2 shrink-0">Name</span>
+        <input bind:value={name} required placeholder="Max Mustermann" class="ios-input" autocomplete="name" />
+      </div>
+      <div class="ios-row flex items-center px-4">
+        <span class="w-20 text-[15px] text-label-2 shrink-0">E-Mail</span>
+        <input type="email" bind:value={email} required placeholder="max@beispiel.de" class="ios-input" autocomplete="email" />
+      </div>
+      <div class="ios-row flex items-center px-4">
+        <span class="w-20 text-[15px] text-label-2 shrink-0">Telefon</span>
+        <input type="tel" bind:value={phone} placeholder="Optional" class="ios-input" autocomplete="tel" />
       </div>
     </div>
 
-    <!-- Preferred date -->
-    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
-      <div class="flex items-center gap-2 mb-4">
-        <span class="material-symbols-outlined text-primary" style="font-size: 20px;">calendar_today</span>
-        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">Wunschtermin</h3>
+    <!-- Departure -->
+    <p class="ios-section-header">Auszugsadresse</p>
+    <div class="ios-card mb-6">
+      <div class="ios-row px-4 py-1">
+        <input bind:value={departureAddress} required placeholder="Straße Nr., PLZ Ort" class="ios-input" autocomplete="street-address" />
       </div>
-      <input
-        type="date"
-        bind:value={preferredDate}
-        class="w-full h-12 px-4 bg-surface-container-high rounded-xl text-on-surface outline-none transition-all"
-        style="border: none;"
-      />
+      <div class="ios-row flex items-center justify-between px-4 min-h-[44px]">
+        <span class="text-[15px] text-label">Etage</span>
+        <select bind:value={departureFloor} class="text-[15px] text-label-2 bg-transparent outline-none text-right">
+          {#each floors as f}<option>{f}</option>{/each}
+        </select>
+      </div>
+      <div class="ios-row flex items-center justify-between px-4 min-h-[44px]">
+        <span class="text-[15px] text-label">Aufzug vorhanden</span>
+        <button type="button" role="switch" aria-checked={departureElevator} aria-label="Aufzug vorhanden"
+          class="ios-switch" data-on={departureElevator}
+          onclick={() => { tapHaptic(); departureElevator = !departureElevator; }}></button>
+      </div>
+      <div class="ios-row flex items-center justify-between px-4 min-h-[44px]">
+        <span class="text-[15px] text-label">Halteverbot beantragen</span>
+        <button type="button" role="switch" aria-checked={departureParkingBan} aria-label="Halteverbot beantragen"
+          class="ios-switch" data-on={departureParkingBan}
+          onclick={() => { tapHaptic(); departureParkingBan = !departureParkingBan; }}></button>
+      </div>
+    </div>
+
+    <!-- Arrival -->
+    <p class="ios-section-header">Einzugsadresse</p>
+    <div class="ios-card mb-6">
+      <div class="ios-row px-4 py-1">
+        <input bind:value={arrivalAddress} required placeholder="Straße Nr., PLZ Ort" class="ios-input" />
+      </div>
+      <div class="ios-row flex items-center justify-between px-4 min-h-[44px]">
+        <span class="text-[15px] text-label">Etage</span>
+        <select bind:value={arrivalFloor} class="text-[15px] text-label-2 bg-transparent outline-none text-right">
+          {#each floors as f}<option>{f}</option>{/each}
+        </select>
+      </div>
+      <div class="ios-row flex items-center justify-between px-4 min-h-[44px]">
+        <span class="text-[15px] text-label">Aufzug vorhanden</span>
+        <button type="button" role="switch" aria-checked={arrivalElevator} aria-label="Aufzug vorhanden"
+          class="ios-switch" data-on={arrivalElevator}
+          onclick={() => { tapHaptic(); arrivalElevator = !arrivalElevator; }}></button>
+      </div>
+      <div class="ios-row flex items-center justify-between px-4 min-h-[44px]">
+        <span class="text-[15px] text-label">Halteverbot beantragen</span>
+        <button type="button" role="switch" aria-checked={arrivalParkingBan} aria-label="Halteverbot beantragen"
+          class="ios-switch" data-on={arrivalParkingBan}
+          onclick={() => { tapHaptic(); arrivalParkingBan = !arrivalParkingBan; }}></button>
+      </div>
+    </div>
+
+    <!-- Date -->
+    <p class="ios-section-header">Wunschtermin</p>
+    <div class="ios-card mb-6">
+      <div class="flex items-center justify-between px-4 min-h-[44px]">
+        <span class="text-[15px] text-label">Datum</span>
+        <input type="date" bind:value={preferredDate} class="text-[15px] text-label-2 bg-transparent outline-none text-right" />
+      </div>
     </div>
 
     <!-- Services -->
-    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
-      <div class="flex items-center gap-2 mb-4">
-        <span class="material-symbols-outlined text-primary" style="font-size: 20px;">home_repair_service</span>
-        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">Zusatzleistungen</h3>
-      </div>
+    <p class="ios-section-header">Zusatzleistungen</p>
+    <div class="ios-card mb-6 p-4">
       <div class="flex flex-wrap gap-2">
         {#each serviceOptions as svc}
           <button
             type="button"
-            onclick={() => toggleService(svc.key)}
-            class="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold uppercase tracking-wide transition-all duration-200
-              {services.includes(svc.key)
-                ? 'bg-primary text-white'
-                : 'bg-surface-container text-on-surface-variant hover:bg-surface-container-high'}"
+            onclick={() => toggleService(svc)}
+            class="h-9 px-4 rounded-full text-[14px] font-medium transition-colors
+              {services.includes(svc) ? 'bg-tint text-on-tint' : 'bg-fill text-label'}"
           >
-            <span class="material-symbols-outlined" style="font-size: 14px;">{svc.icon}</span>
-            {svc.key}
+            {svc}
           </button>
         {/each}
       </div>
     </div>
 
     <!-- Notes -->
-    <div class="bg-surface-container-lowest rounded-2xl p-5 bento-shadow">
-      <div class="flex items-center gap-2 mb-4">
-        <span class="material-symbols-outlined text-primary" style="font-size: 20px;">edit_note</span>
-        <h3 class="font-bold text-xs tracking-widest uppercase text-on-surface">
-          Besondere Hinweise
-          <span class="text-outline normal-case font-normal tracking-normal text-xs"> (optional)</span>
-        </h3>
-      </div>
+    <p class="ios-section-header">Besondere Hinweise</p>
+    <div class="ios-card mb-6 px-4 py-2">
       <textarea
         bind:value={message}
         rows="3"
-        placeholder="Antikes Klavier, empfindliche Kunstwerke, Besonderheiten..."
-        class="w-full px-4 py-3 bg-surface-container-high rounded-xl text-on-surface placeholder:text-outline outline-none transition-all resize-none"
-        style="border: none;"
+        placeholder="Antikes Klavier, empfindliche Kunstwerke, Besonderheiten …"
+        class="ios-input resize-none py-2"
       ></textarea>
     </div>
 
     {#if error}
-      <div class="rounded-xl bg-error-container p-4 text-sm text-on-error-container">
-        <div class="flex items-center gap-2 mb-1">
-          <span class="material-symbols-outlined text-error" style="font-size: 18px;">error</span>
-          <span class="font-bold">{error}</span>
+      <div class="ios-card mb-6 p-4" style="background: var(--ios-red-soft);">
+        <div class="flex items-center gap-2 mb-1 text-red">
+          <CircleAlert size={18} />
+          <span class="text-[15px] font-semibold">{error}</span>
         </div>
         {#if errorDetail}
-          <pre class="mt-2 p-2 bg-error/10 rounded-lg text-[11px] text-on-error-container/70 whitespace-pre-wrap break-all font-mono overflow-x-auto">{errorDetail}</pre>
+          <pre class="mt-2 p-2 rounded-lg text-[11px] text-label-2 whitespace-pre-wrap break-all font-mono overflow-x-auto bg-fill">{errorDetail}</pre>
         {/if}
       </div>
     {/if}
   </form>
 </main>
 
-<!-- Fixed bottom action bar -->
-<div class="fixed bottom-0 left-0 w-full z-50" style="background: rgba(255,255,255,0.92); backdrop-filter: blur(20px); border-top: 1px solid rgba(196,198,207,0.15); padding-bottom: env(safe-area-inset-bottom, 0px);">
-  <div class="max-w-lg mx-auto flex items-center justify-between gap-4 px-5 py-4">
-    <button
-      onclick={() => goto('/scan')}
-      class="text-secondary font-bold text-sm tracking-widest uppercase"
-    >
-      Zurück
-    </button>
+<!-- Bottom action bar -->
+<div class="fixed bottom-0 left-0 w-full z-50 tab-bar" style="padding-bottom: env(safe-area-inset-bottom, 0px);">
+  <div class="max-w-lg mx-auto px-4 py-3">
     <button
       type="button"
-      onclick={() => formEl?.requestSubmit()}
+      onclick={() => { tapHaptic(); formEl?.requestSubmit(); }}
       disabled={submitting || !name || !email || !departureAddress || !arrivalAddress}
-      class="bg-gradient-to-br from-primary to-primary-container text-white px-8 py-3.5 rounded-xl font-bold text-sm tracking-wide uppercase bento-shadow active:scale-95 transition-all disabled:opacity-50 flex items-center gap-2"
+      class="btn-filled w-full"
     >
       {#if submitting}
-        <div class="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin"></div>
-        Wird gesendet...
+        <span class="ios-spinner" style="width: 18px; height: 18px; border-top-color: #fff; border-color: rgba(255,255,255,0.3); border-top-color: #fff;"></span>
+        Wird gesendet …
       {:else}
         Anfrage senden
-        <span class="material-symbols-outlined" style="font-size: 16px;">send</span>
       {/if}
     </button>
   </div>

@@ -65,6 +65,8 @@ export interface ItemSavedEvent {
     frameCount: number;
     arcDegrees: number;
     hasDepth: boolean;
+    /** On-device volume estimate in m³ (LiDAR devices only). */
+    volumeM3?: number;
 }
 /** A complete item scan: one arc sweep around one piece of furniture. */
 export interface ItemScan {
@@ -72,6 +74,17 @@ export interface ItemScan {
     frames: ItemFrame[];
     arcDegrees: number;
     hasDepth: boolean;
+    /**
+     * On-device volume estimate in m³, computed from LiDAR depth back-projection
+     * + gravity-aligned OBB (includes packing factor). Absent on non-LiDAR
+     * devices or when depth segmentation failed — the backend then estimates
+     * server-side.
+     */
+    volumeM3?: number;
+    /** Gravity-aligned OBB dimensions [length, width, height] in metres. */
+    dimsM?: number[];
+    /** Heuristic confidence [0, 1] for the on-device measurement. */
+    deviceConfidence?: number;
 }
 export interface ItemFrame {
     /** JPEG image as base64. */

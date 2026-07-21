@@ -71,6 +71,13 @@ jobs:
       - run: npx cap add android
       - run: npx cap sync android
 
+      # Camera permission for the in-WebView getUserMedia capture flow
+      - name: Inject CAMERA permission
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.CAMERA' $MANIFEST || \
+            sed -i 's|<application|<uses-permission android:name="android.permission.CAMERA" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <application|' $MANIFEST
+
       # ── Release build (main branch only) ──
       - name: Decode keystore
         if: github.ref == 'refs/heads/main'

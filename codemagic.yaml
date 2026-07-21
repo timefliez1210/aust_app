@@ -4,6 +4,15 @@ workflows:
     max_build_duration: 60
     instance_type: mac_mini_m2
 
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+          source: true
+      cancel_previous_builds: true
+
     environment:
       groups:
         - app-stuff
@@ -26,7 +35,7 @@ workflows:
           pip3 install ultralytics coremltools==7.2
           python3 -c "
           from ultralytics import YOLO
-          model = YOLO('yolov8n.pt')
+          model = YOLO('yolo11n.pt')
           model.export(format='coreml', nms=True, imgsz=640)
           "
 
@@ -39,13 +48,13 @@ workflows:
           npx cap sync ios
 
           # Compile YOLO model and add to iOS app resources
-          xcrun coremlcompiler compile yolov8n.mlpackage ios/App/App/
+          xcrun coremlcompiler compile yolo11n.mlpackage ios/App/App/
           ruby -e "
           require 'xcodeproj'
           proj = Xcodeproj::Project.open('ios/App/App.xcodeproj')
           target = proj.targets.find { |t| t.name == 'App' }
           group = proj.main_group.find_subpath('App/App', true)
-          ref = group.new_reference('yolov8n.mlmodelc')
+          ref = group.new_reference('yolo11n.mlmodelc')
           target.resources_build_phase.add_file_reference(ref)
           proj.save
           "
@@ -110,6 +119,11 @@ workflows:
         script: |
           npx cap add android
           npx cap sync android
+
+          # Camera permission for the in-WebView getUserMedia capture flow
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.CAMERA' $MANIFEST || \
+            sed -i 's|<application|<uses-permission android:name="android.permission.CAMERA" />\n    <uses-feature android:name="android.hardware.camera" android:required="false" />\n    <application|' $MANIFEST
 
       - name: Build debug APK
         script: cd android && ./gradlew assembleDebug

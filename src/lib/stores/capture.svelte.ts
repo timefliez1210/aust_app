@@ -10,6 +10,11 @@ export interface StoredItem {
   }[];
   arcDegrees: number;
   hasDepth: boolean;
+  /** On-device LiDAR volume estimate in m³ (null on non-LiDAR / failed segmentation). */
+  volumeM3: number | null;
+  /** Gravity-aligned OBB dims [length, width, height] in metres. */
+  dimsM: number[] | null;
+  deviceConfidence: number | null;
 }
 
 class CaptureStore {
@@ -27,6 +32,9 @@ class CaptureStore {
       })),
       arcDegrees: raw.arcDegrees,
       hasDepth: raw.hasDepth,
+      volumeM3: raw.volumeM3 ?? null,
+      dimsM: raw.dimsM ?? null,
+      deviceConfidence: raw.deviceConfidence ?? null,
     });
   }
 
@@ -46,6 +54,11 @@ class CaptureStore {
   get itemCount() { return this.items.length; }
   get totalFrames() { return this.items.reduce((n, i) => n + i.frames.length, 0); }
   get hasAnyDepth() { return this.items.some(i => i.hasDepth); }
+  /** Sum of on-device volumes, or null unless every item has one. */
+  get deviceVolumeM3(): number | null {
+    if (this.items.length === 0 || this.items.some(i => i.volumeM3 == null)) return null;
+    return this.items.reduce((sum, i) => sum + (i.volumeM3 ?? 0), 0);
+  }
 }
 
 export const capture = new CaptureStore();

@@ -20,6 +20,13 @@ private struct SavedItem {
     let frames: [ItemFrame]
     let arcDegrees: Float
     let hasDepth: Bool
+    /// On-device volume estimate in m³ (LiDAR only, incl. packing factor). nil when
+    /// depth segmentation failed — the backend falls back to server-side estimation.
+    let volumeM3: Float?
+    /// Gravity-aligned OBB dimensions [length, width, height] in metres.
+    let dims: simd_float3?
+    /// Heuristic confidence [0, 1] for the on-device measurement.
+    let deviceConfidence: Float?
 }
 
 // MARK: - DetectionBox
@@ -32,6 +39,179 @@ private struct DetectionBox {
     let y: Float
     let w: Float
     let h: Float
+}
+
+// MARK: - VolumeAccumulator
+//
+// On-device volume estimation for LiDAR devices. Per captured frame, the object
+// the user is orbiting (kept centered during the arc sweep) is segmented out of
+// the depth map by region-growing from the frame center; segment pixels are
+// back-projected through the camera intrinsics and pose into world space. At
+// finalize, the fused cloud is trimmed (2–98 percentile per axis) and measured
+// with a gravity-aligned oriented bounding box (ARKit world: -Y is gravity).
+private final class VolumeAccumulator {
+
+    /// Subsample stride over the 256×192 depth grid.
+    private static let stride = 2
+    /// Depth continuity threshold for region growing: max(4 cm, 2% of depth).
+    private static let depthJump: Float = 0.04
+    /// Points farther than this from the seed are never part of one furniture item.
+    private static let maxRadiusFromSeed: Float = 2.5
+    /// A flood that swallows this fraction of the grid hit the walls/floor — discard frame.
+    private static let maxRegionFraction = 0.45
+    /// Loading volume includes handling space around the raw geometric OBB.
+    private static let packingFactor: Float = 1.2
+
+    private var worldPoints: [simd_float3] = []
+    private(set) var framesUsed = 0
+
+    /// Segment the centered object in one depth frame and fuse its points into
+    /// the world-space cloud. `intrinsics` and `imageSize` describe the RGB
+    /// image the depth map is registered to.
+    func ingest(depthMap: CVPixelBuffer,
+                intrinsics k: simd_float3x3,
+                imageSize: CGSize,
+                cameraTransform: simd_float4x4) {
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+        let w = CVPixelBufferGetWidth(depthMap)
+        let h = CVPixelBufferGetHeight(depthMap)
+        guard w > 0, h > 0, let base = CVPixelBufferGetBaseAddress(depthMap) else { return }
+        let rowStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
+        let ptr = base.bindMemory(to: Float32.self, capacity: rowStride * h)
+
+        // Intrinsics are for the full RGB resolution — rescale to the depth grid.
+        let sx = Float(w) / Float(imageSize.width)
+        let sy = Float(h) / Float(imageSize.height)
+        let fx = k[0][0] * sx, fy = k[1][1] * sy
+        let cx = k[2][0] * sx, cy = k[2][1] * sy
+        guard fx > 0, fy > 0 else { return }
+
+        let s = Self.stride
+        let gw = w / s, gh = h / s
+        func depthAt(_ gx: Int, _ gy: Int) -> Float {
+            ptr[(gy * s) * rowStride + gx * s]
+        }
+
+        // Seed: median depth of the central window.
+        var centerDepths: [Float] = []
+        let half = 7
+        for gy in max(0, gh / 2 - half)...min(gh - 1, gh / 2 + half) {
+            for gx in max(0, gw / 2 - half)...min(gw - 1, gw / 2 + half) {
+                let d = depthAt(gx, gy)
+                if d.isFinite && d > 0.2 && d < 6.0 { centerDepths.append(d) }
+            }
+        }
+        guard centerDepths.count >= 20 else { return }
+        centerDepths.sort()
+        let seedDepth = centerDepths[centerDepths.count / 2]
+
+        func backProject(_ gx: Int, _ gy: Int, _ d: Float) -> simd_float3 {
+            let u = Float(gx * s), v = Float(gy * s)
+            let xc = (u - cx) * d / fx
+            let yc = -(v - cy) * d / fy
+            let cam = simd_float4(xc, yc, -d, 1)
+            let world = cameraTransform * cam
+            return simd_float3(world.x, world.y, world.z)
+        }
+
+        // Region-grow (BFS, 4-neighbor) from the seed across depth-continuous pixels.
+        var visited = [Bool](repeating: false, count: gw * gh)
+        var region: [(Int, Int, Float)] = []
+        var queue: [(Int, Int, Float)] = []
+        let seed = (gw / 2, gh / 2, depthAt(gw / 2, gh / 2))
+        guard seed.2.isFinite, abs(seed.2 - seedDepth) < 0.3 else { return }
+        let seedWorld = backProject(seed.0, seed.1, seed.2)
+        queue.append(seed)
+        visited[seed.1 * gw + seed.0] = true
+        let maxRegion = Int(Double(gw * gh) * Self.maxRegionFraction)
+
+        var qi = 0
+        while qi < queue.count {
+            let (gx, gy, d) = queue[qi]
+            qi += 1
+            region.append((gx, gy, d))
+            if region.count > maxRegion { return }  // flooded into the room — unusable frame
+
+            for (nx, ny) in [(gx - 1, gy), (gx + 1, gy), (gx, gy - 1), (gx, gy + 1)] {
+                guard nx >= 0, nx < gw, ny >= 0, ny < gh, !visited[ny * gw + nx] else { continue }
+                visited[ny * gw + nx] = true
+                let nd = depthAt(nx, ny)
+                guard nd.isFinite, nd > 0.2, nd < 6.0,
+                      abs(nd - d) < max(Self.depthJump, 0.02 * d),
+                      simd_distance(backProject(nx, ny, nd), seedWorld) < Self.maxRadiusFromSeed
+                else { continue }
+                queue.append((nx, ny, nd))
+            }
+        }
+        guard region.count >= 150 else { return }  // too small to be the item
+
+        // Fuse into the world cloud, capped per frame.
+        let cap = 6000
+        let keepEvery = max(1, region.count / cap)
+        var added = 0
+        for (i, (gx, gy, d)) in region.enumerated() where i % keepEvery == 0 {
+            worldPoints.append(backProject(gx, gy, d))
+            added += 1
+        }
+        if added > 0 { framesUsed += 1 }
+    }
+
+    /// Measure the fused cloud. Returns (loading volume m³, dims [l, w, h]) or nil.
+    func finalize() -> (volume: Float, dims: simd_float3, confidence: Float)? {
+        guard framesUsed >= 1, worldPoints.count >= 400 else { return nil }
+
+        func trimmedExtent(_ values: [Float]) -> (lo: Float, hi: Float) {
+            let sorted = values.sorted()
+            let lo = sorted[Int(Float(sorted.count - 1) * 0.02)]
+            let hi = sorted[Int(Float(sorted.count - 1) * 0.98)]
+            return (lo, hi)
+        }
+
+        // Trim outliers per world axis, keeping points inside the trimmed box.
+        let ex = trimmedExtent(worldPoints.map { $0.x })
+        let ey = trimmedExtent(worldPoints.map { $0.y })
+        let ez = trimmedExtent(worldPoints.map { $0.z })
+        let pts = worldPoints.filter {
+            $0.x >= ex.lo && $0.x <= ex.hi &&
+            $0.y >= ey.lo && $0.y <= ey.hi &&
+            $0.z >= ez.lo && $0.z <= ez.hi
+        }
+        guard pts.count >= 300 else { return nil }
+
+        // Gravity-aligned OBB: height straight from Y; footprint via 2D PCA on XZ.
+        let height = ey.hi - ey.lo
+        let mx = pts.reduce(Float(0)) { $0 + $1.x } / Float(pts.count)
+        let mz = pts.reduce(Float(0)) { $0 + $1.z } / Float(pts.count)
+        var cxx: Float = 0, cxz: Float = 0, czz: Float = 0
+        for p in pts {
+            let dx = p.x - mx, dz = p.z - mz
+            cxx += dx * dx; cxz += dx * dz; czz += dz * dz
+        }
+        cxx /= Float(pts.count); cxz /= Float(pts.count); czz /= Float(pts.count)
+        // Principal axis angle of the 2×2 covariance matrix.
+        let theta = 0.5 * atan2(2 * cxz, cxx - czz)
+        let ct = cos(theta), st = sin(theta)
+        let a = trimmedExtent(pts.map { ($0.x - mx) * ct + ($0.z - mz) * st })
+        let b = trimmedExtent(pts.map { -($0.x - mx) * st + ($0.z - mz) * ct })
+        let da = a.hi - a.lo, db = b.hi - b.lo
+
+        let length = max(da, db), width = min(da, db)
+        guard height > 0.05, length > 0.05, width > 0.02 else { return nil }
+
+        let volume = length * width * height * Self.packingFactor
+        guard volume.isFinite, volume > 0.005, volume < 12.0 else { return nil }
+
+        // More usable frames and denser clouds → higher confidence.
+        let confidence = min(0.9, 0.5 + 0.08 * Float(framesUsed) + 0.00001 * Float(pts.count))
+        return (volume, simd_float3(length, width, height), confidence)
+    }
+
+    func reset() {
+        worldPoints.removeAll()
+        framesUsed = 0
+    }
 }
 
 // MARK: - DepthCapturePlugin
@@ -71,8 +251,14 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     private var scanRefQuaternion: simd_quatf?
     private var scanAccumulatedDeg: Float = 0
     private var scanPrevQuaternion: simd_quatf?
+    private var scanLastCapturedDeg: Float = -Float.greatestFiniteMagnitude
+    private let scanVolume = VolumeAccumulator()
     private static let arcThresholdDeg: Float = 28
     private static let minFrames = 4
+    /// Encode a frame every N degrees of sweep instead of every render tick —
+    /// 28° yields ~8 frames instead of 100+, keeping upload size and the render
+    /// loop sane.
+    private static let captureEveryDeg: Float = 3.5
 
     // ── Items ─────────────────────────────────────────────────────────────
     private var savedItems: [SavedItem] = []
@@ -134,10 +320,14 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
                 fd["depthMapBase64"] = f.depthMapBase64 as Any
                 return fd
             }
-            return [
+            var dict: [String: Any] = [
                 "label": item.label, "frames": frames,
                 "arcDegrees": item.arcDegrees, "hasDepth": item.hasDepth,
             ]
+            if let v = item.volumeM3 { dict["volumeM3"] = v }
+            if let d = item.dims { dict["dimsM"] = [d.x, d.y, d.z] }
+            if let c = item.deviceConfidence { dict["deviceConfidence"] = c }
+            return dict
         }
         call.resolve(["items": result])
     }
@@ -231,6 +421,8 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         scanRefQuaternion = nil
         scanPrevQuaternion = nil
         scanAccumulatedDeg = 0
+        scanLastCapturedDeg = -Float.greatestFiniteMagnitude
+        scanVolume.reset()
         scanActive = true
         clearDetectionLayers()
         overlay?.setState(.arcSweep)
@@ -256,11 +448,22 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
             }
         }
 
-        let imageBase64 = pixelBufferToJPEGBase64(frame.capturedImage)
-        var depthBase64: String?
-        if hasLidar, let dm = frame.sceneDepth?.depthMap { depthBase64 = depthMapToBase64PNG(dm) }
-        scanFrames.append(ItemFrame(imageBase64: imageBase64, depthMapBase64: depthBase64,
-                                    pose: transformToFloatArray(frame.camera.transform)))
+        // Encode + fuse only every ~3.5° of sweep; encoding every render tick
+        // stutters the render loop and balloons the upload.
+        if scanAccumulatedDeg - scanLastCapturedDeg >= Self.captureEveryDeg || scanFrames.isEmpty {
+            scanLastCapturedDeg = scanAccumulatedDeg
+            let imageBase64 = pixelBufferToJPEGBase64(frame.capturedImage)
+            var depthBase64: String?
+            if hasLidar, let dm = frame.sceneDepth?.depthMap {
+                depthBase64 = depthMapToBase64PNG(dm)
+                scanVolume.ingest(depthMap: dm,
+                                  intrinsics: frame.camera.intrinsics,
+                                  imageSize: frame.camera.imageResolution,
+                                  cameraTransform: frame.camera.transform)
+            }
+            scanFrames.append(ItemFrame(imageBase64: imageBase64, depthMapBase64: depthBase64,
+                                        pose: transformToFloatArray(frame.camera.transform)))
+        }
 
         if scanAccumulatedDeg >= Self.arcThresholdDeg && scanFrames.count >= Self.minFrames {
             finalizeScan()
@@ -269,17 +472,23 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
 
     private func finalizeScan() {
         scanActive = false
+        let measured = scanVolume.finalize()
         let item = SavedItem(label: scanLabel, frames: scanFrames,
                              arcDegrees: scanAccumulatedDeg,
-                             hasDepth: scanFrames.contains { $0.depthMapBase64 != nil })
+                             hasDepth: scanFrames.contains { $0.depthMapBase64 != nil },
+                             volumeM3: measured?.volume,
+                             dims: measured?.dims,
+                             deviceConfidence: measured?.confidence)
         savedItems.append(item)
-        notifyListeners("itemSaved", data: [
+        var eventData: [String: Any] = [
             "label": item.label, "frameCount": item.frames.count,
             "arcDegrees": item.arcDegrees, "hasDepth": item.hasDepth,
-        ])
+        ]
+        if let v = item.volumeM3 { eventData["volumeM3"] = v }
+        notifyListeners("itemSaved", data: eventData)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.overlay?.showSavedFlash(label: self.scanLabel)
+            self.overlay?.showSavedFlash(label: self.scanLabel, volumeM3: item.volumeM3)
             self.overlay?.updateItemCount(self.savedItems.count)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 self?.overlay?.setState(.idle)
@@ -327,7 +536,7 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - YOLO
 
     private func loadYOLOModel() {
-        let names = ["yolov8n", "YOLOv8n", "YOLOv11n"]
+        let names = ["yolo11n", "YOLOv11n", "yolov8n", "YOLOv8n"]
         let bundles = [Bundle.module, Bundle.main]
         var modelURL: URL?
         for name in names {
@@ -360,7 +569,9 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         let request = VNCoreMLRequest(model: model) { [weak self] req, _ in
             guard let self, let results = req.results as? [VNRecognizedObjectObservation] else { return }
             let boxes = results.compactMap { obs -> DetectionBox? in
-                guard let top = obs.labels.first, top.confidence > 0.45 else { return nil }
+                // 0.35: detections are tap-to-confirm, so extra candidates are cheap
+                // and misses are expensive (user has to fall back to draw mode).
+                guard let top = obs.labels.first, top.confidence > 0.35 else { return nil }
                 let german = self.furnitureLabels[top.identifier] ?? ""
                 // Skip non-furniture items (person, handbag, etc.)
                 guard !german.isEmpty else { return nil }
@@ -852,8 +1063,13 @@ private class ScanOverlayView: UIView {
         UIView.animate(withDuration: 0.3) { self.sheet.transform = .identity }
     }
 
-    func showSavedFlash(label: String) {
+    func showSavedFlash(label: String, volumeM3: Float? = nil) {
         flashLabel.text = label
+        if let v = volumeM3 {
+            flashSub.text = String(format: "≈ %.1f m³ · gespeichert", v)
+        } else {
+            flashSub.text = "gespeichert"
+        }
         setState(.itemSaved)
     }
 

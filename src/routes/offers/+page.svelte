@@ -2,6 +2,8 @@
   import { goto } from '$app/navigation';
   import { apiGet } from '$lib/api/client';
   import BottomNav from '$lib/components/BottomNav.svelte';
+  import { tapHaptic } from '$lib/haptics';
+  import { Plus, FileText, Camera, ChevronRight, Ruler } from 'lucide-svelte';
 
   interface QuoteSummary {
     id: string;
@@ -36,14 +38,14 @@
 
   function statusStyle(status: string): string {
     if (['pending', 'info_requested', 'estimating', 'estimated'].includes(status))
-      return 'bg-primary-fixed text-primary';
+      return 'background: var(--ios-tint-soft); color: var(--ios-tint);';
     if (['offer_ready', 'offer_sent'].includes(status))
-      return 'bg-secondary-fixed text-secondary';
+      return 'background: var(--ios-accent-soft); color: var(--ios-accent);';
     if (status === 'accepted')
-      return 'bg-surface-container-high text-on-surface';
+      return 'background: rgba(52,199,89,0.15); color: var(--ios-green);';
     if (['rejected', 'expired', 'cancelled'].includes(status))
-      return 'bg-error-container text-error';
-    return 'bg-surface-container text-on-surface-variant';
+      return 'background: var(--ios-red-soft); color: var(--ios-red);';
+    return 'background: var(--ios-fill); color: var(--ios-label-2);';
   }
 
   function formatDate(d: string | null): string {
@@ -67,82 +69,71 @@
   $effect(() => { load(); });
 </script>
 
-<!-- Glass header -->
-<header class="fixed top-0 w-full z-50 glass-header bento-shadow" style="padding-top: env(safe-area-inset-top, 0px);">
-  <div class="h-16 flex justify-between items-center px-6">
-  <h1 class="text-white text-base font-black tracking-tight uppercase">Meine Angebote</h1>
-  <button
-    onclick={() => goto('/scan')}
-    class="flex items-center gap-1.5 bg-secondary-container text-on-secondary-container px-3 py-1.5 rounded-full text-xs font-bold uppercase tracking-wide active:scale-95 transition-all"
-  >
-    <span class="material-symbols-outlined" style="font-size: 16px;">add</span>
-    Neu
-  </button>
+<main
+  class="px-4 max-w-lg mx-auto rise-in"
+  style="padding-top: calc(env(safe-area-inset-top, 0px) + 1.25rem); padding-bottom: calc(5.5rem + env(safe-area-inset-bottom, 0px));"
+>
+  <div class="flex items-end justify-between px-1 mb-5">
+    <h1 class="text-[34px] leading-none font-bold tracking-tight text-label">Angebote</h1>
+    <button
+      onclick={() => { tapHaptic(); goto('/scan'); }}
+      class="w-9 h-9 rounded-full bg-tint-soft text-tint flex items-center justify-center"
+      aria-label="Neuer Scan"
+    >
+      <Plus size={20} strokeWidth={2.2} />
+    </button>
   </div>
-</header>
 
-<main class="px-5 max-w-lg mx-auto" style="padding-top: calc(4rem + env(safe-area-inset-top, 0px) + 2rem); padding-bottom: calc(7rem + env(safe-area-inset-bottom, 0px));">
   {#if loading}
-    <div class="flex justify-center py-20">
-      <div class="w-12 h-12 rounded-2xl bg-primary flex items-center justify-center bento-shadow">
-        <div class="w-5 h-5 border-2 border-primary-fixed/40 border-t-primary-fixed rounded-full animate-spin"></div>
-      </div>
+    <div class="flex justify-center py-24">
+      <div class="ios-spinner"></div>
     </div>
 
   {:else if quotes.length === 0}
     <div class="flex flex-col items-center py-20 text-center">
-      <div class="w-24 h-24 rounded-3xl bg-surface-container-high flex items-center justify-center mb-6">
-        <span class="material-symbols-outlined text-on-surface-variant" style="font-size: 44px;">description</span>
+      <div class="w-20 h-20 rounded-full bg-fill flex items-center justify-center mb-6 text-label-3">
+        <FileText size={36} strokeWidth={1.5} />
       </div>
-      <h2 class="text-lg font-bold text-on-surface mb-2">Noch keine Anfragen</h2>
-      <p class="text-on-surface-variant text-sm mb-8 max-w-xs leading-relaxed">
+      <h2 class="text-[20px] font-bold text-label mb-1.5">Noch keine Anfragen</h2>
+      <p class="text-label-2 text-[15px] mb-8 max-w-xs leading-relaxed">
         Starten Sie Ihren ersten Raumscan, um ein kostenloses Angebot zu erhalten.
       </p>
-      <button
-        onclick={() => goto('/scan')}
-        class="h-14 px-8 bg-gradient-to-br from-primary to-primary-container text-white font-bold rounded-xl bento-shadow active:scale-95 transition-all flex items-center gap-2"
-      >
-        <span class="material-symbols-outlined" style="font-size: 18px;">photo_camera</span>
+      <button onclick={() => { tapHaptic(); goto('/scan'); }} class="btn-filled px-8">
+        <Camera size={18} />
         Jetzt scannen
       </button>
     </div>
 
   {:else}
-    <div class="space-y-3">
+    <div class="ios-card">
       {#each quotes as quote}
         <button
-          onclick={() => goto(`/offers/${quote.id}`)}
-          class="block w-full bg-surface-container-lowest rounded-2xl p-5 text-left bento-shadow active:scale-[0.99] transition-all"
+          onclick={() => { tapHaptic(); goto(`/offers/${quote.id}`); }}
+          class="ios-row w-full flex items-center gap-3 px-4 py-3.5 tappable text-left"
         >
-          <div class="flex items-start justify-between mb-3">
-            <div>
-              <p class="text-xs text-on-surface-variant font-medium">
-                {formatDate(quote.preferred_date || quote.created_at)}
-              </p>
-              <p class="font-bold text-on-surface mt-0.5">
-                {quote.origin_city || '?'} → {quote.destination_city || '?'}
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2 mb-0.5">
+              <p class="text-[17px] text-label truncate">
+                {quote.origin_city || '–'} → {quote.destination_city || '–'}
               </p>
             </div>
-            <span class="rounded-full px-3 py-1 text-[10px] font-black uppercase tracking-wide {statusStyle(quote.status)}">
-              {statusLabels[quote.status] || quote.status}
-            </span>
+            <div class="flex items-center gap-3 text-[13px] text-label-2">
+              <span>{formatDate(quote.preferred_date || quote.created_at)}</span>
+              {#if quote.estimated_volume_m3}
+                <span class="inline-flex items-center gap-1">
+                  <Ruler size={11} />
+                  {quote.estimated_volume_m3.toFixed(1)} m³
+                </span>
+              {/if}
+              {#if quote.price_cents}
+                <span class="font-semibold text-label">{formatPrice(quote.price_cents)}</span>
+              {/if}
+            </div>
           </div>
-
-          <div class="flex items-center gap-4 pt-3" style="border-top: 1px solid rgba(196,198,207,0.15);">
-            {#if quote.estimated_volume_m3}
-              <div class="flex items-center gap-1.5 text-on-surface-variant">
-                <span class="material-symbols-outlined" style="font-size: 14px;">straighten</span>
-                <span class="text-sm font-medium">{quote.estimated_volume_m3.toFixed(1)} m³</span>
-              </div>
-            {/if}
-            {#if quote.price_cents}
-              <div class="flex items-center gap-1.5">
-                <span class="material-symbols-outlined text-secondary" style="font-size: 14px;">euro</span>
-                <span class="text-sm font-bold text-on-surface">{formatPrice(quote.price_cents)}</span>
-              </div>
-            {/if}
-            <span class="ml-auto material-symbols-outlined text-outline-variant" style="font-size: 18px;">chevron_right</span>
-          </div>
+          <span class="shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold" style={statusStyle(quote.status)}>
+            {statusLabels[quote.status] || quote.status}
+          </span>
+          <ChevronRight size={16} class="text-label-3 shrink-0" />
         </button>
       {/each}
     </div>
