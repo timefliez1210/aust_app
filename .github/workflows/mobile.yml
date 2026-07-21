@@ -127,11 +127,10 @@ jobs:
           name: web-build
           path: build/
 
-      # Generate the iOS Capacitor project (gitignored, created fresh each run)
+      # Generate the iOS Capacitor project (gitignored, created fresh each run).
+      # Capacitor 8 generates an SPM-based project — no CocoaPods.
       - run: npx cap add ios
-      - name: Install CocoaPods dependencies
-        working-directory: ios/App
-        run: pod install
+      - run: npx cap sync ios
 
       # Set up Ruby + Fastlane (Gemfile.lock ensures reproducible gem versions)
       - uses: ruby/setup-ruby@v1
