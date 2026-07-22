@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Export YOLOv11n to CoreML format for the DepthCapture plugin.
 
-Usage:
-    pip install ultralytics
+Usage (pin the trio — a bare `pip install ultralytics coremltools` pulls
+numpy 2.x + a too-new torch and the CoreML converter dies with
+"TypeError: only 0-dimensional arrays can be converted to Python scalars"):
+    pip install "numpy==1.26.4" "torch==2.4.0" "torchvision==0.19.0" "coremltools==8.1" ultralytics
     python scripts/export-yolo-coreml.py
 
-This produces YOLOv11n.mlpackage in the plugin's iOS directory.
+This produces yolo11n.mlpackage in the plugin's iOS directory.
 After export, commit the model and rebuild.
 """
 

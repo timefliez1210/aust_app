@@ -32,7 +32,15 @@ workflows:
 
       - name: Export YOLO model to CoreML
         script: |
-          pip3 install ultralytics coremltools==7.2
+          # The coremltools <-> torch <-> numpy trio must be pinned together.
+          # Leaving them to pip pulls numpy 2.x + a too-new torch, and the
+          # CoreML Torch converter then dies with
+          #   TypeError: only 0-dimensional arrays can be converted to Python scalars
+          # (numpy-2 scalar-cast change hitting coremltools' `_int` op).
+          # coremltools 8.1 is new enough for the YOLO11 graph; numpy 1.26 + torch
+          # 2.4.0 are a proven-consistent set with it.
+          pip3 install --upgrade pip
+          pip3 install "numpy==1.26.4" "torch==2.4.0" "torchvision==0.19.0" "coremltools==8.1" ultralytics
           python3 -c "
           from ultralytics import YOLO
           model = YOLO('yolo11n.pt')
