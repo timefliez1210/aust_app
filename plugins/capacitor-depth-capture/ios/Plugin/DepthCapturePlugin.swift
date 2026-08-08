@@ -74,14 +74,58 @@ private struct Measurement {
     let yaw: Float
 }
 
+// MARK: - ObjectLock
+
+/// The one object this measurement is about, tracked in world space.
+///
+/// Without it the segmentation re-decides what it is looking at on every frame
+/// ("whatever is in the middle"), and the fused cloud only ever grows — pan
+/// across a bed once and the bed is in the volume forever. The lock turns the
+/// sweep into *tracking a specific thing*: the seed is projected from `anchor`
+/// rather than taken from the reticle, and points outside the gate are dropped
+/// instead of accumulated.
+///
+/// The gate is a cylinder, not a sphere: furniture is tall-and-thin or
+/// wide-and-flat far more often than it is round, and an isotropic radius big
+/// enough for a standing fan's height is also big enough to swallow the bed
+/// next to it.
+private struct ObjectLock {
+    var anchor: simd_float3
+    /// Half-extent in the horizontal plane (XZ).
+    var horizontalRadius: Float
+    /// Half-extent along gravity (Y).
+    var halfHeight: Float
+
+    /// How far the object can reach from `anchor` in any direction — used to
+    /// sanity-check the seed depth against the distance to the anchor.
+    var reach: Float { max(horizontalRadius, halfHeight) }
+
+    func contains(_ p: simd_float3) -> Bool {
+        let dxz = simd_length(simd_float2(p.x - anchor.x, p.z - anchor.z))
+        return dxz <= horizontalRadius && abs(p.y - anchor.y) <= halfHeight
+    }
+}
+
+/// What one frame did to the model.
+private enum IngestOutcome {
+    case accepted
+    /// Frame carried no usable depth. Says nothing about tracking.
+    case unusable
+    /// The locked object is not where it should be. `centerWorld` is whatever
+    /// the reticle is on now, so the caller can decide whether the customer has
+    /// moved on to a different item.
+    case lostObject(centerWorld: simd_float3?)
+}
+
 // MARK: - VolumeAccumulator
 //
-// On-device volume estimation for LiDAR devices. Per captured frame, the object
-// the user is measuring (kept centered in the reticle) is segmented out of the
-// depth map by region-growing from the frame center; segment pixels are
-// back-projected through the camera intrinsics and pose into world space.
-// `measure()` trims the fused cloud (2–98 percentile per axis) and fits a
-// gravity-aligned oriented bounding box (ARKit world: -Y is gravity).
+// On-device volume estimation for LiDAR devices. The first frame acquires an
+// object from the reticle; from then on the object is *tracked*: its anchor is
+// projected into each new frame to place the seed, the depth map is region-grown
+// from there, and every back-projected point must fall inside the lock's gate to
+// join the cloud. `measure()` keeps only the cloud component connected to the
+// anchor, trims it (2–98 percentile per axis) and fits a gravity-aligned
+// oriented bounding box (ARKit world: -Y is gravity).
 //
 // Points are ingested on the SceneKit render thread and measured on a
 // background queue, so every access to the cloud is behind `lock`. Measuring
@@ -93,8 +137,10 @@ private final class VolumeAccumulator {
     private static let stride = 2
     /// Depth continuity threshold for region growing: max(4 cm, 2% of depth).
     private static let depthJump: Float = 0.04
-    /// Points farther than this from the seed are never part of one furniture item.
-    private static let maxRadiusFromSeed: Float = 2.5
+    /// Acquisition only: how far the first frame's region may reach from its
+    /// seed. Kept tight — the gate can widen later, but an over-wide first frame
+    /// sizes the lock around the room.
+    private static let acquisitionRadius: Float = 0.85
     /// A flood that swallows this fraction of the grid hit the walls/floor — discard frame.
     private static let maxRegionFraction = 0.45
     /// Loading volume includes handling space around the raw geometric OBB.
@@ -103,133 +149,288 @@ private final class VolumeAccumulator {
     /// updates several times a second matters more than the last few points.
     private static let maxPoints = 40_000
 
+    /// The gate may only creep outwards this far per frame. Real furniture does
+    /// not grow; a jump this big is a segmentation leak, and letting it through
+    /// once is what lets the next frame leak further.
+    private static let maxGateGrowthPerFrame: Float = 0.04
+    private static let maxHorizontalRadius: Float = 1.5
+    private static let maxHalfHeight: Float = 1.3
+    /// The anchor follows the cloud slowly, so a few bad points can't walk the
+    /// gate onto the neighbouring furniture.
+    private static let anchorSmoothing: Float = 0.05
+
     private let lock = NSLock()
     private var worldPoints: [simd_float3] = []
     private var pointSum = simd_float3(repeating: 0)
     private var framesUsedStorage = 0
     private var seedDepthStorage: Float?
+    private var lockStorage: ObjectLock?
 
     var framesUsed: Int {
         lock.lock(); defer { lock.unlock() }
         return framesUsedStorage
     }
 
-    /// Running mean of every ingested point — the anchor for orbit guidance.
-    /// Available after the first successful frame, long before a full OBB fits.
-    var centroid: simd_float3? {
+    /// The tracked object, once acquired.
+    var objectLock: ObjectLock? {
         lock.lock(); defer { lock.unlock() }
-        guard !worldPoints.isEmpty else { return nil }
-        return pointSum / Float(worldPoints.count)
+        return lockStorage
     }
 
-    /// Depth of the object at the reticle in the most recent ingested frame.
+    /// Anchor of the tracked object — what the customer orbits around.
+    var centroid: simd_float3? {
+        lock.lock(); defer { lock.unlock() }
+        return lockStorage?.anchor
+    }
+
+    /// Depth of the object at the seed in the most recent ingested frame.
     /// Drives the "step back" hint. nil until the first frame lands.
     var lastSeedDepth: Float? {
         lock.lock(); defer { lock.unlock() }
         return seedDepthStorage
     }
 
-    /// Segment the centered object in one depth frame and fuse its points into
-    /// the world-space cloud. `intrinsics` and `imageSize` describe the RGB
-    /// image the depth map is registered to. Returns true if the frame was usable.
+    /// Segment the tracked object out of one depth frame and fuse its points
+    /// into the world-space cloud. `intrinsics` and `imageSize` describe the RGB
+    /// image the depth map is registered to. `confidenceMap`, when present, is
+    /// ARKit's per-pixel `ARConfidenceLevel` — low-confidence depth around thin
+    /// edges is exactly the noise that used to inflate the box.
     @discardableResult
     func ingest(depthMap: CVPixelBuffer,
+                confidenceMap: CVPixelBuffer?,
                 intrinsics k: simd_float3x3,
                 imageSize: CGSize,
-                cameraTransform: simd_float4x4) -> Bool {
+                cameraTransform: simd_float4x4) -> IngestOutcome {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
         let w = CVPixelBufferGetWidth(depthMap)
         let h = CVPixelBufferGetHeight(depthMap)
-        guard w > 0, h > 0, let base = CVPixelBufferGetBaseAddress(depthMap) else { return false }
+        guard w > 0, h > 0, let base = CVPixelBufferGetBaseAddress(depthMap) else { return .unusable }
         let rowStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
         let ptr = base.bindMemory(to: Float32.self, capacity: rowStride * h)
+
+        // Confidence is a separate 8-bit plane at the same resolution.
+        var confPtr: UnsafeMutablePointer<UInt8>?
+        var confRowStride = 0
+        if let cm = confidenceMap,
+           CVPixelBufferGetWidth(cm) == w, CVPixelBufferGetHeight(cm) == h {
+            CVPixelBufferLockBaseAddress(cm, .readOnly)
+            confRowStride = CVPixelBufferGetBytesPerRow(cm)
+            confPtr = CVPixelBufferGetBaseAddress(cm)?.bindMemory(to: UInt8.self, capacity: confRowStride * h)
+        }
+        defer {
+            if confPtr != nil, let cm = confidenceMap { CVPixelBufferUnlockBaseAddress(cm, .readOnly) }
+        }
 
         // Intrinsics are for the full RGB resolution — rescale to the depth grid.
         let sx = Float(w) / Float(imageSize.width)
         let sy = Float(h) / Float(imageSize.height)
         let fx = k[0][0] * sx, fy = k[1][1] * sy
         let cx = k[2][0] * sx, cy = k[2][1] * sy
-        guard fx > 0, fy > 0 else { return false }
+        guard fx > 0, fy > 0 else { return .unusable }
 
         let s = Self.stride
         let gw = w / s, gh = h / s
+        guard gw > 4, gh > 4 else { return .unusable }
+
         func depthAt(_ gx: Int, _ gy: Int) -> Float {
             ptr[(gy * s) * rowStride + gx * s]
         }
-
-        // Seed: median depth of the central window.
-        var centerDepths: [Float] = []
-        let half = 7
-        for gy in max(0, gh / 2 - half)...min(gh - 1, gh / 2 + half) {
-            for gx in max(0, gw / 2 - half)...min(gw - 1, gw / 2 + half) {
-                let d = depthAt(gx, gy)
-                if d.isFinite && d > 0.2 && d < 6.0 { centerDepths.append(d) }
-            }
+        /// ARConfidenceLevel.low (0) is discarded; medium and high are kept.
+        func confidentAt(_ gx: Int, _ gy: Int) -> Bool {
+            guard let cp = confPtr else { return true }
+            return cp[(gy * s) * confRowStride + gx * s] > 0
         }
-        guard centerDepths.count >= 20 else { return false }
-        centerDepths.sort()
-        let seedDepth = centerDepths[centerDepths.count / 2]
-        lock.lock(); seedDepthStorage = seedDepth; lock.unlock()
-
         func backProject(_ gx: Int, _ gy: Int, _ d: Float) -> simd_float3 {
             let u = Float(gx * s), v = Float(gy * s)
             let xc = (u - cx) * d / fx
             let yc = -(v - cy) * d / fy
-            let cam = simd_float4(xc, yc, -d, 1)
-            let world = cameraTransform * cam
+            let world = cameraTransform * simd_float4(xc, yc, -d, 1)
             return simd_float3(world.x, world.y, world.z)
         }
+        /// Median depth of a window, so a single bad pixel can't define the seed.
+        func medianDepth(around gx: Int, _ gy: Int, half: Int) -> Float? {
+            var samples: [Float] = []
+            for y in max(0, gy - half)...min(gh - 1, gy + half) {
+                for x in max(0, gx - half)...min(gw - 1, gx + half) {
+                    let d = depthAt(x, y)
+                    if d.isFinite, d > 0.2, d < 6.0, confidentAt(x, y) { samples.append(d) }
+                }
+            }
+            guard samples.count >= 20 else { return nil }
+            samples.sort()
+            return samples[samples.count / 2]
+        }
 
-        // Region-grow (BFS, 4-neighbor) from the seed across depth-continuous pixels.
+        let currentLock = objectLock
+        let camPos = simd_float3(cameraTransform.columns.3.x,
+                                 cameraTransform.columns.3.y,
+                                 cameraTransform.columns.3.z)
+
+        // ── Seed placement ────────────────────────────────────────────────
+        // Acquisition seeds from the reticle. After that the seed follows the
+        // object, not the phone: the anchor is projected back into this frame.
+        var seedX = gw / 2, seedY = gh / 2
+        if let l = currentLock {
+            let cam = simd_inverse(cameraTransform) * simd_float4(l.anchor, 1)
+            let dist = -cam.z
+            guard dist > 0.15 else { return .lostObject(centerWorld: nil) }
+            let u = cam.x * fx / dist + cx
+            let v = -cam.y * fy / dist + cy
+            let px = Int(u) / s, py = Int(v) / s
+            guard px >= 0, px < gw, py >= 0, py < gh else {
+                return .lostObject(centerWorld: centerWorldPoint(gw: gw, gh: gh,
+                                                                 medianDepth: medianDepth,
+                                                                 backProject: backProject))
+            }
+            seedX = px; seedY = py
+        }
+
+        guard let seedDepth = medianDepth(around: seedX, seedY, half: 6) else {
+            return currentLock == nil
+                ? .unusable
+                : .lostObject(centerWorld: centerWorldPoint(gw: gw, gh: gh,
+                                                            medianDepth: medianDepth,
+                                                            backProject: backProject))
+        }
+
+        // The seed must be at roughly the distance the anchor sits at. If the
+        // object moved out of view and something else is behind it, this fails
+        // — which is precisely the "we lost it" signal.
+        if let l = currentLock {
+            let expected = simd_distance(camPos, l.anchor)
+            guard abs(seedDepth - expected) <= l.reach + 0.30 else {
+                return .lostObject(centerWorld: centerWorldPoint(gw: gw, gh: gh,
+                                                                 medianDepth: medianDepth,
+                                                                 backProject: backProject))
+            }
+        }
+
+        lock.lock(); seedDepthStorage = seedDepth; lock.unlock()
+
+        // ── Region grow (BFS, 4-neighbour) across depth-continuous pixels ──
+        let seedRaw = depthAt(seedX, seedY)
+        guard seedRaw.isFinite, abs(seedRaw - seedDepth) < 0.3 else {
+            return currentLock == nil ? .unusable : .lostObject(centerWorld: nil)
+        }
+        let seedWorld = backProject(seedX, seedY, seedRaw)
+        if let l = currentLock, !l.contains(seedWorld) {
+            return .lostObject(centerWorld: seedWorld)
+        }
+
         var visited = [Bool](repeating: false, count: gw * gh)
-        var region: [(Int, Int, Float)] = []
-        var queue: [(Int, Int, Float)] = []
-        let seed = (gw / 2, gh / 2, depthAt(gw / 2, gh / 2))
-        guard seed.2.isFinite, abs(seed.2 - seedDepth) < 0.3 else { return false }
-        let seedWorld = backProject(seed.0, seed.1, seed.2)
-        queue.append(seed)
-        visited[seed.1 * gw + seed.0] = true
+        var region: [simd_float3] = []
+        var queue: [(Int, Int, Float)] = [(seedX, seedY, seedRaw)]
+        visited[seedY * gw + seedX] = true
         let maxRegion = Int(Double(gw * gh) * Self.maxRegionFraction)
 
         var qi = 0
         while qi < queue.count {
             let (gx, gy, d) = queue[qi]
             qi += 1
-            region.append((gx, gy, d))
-            if region.count > maxRegion { return false }  // flooded into the room
+            region.append(backProject(gx, gy, d))
+            if region.count > maxRegion { return .unusable }  // flooded into the room
 
             for (nx, ny) in [(gx - 1, gy), (gx + 1, gy), (gx, gy - 1), (gx, gy + 1)] {
                 guard nx >= 0, nx < gw, ny >= 0, ny < gh, !visited[ny * gw + nx] else { continue }
                 visited[ny * gw + nx] = true
                 let nd = depthAt(nx, ny)
-                guard nd.isFinite, nd > 0.2, nd < 6.0,
-                      abs(nd - d) < max(Self.depthJump, 0.02 * d),
-                      simd_distance(backProject(nx, ny, nd), seedWorld) < Self.maxRadiusFromSeed
+                guard nd.isFinite, nd > 0.2, nd < 6.0, confidentAt(nx, ny),
+                      abs(nd - d) < max(Self.depthJump, 0.02 * d)
                 else { continue }
+                // The gate — the whole point of the lock. Anything reaching past
+                // the tracked object stops here instead of joining the cloud.
+                let world = backProject(nx, ny, nd)
+                if let l = currentLock {
+                    guard l.contains(world) else { continue }
+                } else {
+                    guard simd_distance(world, seedWorld) < Self.acquisitionRadius else { continue }
+                }
                 queue.append((nx, ny, nd))
             }
         }
-        guard region.count >= 150 else { return false }  // too small to be the item
+        guard region.count >= 150 else {
+            return currentLock == nil ? .unusable : .lostObject(centerWorld: seedWorld)
+        }
 
         // Fuse into the world cloud, capped per frame.
         let cap = 6000
         let keepEvery = max(1, region.count / cap)
         var fresh: [simd_float3] = []
         fresh.reserveCapacity(min(region.count, cap) + 1)
-        for (i, (gx, gy, d)) in region.enumerated() where i % keepEvery == 0 {
-            fresh.append(backProject(gx, gy, d))
-        }
-        guard !fresh.isEmpty else { return false }
+        for (i, p) in region.enumerated() where i % keepEvery == 0 { fresh.append(p) }
+        guard !fresh.isEmpty else { return .unusable }
 
         lock.lock()
         worldPoints.append(contentsOf: fresh)
         for p in fresh { pointSum += p }
         framesUsedStorage += 1
+        lockStorage = Self.updatedLock(lockStorage, from: fresh)
         if worldPoints.count > Self.maxPoints { halveLocked() }
         lock.unlock()
-        return true
+        return .accepted
+    }
+
+    /// World point under the reticle, regardless of the lock — the caller uses
+    /// it to tell "lost the object" from "moved on to a different object".
+    private func centerWorldPoint(gw: Int, gh: Int,
+                                  medianDepth: (Int, Int, Int) -> Float?,
+                                  backProject: (Int, Int, Float) -> simd_float3) -> simd_float3? {
+        guard let d = medianDepth(gw / 2, gh / 2, 6) else { return nil }
+        return backProject(gw / 2, gh / 2, d)
+    }
+
+    /// Pull the gate in to fit the box we actually measured.
+    ///
+    /// Acquisition has to be generous — we don't know the object yet — and a
+    /// generous gate on frame one would otherwise persist for the whole sweep,
+    /// since growth is the only other adjustment. The measured OBB comes from
+    /// the anchor-connected component, so it is the best available statement of
+    /// "this is the object", and feeding it back makes the gate converge.
+    /// Only ever shrinks; widening stays on the slow per-frame path.
+    func tightenGate(to m: Measurement, minFrames: Int) {
+        lock.lock(); defer { lock.unlock() }
+        guard var l = lockStorage, framesUsedStorage >= minFrames else { return }
+        // Margin is deliberately fat: early in a sweep the box only covers the
+        // side seen so far, and clamping to that would lock out the rest.
+        let margin: Float = 0.25
+        let horizontal = 0.5 * simd_length(simd_float2(m.dims.x, m.dims.y)) + margin
+        let vertical = 0.5 * m.dims.z + margin
+        l.anchor += (m.center - l.anchor) * 0.30
+        l.horizontalRadius = max(0.30, min(l.horizontalRadius, horizontal))
+        l.halfHeight = max(0.30, min(l.halfHeight, vertical))
+        lockStorage = l
+    }
+
+    /// Acquire the gate on the first frame, then let it creep outwards slowly.
+    private static func updatedLock(_ existing: ObjectLock?, from points: [simd_float3]) -> ObjectLock? {
+        guard !points.isEmpty else { return existing }
+        var mean = simd_float3(repeating: 0)
+        for p in points { mean += p }
+        mean /= Float(points.count)
+
+        // 95th percentile extents, so a few stragglers don't size the gate.
+        var horizontal = points.map { simd_length(simd_float2($0.x - mean.x, $0.z - mean.z)) }
+        var vertical = points.map { abs($0.y - mean.y) }
+        horizontal.sort(); vertical.sort()
+        let idx = max(0, Int(Float(points.count - 1) * 0.95))
+        let wantH = min(Self.maxHorizontalRadius, horizontal[idx] + 0.12)
+        let wantV = min(Self.maxHalfHeight, vertical[idx] + 0.12)
+
+        guard var l = existing else {
+            return ObjectLock(anchor: mean,
+                              horizontalRadius: max(0.20, wantH),
+                              halfHeight: max(0.20, wantV))
+        }
+        l.anchor += (mean - l.anchor) * Self.anchorSmoothing
+        l.horizontalRadius = min(Self.maxHorizontalRadius,
+                                 max(l.horizontalRadius,
+                                     min(wantH, l.horizontalRadius + Self.maxGateGrowthPerFrame)))
+        l.halfHeight = min(Self.maxHalfHeight,
+                           max(l.halfHeight,
+                               min(wantV, l.halfHeight + Self.maxGateGrowthPerFrame)))
+        return l
     }
 
     /// Drop every second point. Called under `lock`.
@@ -246,13 +447,73 @@ private final class VolumeAccumulator {
     }
 
     /// Copy the cloud out so the caller can measure it off the render thread.
-    func snapshot() -> (points: [simd_float3], frames: Int) {
+    func snapshot() -> (points: [simd_float3], frames: Int, anchor: simd_float3?) {
         lock.lock(); defer { lock.unlock() }
-        return (worldPoints, framesUsedStorage)
+        return (worldPoints, framesUsedStorage, lockStorage?.anchor)
+    }
+
+    /// Keep only the part of the cloud that is physically connected to the
+    /// anchor, at 6 cm voxel resolution.
+    ///
+    /// The gate stops *new* leaks, this cleans up whatever got in before the
+    /// lock tightened. Percentile trimming can't: it assumes outliers are a thin
+    /// tail, and a bed is not a thin tail — it is a second dense blob that drags
+    /// the box over both.
+    private static func componentContainingAnchor(_ anchor: simd_float3?,
+                                                  points: [simd_float3]) -> [simd_float3] {
+        guard let anchor, points.count > 50 else { return points }
+        let voxel: Float = 0.06
+        func cell(_ p: simd_float3) -> SIMD3<Int32> {
+            SIMD3<Int32>(Int32(floor(p.x / voxel)), Int32(floor(p.y / voxel)), Int32(floor(p.z / voxel)))
+        }
+
+        var occupancy: [SIMD3<Int32>: [Int]] = [:]
+        occupancy.reserveCapacity(points.count / 4)
+        for (i, p) in points.enumerated() { occupancy[cell(p), default: []].append(i) }
+
+        // Start at the anchor's cell; if the anchor sits in a hollow (it is a
+        // centroid, not a surface point), start from the nearest occupied cell.
+        var start = cell(anchor)
+        if occupancy[start] == nil {
+            var bestDistance = Float.greatestFiniteMagnitude
+            for key in occupancy.keys {
+                let c = simd_float3(Float(key.x), Float(key.y), Float(key.z)) * voxel
+                let d = simd_distance(c, anchor)
+                if d < bestDistance { bestDistance = d; start = key }
+            }
+            guard bestDistance < 1.0 else { return points }
+        }
+
+        var reached: Set<SIMD3<Int32>> = [start]
+        var queue = [start]
+        var qi = 0
+        while qi < queue.count {
+            let c = queue[qi]; qi += 1
+            for dx in Int32(-1)...1 {
+                for dy in Int32(-1)...1 {
+                    for dz in Int32(-1)...1 where !(dx == 0 && dy == 0 && dz == 0) {
+                        let n = SIMD3<Int32>(c.x + dx, c.y + dy, c.z + dz)
+                        guard occupancy[n] != nil, !reached.contains(n) else { continue }
+                        reached.insert(n)
+                        queue.append(n)
+                    }
+                }
+            }
+        }
+
+        var kept: [simd_float3] = []
+        kept.reserveCapacity(points.count)
+        for c in reached {
+            for i in occupancy[c] ?? [] { kept.append(points[i]) }
+        }
+        return kept
     }
 
     /// Fit the gravity-aligned OBB. Pure — safe to call on any thread.
-    static func measure(points: [simd_float3], framesUsed: Int) -> Measurement? {
+    static func measure(points rawPoints: [simd_float3],
+                        framesUsed: Int,
+                        anchor: simd_float3?) -> Measurement? {
+        let points = componentContainingAnchor(anchor, points: rawPoints)
         guard framesUsed >= 1, points.count >= 400 else { return nil }
 
         func trimmedExtent(_ values: [Float]) -> (lo: Float, hi: Float) {
@@ -321,6 +582,7 @@ private final class VolumeAccumulator {
         pointSum = simd_float3(repeating: 0)
         framesUsedStorage = 0
         seedDepthStorage = nil
+        lockStorage = nil
         lock.unlock()
     }
 }
@@ -332,6 +594,9 @@ private final class VolumeAccumulator {
 private enum Guidance {
     /// No depth lock yet: the reticle isn't on an object.
     case aim
+    /// Had the object, lost sight of it. The model is kept — pointing back at it
+    /// resumes rather than restarts.
+    case reacquire
     /// Standing too close for the depth camera to see the whole item.
     case stepBack
     /// Walk around the item; `left` is the on-screen direction to move.
@@ -390,6 +655,19 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     private static let maxFrames = 16
     private var capturedBuckets = Set<Int>()
     private var currentBucket: Int?
+
+    /// Object-tracking state. Losing the lock briefly is normal and silent;
+    /// losing it onto a clearly different object restarts the measurement.
+    private var lostFrames = 0
+    private var objectLost = false
+    private var refocusFrames = 0
+    private var refocusTarget: simd_float3?
+    /// ~0.4 s at 60 fps before we admit the object is gone.
+    private static let lostFrameThreshold = 24
+    /// ~0.75 s locked onto something else before restarting on it.
+    private static let refocusFrameThreshold = 45
+    /// How far past the gate a candidate must sit to count as a different item.
+    private static let refocusMargin: Float = 0.45
 
     /// Last few volume readings — the box has settled when they agree.
     private var volumeHistory: [Float] = []
@@ -594,6 +872,10 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         currentBucket = nil
         volumeHistory.removeAll()
         lastMeasurement = nil
+        lostFrames = 0
+        objectLost = false
+        refocusFrames = 0
+        refocusTarget = nil
         scanRefQuaternion = nil
         scanPrevQuaternion = nil
         scanAccumulatedDeg = 0
@@ -630,14 +912,22 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         guard hasLidar else { return processPhotoSweepFrame(frame) }
-        guard let depth = frame.sceneDepth?.depthMap else { return }
+        guard let sceneDepth = frame.sceneDepth else { return }
 
         // Always fuse depth — the cloud is what we are building. Only the
         // (expensive) JPEG encode is gated on covering a new viewing angle.
-        scanVolume.ingest(depthMap: depth,
-                          intrinsics: frame.camera.intrinsics,
-                          imageSize: frame.camera.imageResolution,
-                          cameraTransform: frame.camera.transform)
+        let outcome = scanVolume.ingest(depthMap: sceneDepth.depthMap,
+                                        confidenceMap: sceneDepth.confidenceMap,
+                                        intrinsics: frame.camera.intrinsics,
+                                        imageSize: frame.camera.imageResolution,
+                                        cameraTransform: frame.camera.transform)
+        handleTracking(outcome)
+        guard !objectLost || scanVolume.objectLock == nil else {
+            // Off the object: keep tracking state and guidance alive, but do not
+            // capture frames — a photo of the wall is worse than no photo.
+            refreshMeasurement(frame)
+            return
+        }
 
         let camPos = simd_float3(frame.camera.transform.columns.3.x,
                                  frame.camera.transform.columns.3.y,
@@ -647,15 +937,81 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
             currentBucket = bucket
             if !capturedBuckets.contains(bucket) && scanFrames.count < Self.maxFrames {
                 capturedBuckets.insert(bucket)
-                captureFrame(frame, depth: depth)
+                captureFrame(frame, depth: sceneDepth.depthMap)
             } else if scanFrames.isEmpty {
-                captureFrame(frame, depth: depth)
+                captureFrame(frame, depth: sceneDepth.depthMap)
             }
         } else if scanFrames.isEmpty {
-            captureFrame(frame, depth: depth)
+            captureFrame(frame, depth: sceneDepth.depthMap)
         }
 
         refreshMeasurement(frame)
+    }
+
+    /// Track whether we still have the object, and decide when the customer has
+    /// simply moved on to a different one.
+    ///
+    /// Losing the object for a moment is normal — a hand passes, the phone
+    /// swings wide. Only a sustained lock on something clearly elsewhere counts
+    /// as a new object, and then the measurement restarts rather than silently
+    /// fusing two pieces of furniture into one box.
+    private func handleTracking(_ outcome: IngestOutcome) {
+        switch outcome {
+        case .accepted:
+            lostFrames = 0
+            refocusFrames = 0
+            refocusTarget = nil
+            if objectLost {
+                objectLost = false
+                DispatchQueue.main.async { [weak self] in self?.overlay?.hideToast() }
+            }
+
+        case .unusable:
+            break  // says nothing about tracking
+
+        case .lostObject(let centerWorld):
+            lostFrames += 1
+            if lostFrames >= Self.lostFrameThreshold && !objectLost {
+                objectLost = true
+            }
+            guard let candidate = centerWorld, let lock = scanVolume.objectLock else { return }
+            // A different object means "clearly somewhere else", not "just
+            // outside the gate" — otherwise the far side of a wardrobe would
+            // count as a new item.
+            let displacement = simd_distance(candidate, lock.anchor)
+            guard displacement > lock.reach + Self.refocusMargin else {
+                refocusFrames = 0
+                return
+            }
+            if let target = refocusTarget, simd_distance(target, candidate) < 0.35 {
+                refocusFrames += 1
+                refocusTarget = target + (candidate - target) * 0.2
+            } else {
+                refocusTarget = candidate
+                refocusFrames = 1
+            }
+            if refocusFrames >= Self.refocusFrameThreshold { refocusOnNewObject() }
+        }
+    }
+
+    /// Start over on whatever the customer is now looking at. Everything tied to
+    /// the old object goes — cloud, lock, coverage, frames — because a half
+    /// measurement of a fan must not become part of a bed.
+    private func refocusOnNewObject() {
+        scanVolume.reset()
+        scanFrames = []
+        capturedBuckets.removeAll()
+        currentBucket = nil
+        volumeHistory.removeAll()
+        lastMeasurement = nil
+        lostFrames = 0
+        refocusFrames = 0
+        refocusTarget = nil
+        objectLost = false
+        DispatchQueue.main.async { [weak self] in
+            self?.removeBoxNode()
+            self?.overlay?.showToast("Anderes Objekt erkannt — Messung neu gestartet")
+        }
     }
 
     /// Non-LiDAR fallback: no cloud, no box — just photos from a few angles.
@@ -701,12 +1057,17 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         lastMeasureTime = now
         let snap = scanVolume.snapshot()
         measureQueue.async { [weak self] in
-            let m = VolumeAccumulator.measure(points: snap.points, framesUsed: snap.frames)
+            let m = VolumeAccumulator.measure(points: snap.points,
+                                              framesUsed: snap.frames,
+                                              anchor: snap.anchor)
             DispatchQueue.main.async {
                 guard let self, self.scanActive else { self?.measuring = false; return }
                 self.measuring = false
                 self.lastMeasurement = m
-                if let m { self.recordVolume(m.volume) }
+                if let m {
+                    self.recordVolume(m.volume)
+                    self.scanVolume.tightenGate(to: m, minFrames: Self.requiredFrames)
+                }
                 self.publishGuidance()
             }
         }
@@ -736,6 +1097,13 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
 
         guard let m = lastMeasurement, let c = scanVolume.centroid else {
             overlay?.updateGuidance(.aim, volumeM3: nil, progress: 0)
+            return
+        }
+
+        // Lost sight of it: the model stays, so this is "point back at it", not
+        // "start again". Never finish a measurement from a stale box.
+        if objectLost {
+            overlay?.updateGuidance(.reacquire, volumeM3: m.volume, progress: progress)
             return
         }
 
@@ -805,6 +1173,15 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         node.simdOrientation = simd_quatf(angle: m.yaw, axis: simd_float3(0, 1, 0))
         node.scale = SCNVector3(m.dims.x, m.dims.z, m.dims.y)  // local X=length, Y=height, Z=width
 
+        /// Project a point in the box's local unit space to screen coordinates.
+        /// nil when it falls behind the camera.
+        func project(_ local: simd_float3) -> CGPoint? {
+            let world = node.simdConvertPosition(local, to: nil)
+            let p = arView.projectPoint(SCNVector3(world))
+            guard p.z > 0, p.z < 1 else { return nil }
+            return CGPoint(x: CGFloat(p.x), y: CGFloat(p.y))
+        }
+
         // Edge midpoints of the unit box, one per dimension.
         let anchors: [(simd_float3, String, Float)] = [
             (simd_float3(0, -0.5, 0.5), "L", m.dims.x),
@@ -813,17 +1190,55 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         ]
         var tags: [DimensionTag] = []
         for (local, prefix, metres) in anchors {
-            let world = node.simdConvertPosition(local, to: nil)
-            let projected = arView.projectPoint(SCNVector3(world))
-            // z outside (0, 1) means the point sits behind the camera.
-            guard projected.z > 0, projected.z < 1 else { continue }
-            tags.append(DimensionTag(point: CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y)),
+            guard let point = project(local) else { continue }
+            tags.append(DimensionTag(point: point,
                                      text: "\(prefix) \(Int((metres * 100).rounded())) cm"))
         }
 
+        // Focus silhouette: the convex hull of the eight projected corners.
+        // Everything outside it gets dimmed, so the customer can see at a glance
+        // what is inside the measurement — and, more usefully, when something
+        // that shouldn't be has crept in.
+        var corners: [CGPoint] = []
+        for sx in [Float(-0.5), 0.5] {
+            for sy in [Float(-0.5), 0.5] {
+                for sz in [Float(-0.5), 0.5] {
+                    if let p = project(simd_float3(sx, sy, sz)) { corners.append(p) }
+                }
+            }
+        }
+        let hull = corners.count >= 3 ? Self.convexHull(corners) : []
+
         DispatchQueue.main.async { [weak self] in
             self?.overlay?.updateDimensionTags(tags)
+            self?.overlay?.updateFocusSilhouette(hull)
         }
+    }
+
+    /// Andrew's monotone chain. Small n (≤8), so the sort dominates and this is
+    /// nowhere near hot enough to matter.
+    private static func convexHull(_ input: [CGPoint]) -> [CGPoint] {
+        let points = input.sorted { $0.x == $1.x ? $0.y < $1.y : $0.x < $1.x }
+        guard points.count >= 3 else { return points }
+        func cross(_ o: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+            (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+        }
+        var hull: [CGPoint] = []
+        for p in points {
+            while hull.count >= 2, cross(hull[hull.count - 2], hull[hull.count - 1], p) <= 0 {
+                hull.removeLast()
+            }
+            hull.append(p)
+        }
+        let lowerCount = hull.count + 1
+        for p in points.reversed() {
+            while hull.count >= lowerCount, cross(hull[hull.count - 2], hull[hull.count - 1], p) <= 0 {
+                hull.removeLast()
+            }
+            hull.append(p)
+        }
+        hull.removeLast()
+        return hull
     }
 
     private func makeBoxNode() -> SCNNode {
@@ -883,13 +1298,17 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
 
     private func setBoxHidden(_ hidden: Bool) {
         boxNode?.isHidden = hidden
-        if hidden { overlay?.updateDimensionTags([]) }
+        if hidden {
+            overlay?.updateDimensionTags([])
+            overlay?.updateFocusSilhouette([])
+        }
     }
 
     private func removeBoxNode() {
         boxNode?.removeFromParentNode()
         boxNode = nil
         overlay?.updateDimensionTags([])
+        overlay?.updateFocusSilhouette([])
     }
 
     // MARK: - Finishing
@@ -899,8 +1318,9 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         guard scanActive else { return }
         scanActive = false
         let snap = scanVolume.snapshot()
-        let measured = VolumeAccumulator.measure(points: snap.points, framesUsed: snap.frames)
-            ?? lastMeasurement
+        let measured = VolumeAccumulator.measure(points: snap.points,
+                                                 framesUsed: snap.frames,
+                                                 anchor: snap.anchor) ?? lastMeasurement
         let spanDeg = Float(capturedBuckets.count) * (360.0 / Float(Self.bucketCount))
         pendingItem = SavedItem(label: scanSuggestedLabel,
                                 frames: scanFrames,
@@ -1197,6 +1617,13 @@ private class ScanOverlayView: UIView {
     private let hudAccept = UIButton(type: .system)
     /// One label per dimension, positioned over the box edge it describes.
     private var dimLabels: [UILabel] = []
+    /// Dims everything outside the measured box, so what is (and isn't) part of
+    /// the measurement is visible rather than inferred.
+    private let focusScrim = CAShapeLayer()
+
+    // ── Toast ────────────────────────────────────────────────────────────
+    private let toastLabel = UILabel()
+    private var toastHideWork: DispatchWorkItem?
 
     // ── Review card ──────────────────────────────────────────────────────
     private let reviewCard = UIView()
@@ -1331,6 +1758,12 @@ private class ScanOverlayView: UIView {
         hud.isHidden = true
         addSubview(hud)
 
+        // Even-odd fill: the full screen minus the box silhouette.
+        focusScrim.fillRule = .evenOdd
+        focusScrim.fillColor = UIColor.black.withAlphaComponent(0.42).cgColor
+        focusScrim.isHidden = true
+        hud.layer.addSublayer(focusScrim)
+
         // The instruction — one at a time, arrow first because that is the part
         // people act on without reading.
         guidanceCard.backgroundColor = UIColor.black.withAlphaComponent(0.78)
@@ -1389,6 +1822,16 @@ private class ScanOverlayView: UIView {
         hudAccept.isEnabled = false
         hudAccept.addTarget(self, action: #selector(acceptEarlyTapped), for: .touchUpInside)
         hud.addSubview(hudAccept)
+
+        toastLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        toastLabel.textColor = .white
+        toastLabel.textAlignment = .center
+        toastLabel.numberOfLines = 2
+        toastLabel.backgroundColor = Self.orange.withAlphaComponent(0.94)
+        toastLabel.layer.cornerRadius = 14
+        toastLabel.clipsToBounds = true
+        toastLabel.alpha = 0
+        addSubview(toastLabel)
     }
 
     private func buildReviewCard() {
@@ -1585,6 +2028,8 @@ private class ScanOverlayView: UIView {
 
         // Measuring HUD
         hud.frame = bounds
+        focusScrim.frame = bounds
+        toastLabel.frame = CGRect(x: 24, y: safe.top + 140, width: w - 48, height: 44)
         let gcW = w - 40
         guidanceCard.frame = CGRect(x: 20, y: safe.top + 56, width: gcW, height: 72)
         guidanceArrow.frame = CGRect(x: 16, y: 16, width: 44, height: 40)
@@ -1676,6 +2121,8 @@ private class ScanOverlayView: UIView {
         }
         if newState != .measuring {
             updateDimensionTags([])
+            updateFocusSilhouette([])
+            hideToast()
             hasLiveVolume = false
             setAcceptEnabled(false)
         }
@@ -1703,6 +2150,9 @@ private class ScanOverlayView: UIView {
         case .aim:
             guidanceArrow.text = "◎"
             guidanceText.text = "Objekt mittig anvisieren und ruhig halten"
+        case .reacquire:
+            guidanceArrow.text = "◎"
+            guidanceText.text = "Objekt aus dem Blick verloren — wieder anvisieren"
         case .stepBack:
             guidanceArrow.text = "↔"
             guidanceText.text = "Etwas zurücktreten — das Objekt passt nicht ganz ins Bild"
@@ -1766,6 +2216,50 @@ private class ScanOverlayView: UIView {
                                  y: tag.point.y - size.height / 2,
                                  width: size.width, height: size.height)
         }
+    }
+
+    /// Dim everything outside the measured box. An empty hull clears it.
+    func updateFocusSilhouette(_ hull: [CGPoint]) {
+        guard hull.count >= 3 else {
+            focusScrim.isHidden = true
+            return
+        }
+        let path = UIBezierPath(rect: bounds)
+        let cutout = UIBezierPath()
+        cutout.move(to: hull[0])
+        for p in hull.dropFirst() { cutout.addLine(to: p) }
+        cutout.close()
+        path.append(cutout)
+        // No implicit animation: the scrim has to track the box frame-for-frame,
+        // and a quarter-second default animation on every update reads as lag.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        focusScrim.path = path.cgPath
+        focusScrim.isHidden = false
+        CATransaction.commit()
+    }
+
+    // MARK: - Toast
+
+    /// Brief, non-blocking notice. Used when the measurement restarts on a
+    /// different object — the customer needs to know it happened, but stopping
+    /// them to confirm it would be worse than the restart itself.
+    func showToast(_ text: String) {
+        toastLabel.text = text
+        toastHideWork?.cancel()
+        bringSubviewToFront(toastLabel)
+        UIView.animate(withDuration: 0.2) { self.toastLabel.alpha = 1 }
+        let work = DispatchWorkItem { [weak self] in
+            UIView.animate(withDuration: 0.3) { self?.toastLabel.alpha = 0 }
+        }
+        toastHideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6, execute: work)
+    }
+
+    func hideToast() {
+        toastHideWork?.cancel()
+        guard toastLabel.alpha > 0 else { return }
+        UIView.animate(withDuration: 0.25) { self.toastLabel.alpha = 0 }
     }
 
     // MARK: - Review

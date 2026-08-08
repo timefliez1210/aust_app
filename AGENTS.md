@@ -93,10 +93,15 @@ CI only — there is no local Xcode on the dev machine.
 ## Constraints
 
 - The native sweep captures a frame per **new 15° viewing-angle bucket** (≤16/item), not per render tick. Depth is fused every frame; only the JPEG encode is gated.
+- **One object per measurement, tracked in world space** (`ObjectLock`). The reticle only *acquires*; from the second frame on, the seed is the anchor re-projected into the frame, and points outside the gate are dropped rather than accumulated. Without this the cloud only grows and the OBB eventually swallows the bed behind the item (observed 2026-08-08).
+- The gate is a **cylinder** (horizontal radius + half height), not a sphere — a radius big enough for a standing fan's height also reaches the furniture beside it. It widens ≤4 cm/frame and is pulled back in by `tightenGate(to:)` after each fit.
+- Low-confidence depth (`sceneDepth.confidenceMap` == `.low`) is discarded. Thin objects are mostly low-confidence edge noise.
+- `measure()` keeps only the voxel-connected component containing the anchor. Percentile trimming can't remove a second dense blob — it assumes outliers are a thin tail.
+- Losing the object is silent and recoverable (guidance switches to `.reacquire`, model kept). Only ~0.75 s locked onto something >gate+45 cm away restarts the measurement, with a toast.
 - The OBB is re-fit on a background queue ~4×/s and the cloud is capped at 40k points. `VolumeAccumulator` is lock-guarded: ingest runs on the render thread, `measure()` must not.
 - Completion is coverage + stability (≥5 buckets, ≥6 frames, last 4 volumes within 10%) — never a degree count. "Übernehmen" lets the customer take a partial measurement.
 - Orbit direction is resolved by projecting the target standpoint through `camera.viewMatrix(for: .portrait)` and reading the sign of x. Do not derive it from quaternion axes — that arrow comes out mirrored.
-- Depth segmentation seeds from the **frame centre** — the reticle is load-bearing UI, not decoration.
+- Depth segmentation **acquires** from the frame centre — the reticle is load-bearing UI, not decoration. After acquisition it follows the lock, not the reticle.
 - Item names may be empty end to end (plugin → store → manifest → backend). Never add a client-side "name required" check.
 - YOLO output is never drawn. If you find yourself adding detection boxes back to the overlay, the answer is a better measurement affordance, not more labels.
 - Frames are canvas-compressed client-side before the multipart upload (~100 KB each).
