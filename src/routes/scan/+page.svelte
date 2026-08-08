@@ -46,12 +46,14 @@
   }
 
   // ── Web/Android capture flow ─────────────────────────────────────────────
-  type WebState = 'idle' | 'labeling' | 'capturing';
+  // Photos first, name afterwards and only if the customer wants to: the volume
+  // (here: server-side from the photos) is what matters, the label is filled in
+  // by the backend when it's missing.
+  type WebState = 'idle' | 'capturing' | 'review';
   let webState: WebState = $state('idle');
   let stream: MediaStream | null = null;
   let videoEl: HTMLVideoElement | undefined = $state();
   let labelInput = $state('');
-  let currentLabel = $state('');
   let currentFrames: string[] = $state([]);
   let flash = $state(false);
   let savedFlash: string | null = $state(null);
@@ -91,36 +93,40 @@
     setTimeout(() => (flash = false), 120);
   }
 
-  function confirmLabel() {
-    const label = labelInput.trim();
-    if (!label) return;
+  function startItem() {
     tapHaptic();
-    currentLabel = label;
     currentFrames = [];
     labelInput = '';
     webState = 'capturing';
   }
 
+  function reviewItem() {
+    if (currentFrames.length === 0) return;
+    tapHaptic();
+    webState = 'review';
+  }
+
+  /** Save the item. An empty label is fine — the backend names it from the photos. */
   function saveItem() {
     if (currentFrames.length === 0) return;
     successHaptic();
+    const label = labelInput.trim();
     capture.addItem({
-      label: currentLabel,
+      label,
       frames: currentFrames.map(f => ({ imageBase64: f, depthMapBase64: null, pose: null })),
       arcDegrees: 0,
       hasDepth: false,
     });
-    savedFlash = currentLabel;
+    savedFlash = label || 'Objekt erfasst';
     setTimeout(() => (savedFlash = null), 1400);
     currentFrames = [];
-    currentLabel = '';
+    labelInput = '';
     webState = 'idle';
   }
 
   function cancelItem() {
     tapHaptic();
     currentFrames = [];
-    currentLabel = '';
     labelInput = '';
     webState = 'idle';
   }
@@ -227,7 +233,7 @@
             {capture.itemCount === 0 ? 'Erfassen Sie Ihre Möbel Stück für Stück' : 'Weiteres Objekt hinzufügen oder abschließen'}
           </p>
           <div class="flex items-center justify-center gap-3 px-5">
-            <button onclick={() => { tapHaptic(); webState = 'labeling'; }}
+            <button onclick={startItem}
               class="flex-1 h-[50px] rounded-full flex items-center justify-center gap-2 text-white text-[16px] font-semibold"
               style="background: var(--aust-orange);">
               <Plus size={20} strokeWidth={2.5} />
@@ -242,43 +248,12 @@
             {/if}
           </div>
 
-        {:else if webState === 'labeling'}
-          <!-- Label sheet -->
-          <div class="mx-3 rounded-[20px] p-5" style="background: var(--ios-card);">
-            <p class="text-[17px] font-semibold text-label mb-3">Was möchten Sie erfassen?</p>
-            <input
-              bind:value={labelInput}
-              placeholder="z. B. Sofa, Schrank, Bett …"
-              class="ios-input bg-fill rounded-xl px-4 mb-3"
-              onkeydown={(e) => e.key === 'Enter' && confirmLabel()}
-            />
-            <div class="flex flex-wrap gap-2 mb-4">
-              {#each suggestions as s}
-                <button onclick={() => { labelInput = s; confirmLabel(); }}
-                  class="h-8 px-3.5 rounded-full bg-fill text-label text-[13px] font-medium tappable">
-                  {s}
-                </button>
-              {/each}
-            </div>
-            <div class="flex gap-3">
-              <button onclick={cancelItem} class="btn-gray flex-1">Abbrechen</button>
-              <button onclick={confirmLabel} disabled={!labelInput.trim()} class="btn-filled flex-1"
-                style={!labelInput.trim() ? 'opacity: 0.4;' : ''}>
-                Weiter
-              </button>
-            </div>
-          </div>
-
-        {:else}
-          <!-- Capturing -->
+        {:else if webState === 'capturing'}
+          <!-- Capturing: straight to the camera, no naming up front -->
           <div class="px-5">
-            <div class="flex items-center justify-between mb-3">
-              <span class="text-white text-[15px] font-semibold px-3 h-8 rounded-full inline-flex items-center"
-                style="background: rgba(0,0,0,0.55); backdrop-filter: blur(10px);">
-                {currentLabel}
-              </span>
+            <div class="flex items-center justify-center mb-3">
               <span class="text-[13px] font-medium px-3 h-8 rounded-full inline-flex items-center text-white"
-                style="background: rgba(0,0,0,0.55);">
+                style="background: rgba(0,0,0,0.55); backdrop-filter: blur(10px);">
                 {currentFrames.length} / 4 Fotos
               </span>
             </div>
@@ -294,10 +269,42 @@
                 class="w-[74px] h-[74px] rounded-full border-4 border-white flex items-center justify-center active:scale-95 transition-transform">
                 <span class="w-[60px] h-[60px] rounded-full bg-white"></span>
               </button>
-              <button onclick={saveItem} disabled={currentFrames.length === 0}
+              <button onclick={reviewItem} disabled={currentFrames.length === 0}
                 class="w-[72px] text-right text-[15px] font-semibold {currentFrames.length > 0 ? 'text-white' : 'text-white/30'}">
-                Sichern
+                Weiter
               </button>
+            </div>
+          </div>
+
+        {:else}
+          <!-- Review: naming is optional, saving is one tap away -->
+          <div class="mx-3 rounded-[20px] p-5" style="background: var(--ios-card);">
+            <p class="text-[13px] font-semibold text-label-2 mb-1">
+              {currentFrames.length} {currentFrames.length === 1 ? 'Foto' : 'Fotos'} erfasst
+            </p>
+            <p class="text-[17px] font-semibold text-label mb-3">Bezeichnung (optional)</p>
+            <input
+              bind:value={labelInput}
+              placeholder="z. B. Sofa, Schrank, Bett …"
+              class="ios-input bg-fill rounded-xl px-4 mb-3"
+              onkeydown={(e) => e.key === 'Enter' && saveItem()}
+            />
+            <div class="flex flex-wrap gap-2 mb-3">
+              {#each suggestions as s}
+                <button onclick={() => { tapHaptic(); labelInput = s; }}
+                  class="h-8 px-3.5 rounded-full bg-fill text-label text-[13px] font-medium tappable">
+                  {s}
+                </button>
+              {/each}
+            </div>
+            <p class="text-[12px] text-label-3 mb-4">
+              Ohne Bezeichnung erkennen wir das Objekt automatisch.
+            </p>
+            <div class="flex gap-3">
+              <button onclick={() => { tapHaptic(); webState = 'capturing'; }} class="btn-gray flex-1">
+                Weitere Fotos
+              </button>
+              <button onclick={saveItem} class="btn-filled flex-1">Sichern</button>
             </div>
           </div>
         {/if}

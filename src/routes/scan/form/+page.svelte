@@ -99,7 +99,8 @@
 
       // AR item manifest — which frames belong to which item, plus on-device
       // LiDAR volumes when available (backend skips server-side vision if every
-      // item carries one).
+      // item carries one). `label` may be an empty string: naming is optional in
+      // the capture flow and the backend fills it in from the item's photo.
       formData.append('item_manifest', JSON.stringify(
         capture.items.map(item => ({
           label: item.label,
@@ -199,11 +200,13 @@
             <div class="w-8 h-8 rounded-lg bg-tint-soft flex items-center justify-center shrink-0 text-tint">
               <Box size={15} strokeWidth={2} />
             </div>
-            <span class="flex-1 text-[15px] text-label">{item.label}</span>
+            <span class="flex-1 text-[15px] {item.label ? 'text-label' : 'text-label-3 italic'}">
+              {item.label || 'Wird automatisch erkannt'}
+            </span>
             {#if item.volumeM3 != null}
-              <span class="inline-flex items-center gap-1 text-[13px] text-label-2">
+              <span class="inline-flex items-center gap-1 text-[13px] font-semibold text-label">
                 <Ruler size={12} />
-                ≈ {item.volumeM3.toFixed(1)} m³
+                ≈ {item.volumeM3.toFixed(1).replace('.', ',')} m³
               </span>
             {:else}
               <span class="text-[13px] text-label-3">{item.frames.length} Fotos</span>
@@ -213,7 +216,7 @@
         {#if capture.deviceVolumeM3 != null}
           <div class="ios-row flex items-center justify-between px-4 py-2.5">
             <span class="text-[15px] font-semibold text-label">Gesamtvolumen</span>
-            <span class="text-[15px] font-semibold text-tint">≈ {capture.deviceVolumeM3.toFixed(1)} m³</span>
+            <span class="text-[15px] font-semibold text-tint">≈ {capture.deviceVolumeM3.toFixed(1).replace('.', ',')} m³</span>
           </div>
         {/if}
       </div>

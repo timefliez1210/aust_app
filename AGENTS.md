@@ -4,20 +4,28 @@ SvelteKit + Capacitor mobile app for iOS/Android. Customers scan their furniture
 item-by-item; volume comes from on-device LiDAR where available, otherwise from
 the backend VLM pipeline.
 
+**Capture is volume-first.** What the customer must produce is a *measurement*;
+the item's name is optional at every step and may be submitted empty — the
+backend names unlabelled items from their photo (`fill_missing_labels` in
+`crates/api/src/routes/submissions.rs`). Detection (YOLO) is only a shortcut that
+pre-fills the name; it never gates a measurement.
+
 ## Capture architecture (per platform)
 
 | Platform | Flow | Volume |
 |----------|------|--------|
-| iPhone Pro (LiDAR) | Native ARKit session (plugin hides WebView): YOLO live detection → tap to confirm (or draw box + name manually) → 28° arc sweep captures ~8 frames + depth maps | **On-device**: depth region-growing → world-space point cloud → gravity-aligned OBB (`VolumeAccumulator` in the Swift plugin). Sent as `device_volume_m3` per item |
-| iPhone non-Pro | Same native ARKit flow, no depth maps | Backend (VLM) |
-| Android / web | In-page guided capture (`/scan` web mode): label each item, 3–4 photos from different angles | Backend (VLM) |
+| iPhone Pro (LiDAR) | Native ARKit session (plugin hides WebView): object in the reticle → tap **Messen** (or tap a YOLO box to pre-fill a name) → 28° arc sweep captures ~8 frames + depth maps, live m³ readout → review card: measured volume + optional name → *Sichern* / *Erneut messen* | **On-device**: depth region-growing → world-space point cloud → gravity-aligned OBB (`VolumeAccumulator` in the Swift plugin). Sent as `device_volume_m3` per item |
+| iPhone non-Pro | Same native ARKit flow, no depth maps (review card says so) | Backend (VLM) |
+| Android / web | In-page guided capture (`/scan` web mode): 3–4 photos from different angles, then an optional name in the review sheet | Backend (VLM) |
 
 ```
 Capture → /scan/form (contact + addresses + services)
         → POST /api/v1/submit/mobile/ar   (multipart: images, depth_maps,
-              item_manifest [labels, frame counts, device volumes], poses, intrinsics)
+              item_manifest [optional labels, frame counts, device volumes], poses, intrinsics)
         → backend (crates/api/src/routes/submissions.rs):
               all items have device_volume_m3 → method "ar_device", no server vision
+                  unnamed items → VLM naming-only pass over their representative
+                  frame (VlmEstimator::label_objects), fallback "Möbelstück"
               else vision_service.backend = "vlm" → catalogue-grounded VLM (1 frame/item)
               else → legacy Modal GPU pipeline
         → estimated → auto-offer → Telegram approval → offer_sent
@@ -41,9 +49,9 @@ Capture → /scan/form (contact + addresses + services)
 
 | File/dir | Purpose |
 |----------|---------|
-| `plugins/capacitor-depth-capture/` | Capacitor plugin. iOS: ARKit + YOLO (CoreML) + native overlay UI + `VolumeAccumulator` (on-device m³). Web impl is a dev stub — Android capture lives in the scan page itself |
+| `plugins/capacitor-depth-capture/` | Capacitor plugin. iOS: ARKit + YOLO (CoreML) + native overlay UI (reticle, measure button, arc sweep, review card) + `VolumeAccumulator` (on-device m³). Web impl is a dev stub — Android capture lives in the scan page itself |
 | `src/lib/api/client.ts` | Fetch wrapper (Bearer token, FormData, blob download, German errors) |
-| `src/lib/stores/capture.svelte.ts` | Scanned items incl. `volumeM3`/`dimsM`; `deviceVolumeM3` total |
+| `src/lib/stores/capture.svelte.ts` | Scanned items incl. `volumeM3`/`dimsM` and a possibly empty `label`; `deviceVolumeM3` total |
 | `src/lib/stores/auth.svelte.ts` | OTP auth session (localStorage) |
 | `src/lib/components/` | `NavBar` (iOS nav bar), `BottomNav` (iOS tab bar) |
 | `src/lib/haptics.ts` | Capacitor haptics helpers (no-op on web) |
@@ -71,7 +79,9 @@ CI only — there is no local Xcode on the dev machine.
 
 ## Constraints
 
-- Native iOS scan captures a frame every ~3.5° of sweep (~8 frames/item), not every render tick.
+- Native iOS scan captures a frame every ~3.5° of sweep (~8 frames/item), not every render tick; the live m³ readout re-measures only every ~7°.
+- Depth segmentation seeds from the **frame centre** — the reticle is load-bearing UI, not decoration.
+- Item names may be empty end to end (plugin → store → manifest → backend). Never add a client-side "name required" check.
 - Frames are canvas-compressed client-side before the multipart upload (~100 KB each).
 - Per-item on-device volumes are validated server-side (0.005–12 m³); one implausible
   item ⇒ the whole submission falls back to server-side estimation.

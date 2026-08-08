@@ -67,8 +67,11 @@ export class DepthCaptureWeb extends WebPlugin implements DepthCapturePlugin {
 
   // ── Web-only helpers (for dev testing) ───────────────────────────────────
 
-  /** Simulate capturing one item (call from browser devtools for testing). */
-  async simulateCapture(label: string): Promise<void> {
+  /**
+   * Simulate capturing one item (call from browser devtools for testing).
+   * `label` may be empty — that's the normal case for an unnamed measurement.
+   */
+  async simulateCapture(label = ''): Promise<void> {
     const frame = await this._captureFrame();
     const item: ItemScan = { label, frames: [frame], arcDegrees: 28, hasDepth: false };
     this.items.push(item);

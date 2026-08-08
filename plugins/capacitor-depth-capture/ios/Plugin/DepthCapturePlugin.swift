@@ -16,7 +16,10 @@ private struct ItemFrame {
 }
 
 private struct SavedItem {
-    let label: String
+    /// Customer-supplied name. **May be empty** — the measurement is what the
+    /// submission is about, and the backend names unlabelled items from their
+    /// photo. Never block a saved volume on a missing name.
+    var label: String
     let frames: [ItemFrame]
     let arcDegrees: Float
     let hasDepth: Bool
@@ -246,7 +249,9 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
 
     // ── Arc sweep ─────────────────────────────────────────────────────────
     private var scanActive = false
-    private var scanLabel = ""
+    /// Name proposed by YOLO when the sweep was started from a detection tap.
+    /// Only a pre-fill for the review card — the user may clear it.
+    private var scanSuggestedLabel = ""
     private var scanFrames: [ItemFrame] = []
     private var scanRefQuaternion: simd_quatf?
     private var scanAccumulatedDeg: Float = 0
@@ -260,8 +265,16 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     /// loop sane.
     private static let captureEveryDeg: Float = 3.5
 
+    /// Live volume readout during the sweep is refreshed at most this often —
+    /// measuring re-sorts the whole cloud, which is too heavy for every frame.
+    private static let previewEveryDeg: Float = 7
+    private var scanLastPreviewDeg: Float = -Float.greatestFiniteMagnitude
+
     // ── Items ─────────────────────────────────────────────────────────────
     private var savedItems: [SavedItem] = []
+    /// Finished sweep awaiting the user's confirmation in the review card.
+    /// Nothing reaches `savedItems` until they tap "Sichern".
+    private var pendingItem: SavedItem?
 
     // ── Native UI ─────────────────────────────────────────────────────────
     private var overlay: ScanOverlayView?
@@ -382,20 +395,25 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
             guard let self else { return }
             self.notifyListeners("sessionComplete", data: ["itemCount": self.savedItems.count])
         }
+        // Tapping a detection is a shortcut, not a gate: it starts the same
+        // measurement and only pre-fills the name.
         ov.onDetectionTapped = { [weak self] box in
-            self?.overlay?.showItemSheet(label: box.germanLabel.isEmpty ? box.label : box.germanLabel,
-                                         confidence: box.confidence)
+            self?.beginArcSweep(suggestedLabel: box.germanLabel.isEmpty ? box.label : box.germanLabel)
         }
-        ov.onConfirmItem = { [weak self] label in
-            self?.beginArcSweep(label: label)
-        }
-        ov.onDrawModeRequested = { [weak self] in
-            self?.enterNativeDrawMode()
+        ov.onMeasureRequested = { [weak self] in
+            self?.beginArcSweep(suggestedLabel: "")
         }
         ov.onCancelArc = { [weak self] in
-            self?.scanActive = false
-            self?.scanFrames = []
-            self?.overlay?.setState(.idle)
+            self?.abortScan()
+        }
+        ov.onSaveItem = { [weak self] label in
+            self?.commitPendingItem(label: label)
+        }
+        ov.onRemeasure = { [weak self] in
+            guard let self else { return }
+            let suggestion = self.pendingItem?.label ?? ""
+            self.pendingItem = nil
+            self.beginArcSweep(suggestedLabel: suggestion)
         }
 
         window.addSubview(ov)
@@ -415,17 +433,28 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Arc sweep
 
-    private func beginArcSweep(label: String) {
-        scanLabel = label
+    private func beginArcSweep(suggestedLabel: String) {
+        scanSuggestedLabel = suggestedLabel
         scanFrames = []
         scanRefQuaternion = nil
         scanPrevQuaternion = nil
         scanAccumulatedDeg = 0
         scanLastCapturedDeg = -Float.greatestFiniteMagnitude
+        scanLastPreviewDeg = -Float.greatestFiniteMagnitude
         scanVolume.reset()
         scanActive = true
         clearDetectionLayers()
-        overlay?.setState(.arcSweep)
+        DispatchQueue.main.async { [weak self] in
+            self?.overlay?.setState(.arcSweep)
+        }
+    }
+
+    private func abortScan() {
+        scanActive = false
+        scanFrames = []
+        scanVolume.reset()
+        pendingItem = nil
+        overlay?.setState(.idle)
     }
 
     private func processArcFrame(_ frame: ARFrame) {
@@ -463,6 +492,17 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
             }
             scanFrames.append(ItemFrame(imageBase64: imageBase64, depthMapBase64: depthBase64,
                                         pose: transformToFloatArray(frame.camera.transform)))
+
+            // Live readout: the measurement is the point of the sweep, so show it
+            // growing rather than only degrees. Measuring re-sorts the cloud —
+            // keep it to every few degrees.
+            if hasLidar, scanAccumulatedDeg - scanLastPreviewDeg >= Self.previewEveryDeg {
+                scanLastPreviewDeg = scanAccumulatedDeg
+                let preview = scanVolume.finalize()?.volume
+                DispatchQueue.main.async { [weak self] in
+                    self?.overlay?.updateLiveVolume(preview)
+                }
+            }
         }
 
         if scanAccumulatedDeg >= Self.arcThresholdDeg && scanFrames.count >= Self.minFrames {
@@ -470,67 +510,49 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    /// End the sweep and hand the measurement to the review card. Nothing is
+    /// saved yet — the user confirms (and optionally names) it there.
     private func finalizeScan() {
         scanActive = false
         let measured = scanVolume.finalize()
-        let item = SavedItem(label: scanLabel, frames: scanFrames,
-                             arcDegrees: scanAccumulatedDeg,
-                             hasDepth: scanFrames.contains { $0.depthMapBase64 != nil },
-                             volumeM3: measured?.volume,
-                             dims: measured?.dims,
-                             deviceConfidence: measured?.confidence)
+        pendingItem = SavedItem(label: scanSuggestedLabel, frames: scanFrames,
+                                arcDegrees: scanAccumulatedDeg,
+                                hasDepth: scanFrames.contains { $0.depthMapBase64 != nil },
+                                volumeM3: measured?.volume,
+                                dims: measured?.dims,
+                                deviceConfidence: measured?.confidence)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.overlay?.showReview(volumeM3: measured?.volume,
+                                     dims: measured?.dims.map { [$0.x, $0.y, $0.z] },
+                                     suggestedLabel: self.scanSuggestedLabel,
+                                     measurable: self.hasLidar)
+        }
+    }
+
+    /// Save the reviewed item. `label` may be empty — the backend names it from
+    /// the photo, so a blank name never costs a measurement.
+    private func commitPendingItem(label: String) {
+        guard var item = pendingItem else { return }
+        item.label = label.trimmingCharacters(in: .whitespaces)
+        pendingItem = nil
         savedItems.append(item)
+
         var eventData: [String: Any] = [
             "label": item.label, "frameCount": item.frames.count,
             "arcDegrees": item.arcDegrees, "hasDepth": item.hasDepth,
         ]
         if let v = item.volumeM3 { eventData["volumeM3"] = v }
         notifyListeners("itemSaved", data: eventData)
+
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.overlay?.showSavedFlash(label: self.scanLabel, volumeM3: item.volumeM3)
             self.overlay?.updateItemCount(self.savedItems.count)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self.overlay?.showSavedFlash(label: item.label, volumeM3: item.volumeM3)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                 self?.overlay?.setState(.idle)
             }
         }
-    }
-
-    // MARK: - Draw mode
-
-    private func enterNativeDrawMode() {
-        guard let ov = overlay,
-              let window = ov.superview,
-              let rootVC = bridge?.viewController else { return }
-        ov.setState(.drawMode)
-        let draw = DrawOverlayView(frame: window.bounds)
-        draw.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        draw.onBoxDrawn = { [weak self] rect, screenSize in
-            guard let self else { return }
-            // Keep draw view alive (box stays visible) while alert is on screen
-            let alert = UIAlertController(title: "Objekt benennen", message: nil, preferredStyle: .alert)
-            alert.addTextField { tf in
-                tf.placeholder = "z.B. Schrank, Sofa, Bett..."
-                tf.autocapitalizationType = .sentences
-            }
-            alert.addAction(UIAlertAction(title: "Abbrechen", style: .cancel) { _ in
-                draw.removeFromSuperview()
-                self.overlay?.setState(.idle)
-            })
-            alert.addAction(UIAlertAction(title: "Erfassen →", style: .default) { _ in
-                let label = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespaces) ?? ""
-                draw.removeFromSuperview()
-                guard !label.isEmpty else { self.overlay?.setState(.idle); return }
-                self.beginArcSweep(label: label)
-            })
-            // Present from the bridge VC — overlay has no VC parent (it's on UIWindow directly)
-            rootVC.present(alert, animated: true)
-        }
-        draw.onCancelled = { [weak self] in
-            draw.removeFromSuperview()
-            self?.overlay?.setState(.idle)
-        }
-        window.addSubview(draw)
     }
 
     // MARK: - YOLO
@@ -701,35 +723,47 @@ extension DepthCapturePlugin: ARSCNViewDelegate {
         guard let frame = arView?.session.currentFrame else { return }
         if sessionIntrinsics == nil { sessionIntrinsics = frame.camera.intrinsics }
 
-        if !scanActive {
+        if scanActive {
+            processArcFrame(frame)
+        } else if pendingItem == nil {
+            // Detection only runs on the idle screen — behind the review card it
+            // would just flicker boxes the user can't act on.
             frameCounter += 1
             if frameCounter % yoloEveryNFrames == 0 {
                 let buf = frame.capturedImage
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.runYOLO(on: buf) }
             }
-        } else {
-            processArcFrame(frame)
         }
     }
 }
 
 // MARK: - ScanOverlayView (100% native UI)
+//
+// Volume-first capture UI. The screen is built around one action: put the object
+// in the reticle and measure it. Detections are a shortcut that pre-fills a name;
+// naming itself happens after the measurement and is optional.
 
 private class ScanOverlayView: UIView {
 
-    enum State { case idle, drawMode, arcSweep, itemSaved }
+    enum State { case idle, arcSweep, review, itemSaved }
 
     // Callbacks
     var onClose: (() -> Void)?
     var onFinish: (() -> Void)?
     var onDetectionTapped: ((DetectionBox) -> Void)?
-    var onConfirmItem: ((String) -> Void)?
-    var onDrawModeRequested: (() -> Void)?
+    /// Measure whatever is in the reticle — no name required.
+    var onMeasureRequested: (() -> Void)?
     var onCancelArc: (() -> Void)?
+    /// Save the reviewed item under this name; empty means "let the backend name it".
+    var onSaveItem: ((String) -> Void)?
+    var onRemeasure: (() -> Void)?
 
     private var state: State = .idle
     private var detections: [DetectionBox] = []
     private var itemCount = 0
+
+    private static let navy = UIColor(red: 2/255, green: 36/255, blue: 72/255, alpha: 1)
+    private static let orange = UIColor(red: 252/255, green: 96/255, blue: 24/255, alpha: 1)
 
     // ── Top bar ──────────────────────────────────────────────────────────
     private let countPill = UIView()
@@ -737,29 +771,38 @@ private class ScanOverlayView: UIView {
     private let countLabel = UILabel()
     private let closeBtn = UIButton(type: .system)
 
+    // ── Reticle ──────────────────────────────────────────────────────────
+    // Segmentation seeds from the frame centre, so "what's in the middle gets
+    // measured" is a hard rule of the pipeline — the UI has to say it.
+    private let reticle = UIView()
+    private let reticleLayer = CAShapeLayer()
+
     // ── Bottom bar ───────────────────────────────────────────────────────
     private let bottomBar = UIView()
-    private let addBtn = UIButton(type: .system)
+    private let measureBtn = UIButton(type: .custom)
+    private let measureRing = CAShapeLayer()
     private let finishBtn = UIButton(type: .system)
     private let hintLabel = UILabel()
-
-    // ── Bottom sheet ─────────────────────────────────────────────────────
-    private let sheet = UIView()
-    private let sheetHandle = UIView()
-    private let sheetTitle = UILabel()
-    private let sheetSubtitle = UILabel()
-    private let sheetCancel = UIButton(type: .system)
-    private let sheetConfirm = UIButton(type: .system)
-    private var sheetLabel = ""
 
     // ── Arc overlay ──────────────────────────────────────────────────────
     private let arcContainer = UIView()
     private let arcBgLayer = CAShapeLayer()
     private let arcProgressLayer = CAShapeLayer()
+    private let arcVolumeLabel = UILabel()
     private let arcDegreesLabel = UILabel()
-    private let arcMaxLabel = UILabel()
     private let arcDirLabel = UILabel()
     private let arcCancelBtn = UIButton(type: .system)
+
+    // ── Review card ──────────────────────────────────────────────────────
+    private let reviewCard = UIView()
+    private let reviewTitle = UILabel()
+    private let reviewVolume = UILabel()
+    private let reviewDims = UILabel()
+    private let reviewField = UITextField()
+    private let reviewFieldHint = UILabel()
+    private let reviewSave = UIButton(type: .system)
+    private let reviewRemeasure = UIButton(type: .system)
+    private var reviewKeyboardShift: CGFloat = 0
 
     // ── Saved flash ──────────────────────────────────────────────────────
     private let flashView = UIView()
@@ -772,20 +815,23 @@ private class ScanOverlayView: UIView {
         backgroundColor = .clear
         isUserInteractionEnabled = true
         buildTopBar()
+        buildReticle()
         buildBottomBar()
-        buildSheet()
         buildArcOverlay()
+        buildReviewCard()
         buildFlash()
         addTapGesture()
+        observeKeyboard()
         setState(.idle)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    deinit { NotificationCenter.default.removeObserver(self) }
+
     // MARK: - Build UI
 
     private func buildTopBar() {
-        // Count pill
         countPill.backgroundColor = UIColor.black.withAlphaComponent(0.8)
         countPill.layer.cornerRadius = 16
         addSubview(countPill)
@@ -799,7 +845,6 @@ private class ScanOverlayView: UIView {
         countLabel.font = .systemFont(ofSize: 12, weight: .bold)
         countPill.addSubview(countLabel)
 
-        // Close button
         closeBtn.backgroundColor = UIColor.black.withAlphaComponent(0.8)
         closeBtn.layer.cornerRadius = 20
         closeBtn.setImage(UIImage(systemName: "xmark", withConfiguration: UIImage.SymbolConfiguration(pointSize: 16, weight: .bold)), for: .normal)
@@ -808,11 +853,21 @@ private class ScanOverlayView: UIView {
         addSubview(closeBtn)
     }
 
+    private func buildReticle() {
+        reticle.isUserInteractionEnabled = false
+        reticleLayer.fillColor = UIColor.clear.cgColor
+        reticleLayer.strokeColor = UIColor.white.withAlphaComponent(0.9).cgColor
+        reticleLayer.lineWidth = 3
+        reticleLayer.lineCap = .round
+        reticle.layer.addSublayer(reticleLayer)
+        addSubview(reticle)
+    }
+
     private func buildBottomBar() {
         bottomBar.backgroundColor = .clear
         addSubview(bottomBar)
 
-        hintLabel.textColor = UIColor.white.withAlphaComponent(0.5)
+        hintLabel.textColor = UIColor.white.withAlphaComponent(0.75)
         hintLabel.font = .systemFont(ofSize: 12, weight: .medium)
         hintLabel.textAlignment = .center
         hintLabel.backgroundColor = UIColor.black.withAlphaComponent(0.7)
@@ -820,61 +875,28 @@ private class ScanOverlayView: UIView {
         hintLabel.clipsToBounds = true
         bottomBar.addSubview(hintLabel)
 
-        // Add button
-        addBtn.backgroundColor = UIColor.black.withAlphaComponent(0.8)
-        addBtn.layer.cornerRadius = 12
-        addBtn.setImage(UIImage(systemName: "plus", withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .bold)), for: .normal)
-        addBtn.tintColor = .white
-        addBtn.addTarget(self, action: #selector(addTapped), for: .touchUpInside)
-        bottomBar.addSubview(addBtn)
+        // Primary action: a shutter-style measure button. Everything else on this
+        // screen is secondary to it.
+        measureBtn.backgroundColor = .clear
+        measureBtn.setImage(UIImage(systemName: "ruler.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 24, weight: .bold)), for: .normal)
+        measureBtn.tintColor = Self.navy
+        measureBtn.addTarget(self, action: #selector(measureTapped), for: .touchUpInside)
+        measureRing.fillColor = UIColor.white.cgColor
+        measureRing.strokeColor = UIColor.white.withAlphaComponent(0.45).cgColor
+        measureRing.lineWidth = 4
+        measureBtn.layer.insertSublayer(measureRing, at: 0)
+        bottomBar.addSubview(measureBtn)
 
-        // Finish button
-        finishBtn.backgroundColor = UIColor(red: 2/255, green: 36/255, blue: 72/255, alpha: 1)
+        finishBtn.backgroundColor = UIColor.black.withAlphaComponent(0.8)
         finishBtn.layer.cornerRadius = 12
         finishBtn.setTitle("Fertig", for: .normal)
         finishBtn.setTitleColor(.white, for: .normal)
         finishBtn.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
-        finishBtn.contentEdgeInsets = UIEdgeInsets(top: 14, left: 28, bottom: 14, right: 28)
+        finishBtn.contentEdgeInsets = UIEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
         finishBtn.alpha = 0.4
         finishBtn.isEnabled = false
         finishBtn.addTarget(self, action: #selector(finishTapped), for: .touchUpInside)
         bottomBar.addSubview(finishBtn)
-    }
-
-    private func buildSheet() {
-        sheet.backgroundColor = UIColor(red: 236/255, green: 238/255, blue: 240/255, alpha: 1)
-        sheet.layer.cornerRadius = 24
-        sheet.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
-        sheet.isHidden = true
-        addSubview(sheet)
-
-        sheetHandle.backgroundColor = UIColor.gray.withAlphaComponent(0.3)
-        sheetHandle.layer.cornerRadius = 2
-        sheet.addSubview(sheetHandle)
-
-        sheetTitle.font = .systemFont(ofSize: 20, weight: .bold)
-        sheetTitle.textColor = UIColor(red: 25/255, green: 28/255, blue: 30/255, alpha: 1)
-        sheet.addSubview(sheetTitle)
-
-        sheetSubtitle.font = .systemFont(ofSize: 14, weight: .regular)
-        sheetSubtitle.textColor = UIColor(red: 116/255, green: 119/255, blue: 127/255, alpha: 1)
-        sheet.addSubview(sheetSubtitle)
-
-        sheetCancel.backgroundColor = UIColor(red: 230/255, green: 232/255, blue: 234/255, alpha: 1)
-        sheetCancel.layer.cornerRadius = 12
-        sheetCancel.setTitle("Abbrechen", for: .normal)
-        sheetCancel.setTitleColor(UIColor(red: 67/255, green: 71/255, blue: 78/255, alpha: 1), for: .normal)
-        sheetCancel.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
-        sheetCancel.addTarget(self, action: #selector(sheetCancelTapped), for: .touchUpInside)
-        sheet.addSubview(sheetCancel)
-
-        sheetConfirm.backgroundColor = UIColor(red: 2/255, green: 36/255, blue: 72/255, alpha: 1)
-        sheetConfirm.layer.cornerRadius = 12
-        sheetConfirm.setTitle("Erfassen →", for: .normal)
-        sheetConfirm.setTitleColor(.white, for: .normal)
-        sheetConfirm.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
-        sheetConfirm.addTarget(self, action: #selector(sheetConfirmTapped), for: .touchUpInside)
-        sheet.addSubview(sheetConfirm)
     }
 
     private func buildArcOverlay() {
@@ -882,13 +904,11 @@ private class ScanOverlayView: UIView {
         arcContainer.isUserInteractionEnabled = true
         addSubview(arcContainer)
 
-        // Background circle
         arcBgLayer.fillColor = UIColor.clear.cgColor
         arcBgLayer.strokeColor = UIColor.white.withAlphaComponent(0.15).cgColor
         arcBgLayer.lineWidth = 4
         arcContainer.layer.addSublayer(arcBgLayer)
 
-        // Progress arc
         arcProgressLayer.fillColor = UIColor.clear.cgColor
         arcProgressLayer.strokeColor = UIColor.white.cgColor
         arcProgressLayer.lineWidth = 5
@@ -896,17 +916,18 @@ private class ScanOverlayView: UIView {
         arcProgressLayer.strokeEnd = 0
         arcContainer.layer.addSublayer(arcProgressLayer)
 
-        arcDegreesLabel.text = "0°"
-        arcDegreesLabel.textColor = .white
-        arcDegreesLabel.font = .systemFont(ofSize: 28, weight: .bold)
+        // The measurement, not the sweep angle, is the headline.
+        arcVolumeLabel.text = "– m³"
+        arcVolumeLabel.textColor = .white
+        arcVolumeLabel.font = .systemFont(ofSize: 34, weight: .bold)
+        arcVolumeLabel.textAlignment = .center
+        arcContainer.addSubview(arcVolumeLabel)
+
+        arcDegreesLabel.text = "0° von 28°"
+        arcDegreesLabel.textColor = UIColor.white.withAlphaComponent(0.6)
+        arcDegreesLabel.font = .systemFont(ofSize: 13)
         arcDegreesLabel.textAlignment = .center
         arcContainer.addSubview(arcDegreesLabel)
-
-        arcMaxLabel.text = "von 28°"
-        arcMaxLabel.textColor = UIColor.white.withAlphaComponent(0.6)
-        arcMaxLabel.font = .systemFont(ofSize: 13)
-        arcMaxLabel.textAlignment = .center
-        arcContainer.addSubview(arcMaxLabel)
 
         arcDirLabel.textColor = .white
         arcDirLabel.font = .systemFont(ofSize: 14, weight: .medium)
@@ -926,6 +947,60 @@ private class ScanOverlayView: UIView {
         arcContainer.addSubview(arcCancelBtn)
     }
 
+    private func buildReviewCard() {
+        reviewCard.backgroundColor = UIColor(red: 236/255, green: 238/255, blue: 240/255, alpha: 1)
+        reviewCard.layer.cornerRadius = 24
+        reviewCard.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        reviewCard.isHidden = true
+        addSubview(reviewCard)
+
+        reviewTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        reviewTitle.textColor = UIColor(red: 116/255, green: 119/255, blue: 127/255, alpha: 1)
+        reviewCard.addSubview(reviewTitle)
+
+        reviewVolume.font = .systemFont(ofSize: 40, weight: .bold)
+        reviewVolume.textColor = Self.navy
+        reviewCard.addSubview(reviewVolume)
+
+        reviewDims.font = .systemFont(ofSize: 14, weight: .regular)
+        reviewDims.textColor = UIColor(red: 116/255, green: 119/255, blue: 127/255, alpha: 1)
+        reviewCard.addSubview(reviewDims)
+
+        reviewField.placeholder = "Bezeichnung (optional)"
+        reviewField.font = .systemFont(ofSize: 16)
+        reviewField.backgroundColor = UIColor(red: 230/255, green: 232/255, blue: 234/255, alpha: 1)
+        reviewField.layer.cornerRadius = 12
+        reviewField.autocapitalizationType = .sentences
+        reviewField.returnKeyType = .done
+        reviewField.clearButtonMode = .whileEditing
+        reviewField.delegate = self
+        reviewField.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 14, height: 1))
+        reviewField.leftViewMode = .always
+        reviewCard.addSubview(reviewField)
+
+        reviewFieldHint.text = "Ohne Bezeichnung erkennen wir das Objekt automatisch."
+        reviewFieldHint.font = .systemFont(ofSize: 12)
+        reviewFieldHint.textColor = UIColor(red: 142/255, green: 145/255, blue: 152/255, alpha: 1)
+        reviewFieldHint.numberOfLines = 2
+        reviewCard.addSubview(reviewFieldHint)
+
+        reviewRemeasure.backgroundColor = UIColor(red: 230/255, green: 232/255, blue: 234/255, alpha: 1)
+        reviewRemeasure.layer.cornerRadius = 12
+        reviewRemeasure.setTitle("Erneut messen", for: .normal)
+        reviewRemeasure.setTitleColor(UIColor(red: 67/255, green: 71/255, blue: 78/255, alpha: 1), for: .normal)
+        reviewRemeasure.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
+        reviewRemeasure.addTarget(self, action: #selector(remeasureTapped), for: .touchUpInside)
+        reviewCard.addSubview(reviewRemeasure)
+
+        reviewSave.backgroundColor = Self.navy
+        reviewSave.layer.cornerRadius = 12
+        reviewSave.setTitle("Sichern", for: .normal)
+        reviewSave.setTitleColor(.white, for: .normal)
+        reviewSave.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
+        reviewSave.addTarget(self, action: #selector(saveTapped), for: .touchUpInside)
+        reviewCard.addSubview(reviewSave)
+    }
+
     private func buildFlash() {
         flashView.backgroundColor = UIColor.black.withAlphaComponent(0.6)
         flashView.isHidden = true
@@ -941,11 +1016,10 @@ private class ScanOverlayView: UIView {
         flashView.addSubview(flashCheck)
 
         flashLabel.textColor = .white
-        flashLabel.font = .systemFont(ofSize: 20, weight: .bold)
+        flashLabel.font = .systemFont(ofSize: 22, weight: .bold)
         flashLabel.textAlignment = .center
         flashView.addSubview(flashLabel)
 
-        flashSub.text = "gespeichert"
         flashSub.textColor = UIColor.white.withAlphaComponent(0.7)
         flashSub.font = .systemFont(ofSize: 14)
         flashSub.textAlignment = .center
@@ -954,7 +1028,17 @@ private class ScanOverlayView: UIView {
 
     private func addTapGesture() {
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        tap.cancelsTouchesInView = false
         addGestureRecognizer(tap)
+    }
+
+    private func observeKeyboard() {
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(keyboardWillChange(_:)),
+            name: UIResponder.keyboardWillShowNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(keyboardWillHide(_:)),
+            name: UIResponder.keyboardWillHideNotification, object: nil)
     }
 
     // MARK: - Layout
@@ -970,46 +1054,77 @@ private class ScanOverlayView: UIView {
         countLabel.frame = CGRect(x: 28, y: 0, width: 96, height: 32)
         closeBtn.frame = CGRect(x: w - 60, y: safe.top + 4, width: 40, height: 40)
 
-        // Bottom bar
-        let bbH: CGFloat = 120
-        bottomBar.frame = CGRect(x: 0, y: bounds.height - bbH - safe.bottom, width: w, height: bbH)
-        hintLabel.frame = CGRect(x: (w - 240) / 2, y: 0, width: 240, height: 28)
-        addBtn.frame = CGRect(x: 20, y: 40, width: 48, height: 48)
-        finishBtn.sizeToFit()
-        finishBtn.frame = CGRect(x: w - finishBtn.frame.width - 20, y: 40,
-                                  width: finishBtn.frame.width, height: 48)
+        // Reticle: centred square with corner brackets
+        let side: CGFloat = min(w, bounds.height) * 0.6
+        let cy = bounds.height / 2 - 40
+        reticle.frame = CGRect(x: (w - side) / 2, y: cy - side / 2, width: side, height: side)
+        reticleLayer.frame = reticle.bounds
+        reticleLayer.path = cornerBracketPath(in: reticle.bounds, arm: side * 0.18, radius: 14).cgPath
 
-        // Sheet
-        let sheetH: CGFloat = 220 + safe.bottom
-        sheet.frame = CGRect(x: 0, y: bounds.height - sheetH, width: w, height: sheetH)
-        sheetHandle.frame = CGRect(x: (w - 40) / 2, y: 12, width: 40, height: 4)
-        sheetTitle.frame = CGRect(x: 24, y: 36, width: w - 48, height: 28)
-        sheetSubtitle.frame = CGRect(x: 24, y: 68, width: w - 48, height: 20)
-        let btnY: CGFloat = 108
-        let btnW = (w - 60) / 2
-        sheetCancel.frame = CGRect(x: 24, y: btnY, width: btnW, height: 48)
-        sheetConfirm.frame = CGRect(x: 24 + btnW + 12, y: btnY, width: btnW, height: 48)
+        // Bottom bar
+        let bbH: CGFloat = 150
+        bottomBar.frame = CGRect(x: 0, y: bounds.height - bbH - safe.bottom, width: w, height: bbH)
+        hintLabel.frame = CGRect(x: (w - 300) / 2, y: 8, width: 300, height: 28)
+        let btn: CGFloat = 78
+        measureBtn.frame = CGRect(x: (w - btn) / 2, y: 52, width: btn, height: btn)
+        measureRing.frame = measureBtn.bounds
+        measureRing.path = UIBezierPath(ovalIn: measureBtn.bounds.insetBy(dx: 8, dy: 8)).cgPath
+        finishBtn.sizeToFit()
+        finishBtn.frame = CGRect(x: w - finishBtn.frame.width - 20,
+                                 y: 52 + (btn - 44) / 2,
+                                 width: finishBtn.frame.width, height: 44)
 
         // Arc overlay
         arcContainer.frame = bounds
         let arcR: CGFloat = 120
-        let cx = w / 2, cy = bounds.height / 2 - 40
-        let circleRect = CGRect(x: cx - arcR, y: cy - arcR, width: arcR * 2, height: arcR * 2)
+        let acx = w / 2
+        let circleRect = CGRect(x: acx - arcR, y: cy - arcR, width: arcR * 2, height: arcR * 2)
         arcBgLayer.path = UIBezierPath(ovalIn: circleRect).cgPath
-        arcProgressLayer.path = UIBezierPath(arcCenter: CGPoint(x: cx, y: cy), radius: arcR,
-                                              startAngle: -.pi / 2,
-                                              endAngle: -.pi / 2 + 2 * .pi,
-                                              clockwise: true).cgPath
-        arcDegreesLabel.frame = CGRect(x: cx - 60, y: cy - 20, width: 120, height: 34)
-        arcMaxLabel.frame = CGRect(x: cx - 60, y: cy + 16, width: 120, height: 20)
+        arcProgressLayer.path = UIBezierPath(arcCenter: CGPoint(x: acx, y: cy), radius: arcR,
+                                             startAngle: -.pi / 2,
+                                             endAngle: -.pi / 2 + 2 * .pi,
+                                             clockwise: true).cgPath
+        arcVolumeLabel.frame = CGRect(x: acx - 90, y: cy - 30, width: 180, height: 42)
+        arcDegreesLabel.frame = CGRect(x: acx - 90, y: cy + 14, width: 180, height: 20)
         arcDirLabel.frame = CGRect(x: (w - 280) / 2, y: cy + arcR + 30, width: 280, height: 36)
         arcCancelBtn.frame = CGRect(x: (w - 140) / 2, y: bounds.height - safe.bottom - 70, width: 140, height: 48)
+
+        // Review card
+        let cardH: CGFloat = 330 + safe.bottom
+        reviewCard.frame = CGRect(x: 0, y: bounds.height - cardH - reviewKeyboardShift,
+                                  width: w, height: cardH)
+        reviewTitle.frame = CGRect(x: 24, y: 24, width: w - 48, height: 18)
+        reviewVolume.frame = CGRect(x: 24, y: 44, width: w - 48, height: 48)
+        reviewDims.frame = CGRect(x: 24, y: 94, width: w - 48, height: 20)
+        reviewField.frame = CGRect(x: 24, y: 130, width: w - 48, height: 48)
+        reviewFieldHint.frame = CGRect(x: 24, y: 184, width: w - 48, height: 34)
+        let rbY: CGFloat = 232
+        let rbW = (w - 60) / 2
+        reviewRemeasure.frame = CGRect(x: 24, y: rbY, width: rbW, height: 50)
+        reviewSave.frame = CGRect(x: 24 + rbW + 12, y: rbY, width: rbW, height: 50)
 
         // Flash
         flashView.frame = bounds
         flashCheck.frame = CGRect(x: (w - 80) / 2, y: bounds.height / 2 - 80, width: 80, height: 80)
-        flashLabel.frame = CGRect(x: 20, y: bounds.height / 2 + 16, width: w - 40, height: 28)
-        flashSub.frame = CGRect(x: 20, y: bounds.height / 2 + 48, width: w - 40, height: 20)
+        flashLabel.frame = CGRect(x: 20, y: bounds.height / 2 + 16, width: w - 40, height: 30)
+        flashSub.frame = CGRect(x: 20, y: bounds.height / 2 + 50, width: w - 40, height: 20)
+    }
+
+    /// Four corner brackets — a viewfinder frame that leaves the object visible.
+    private func cornerBracketPath(in rect: CGRect, arm: CGFloat, radius: CGFloat) -> UIBezierPath {
+        let path = UIBezierPath()
+        let corners: [(CGPoint, CGFloat, CGFloat)] = [
+            (CGPoint(x: rect.minX, y: rect.minY), 1, 1),
+            (CGPoint(x: rect.maxX, y: rect.minY), -1, 1),
+            (CGPoint(x: rect.maxX, y: rect.maxY), -1, -1),
+            (CGPoint(x: rect.minX, y: rect.maxY), 1, -1),
+        ]
+        for (corner, sx, sy) in corners {
+            path.move(to: CGPoint(x: corner.x + sx * radius, y: corner.y + sy * arm))
+            path.addLine(to: CGPoint(x: corner.x + sx * radius, y: corner.y + sy * radius))
+            path.addLine(to: CGPoint(x: corner.x + sx * arm, y: corner.y + sy * radius))
+        }
+        return path
     }
 
     // MARK: - State
@@ -1020,9 +1135,13 @@ private class ScanOverlayView: UIView {
         countPill.isHidden = false
         closeBtn.isHidden = false
         bottomBar.isHidden = !idle
-        sheet.isHidden = true
+        reticle.isHidden = newState == .review || newState == .itemSaved
         arcContainer.isHidden = newState != .arcSweep
         flashView.isHidden = newState != .itemSaved
+        if newState != .review {
+            reviewField.resignFirstResponder()
+            reviewCard.isHidden = true
+        }
         updateHint()
     }
 
@@ -1043,7 +1162,7 @@ private class ScanOverlayView: UIView {
     }
 
     func updateArc(degrees: Float, direction: String) {
-        arcDegreesLabel.text = "\(Int(degrees))°"
+        arcDegreesLabel.text = "\(Int(degrees))° von 28°"
         arcProgressLayer.strokeEnd = CGFloat(min(degrees / 28.0, 1.0))
         switch direction {
         case "left":  arcDirLabel.text = "  ← langsam nach links bewegen  "
@@ -1053,86 +1172,126 @@ private class ScanOverlayView: UIView {
         }
     }
 
-    func showItemSheet(label: String, confidence: Float) {
-        sheetLabel = label
-        sheetTitle.text = label
-        sheetSubtitle.text = "\(Int(confidence * 100))% Konfidenz · 28° Sweep"
-        sheet.isHidden = false
+    /// Live measurement while sweeping; nil until enough depth has been fused.
+    func updateLiveVolume(_ volumeM3: Float?) {
+        arcVolumeLabel.text = volumeM3.map { "≈ \(Self.formatVolume($0)) m³" } ?? "– m³"
+    }
+
+    /// Present the finished measurement for confirmation. `volumeM3 == nil` means
+    /// the sweep produced no usable measurement (or the device has no LiDAR) —
+    /// the photos are still worth keeping, the backend estimates from them.
+    func showReview(volumeM3: Float?, dims: [Float]?, suggestedLabel: String, measurable: Bool) {
+        if let v = volumeM3 {
+            reviewTitle.text = "GEMESSENES VOLUMEN"
+            reviewVolume.text = "≈ \(Self.formatVolume(v)) m³"
+            reviewVolume.textColor = Self.navy
+            if let d = dims, d.count == 3 {
+                reviewDims.text = "\(Self.formatCm(d[0])) × \(Self.formatCm(d[1])) × \(Self.formatCm(d[2])) cm"
+            } else {
+                reviewDims.text = "inkl. Ladespielraum"
+            }
+            reviewSave.setTitle("Sichern", for: .normal)
+        } else if measurable {
+            reviewTitle.text = "MESSUNG UNVOLLSTÄNDIG"
+            reviewVolume.text = "Kein Volumen"
+            reviewVolume.textColor = Self.orange
+            reviewDims.text = "Objekt mittig im Rahmen halten und erneut messen — oder Fotos so senden."
+            reviewSave.setTitle("Trotzdem sichern", for: .normal)
+        } else {
+            reviewTitle.text = "AUFNAHME GESPEICHERT"
+            reviewVolume.text = "Fotos erfasst"
+            reviewVolume.textColor = Self.navy
+            reviewDims.text = "Dieses Gerät misst nicht — wir berechnen das Volumen aus den Fotos."
+            reviewSave.setTitle("Sichern", for: .normal)
+        }
+        reviewDims.numberOfLines = 2
+        reviewField.text = suggestedLabel
+
+        state = .review
         bottomBar.isHidden = true
-        sheet.transform = CGAffineTransform(translationX: 0, y: 300)
-        UIView.animate(withDuration: 0.3) { self.sheet.transform = .identity }
+        arcContainer.isHidden = true
+        flashView.isHidden = true
+        reticle.isHidden = true
+        reviewCard.isHidden = false
+        reviewCard.transform = CGAffineTransform(translationX: 0, y: 340)
+        UIView.animate(withDuration: 0.28) { self.reviewCard.transform = .identity }
     }
 
     func showSavedFlash(label: String, volumeM3: Float? = nil) {
-        flashLabel.text = label
-        if let v = volumeM3 {
-            flashSub.text = String(format: "≈ %.1f m³ · gespeichert", v)
-        } else {
-            flashSub.text = "gespeichert"
-        }
+        flashLabel.text = volumeM3.map { "≈ \(Self.formatVolume($0)) m³" } ?? "Gespeichert"
+        flashSub.text = label.isEmpty ? "wird automatisch benannt" : label
         setState(.itemSaved)
-    }
-
-    func showLabelInput(completion: @escaping (String?) -> Void) {
-        guard let vc = findViewController() else { completion(nil); return }
-        let alert = UIAlertController(title: "Objekt benennen", message: nil, preferredStyle: .alert)
-        alert.addTextField { tf in
-            tf.placeholder = "z.B. Schrank, Sofa, Bett..."
-            tf.autocapitalizationType = .sentences
-        }
-        alert.addAction(UIAlertAction(title: "Abbrechen", style: .cancel) { _ in completion(nil) })
-        alert.addAction(UIAlertAction(title: "Erfassen", style: .default) { _ in
-            completion(alert.textFields?.first?.text?.trimmingCharacters(in: .whitespaces))
-        })
-        vc.present(alert, animated: true)
     }
 
     // MARK: - Private
 
     private func updateHint() {
-        if state != .idle { return }
+        guard state == .idle else { return }
         if !detections.isEmpty {
-            hintLabel.text = "  Tippe auf ein erkanntes Objekt  "
-            hintLabel.textColor = UIColor.white.withAlphaComponent(0.7)
+            hintLabel.text = "  Objekt antippen oder mittig messen  "
         } else {
-            hintLabel.text = "  Richte die Kamera auf Möbel...  "
-            hintLabel.textColor = UIColor.white.withAlphaComponent(0.5)
+            hintLabel.text = "  Objekt in den Rahmen nehmen und messen  "
         }
     }
 
-    private func findViewController() -> UIViewController? {
-        var responder: UIResponder? = self
-        while let r = responder {
-            if let vc = r as? UIViewController { return vc }
-            responder = r.next
-        }
-        return nil
+    /// German decimals: 1.4 m³ reads as "1,4".
+    private static func formatVolume(_ v: Float) -> String {
+        String(format: "%.1f", v).replacingOccurrences(of: ".", with: ",")
+    }
+
+    private static func formatCm(_ m: Float) -> String {
+        String(Int((m * 100).rounded()))
+    }
+
+    // MARK: - Keyboard
+
+    @objc private func keyboardWillChange(_ note: Notification) {
+        guard state == .review,
+              let frameValue = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue
+        else { return }
+        // Lift the card just enough to keep its buttons above the keyboard.
+        let keyboardTop = bounds.height - frameValue.cgRectValue.height
+        let cardTop = reviewCard.frame.minY + reviewKeyboardShift
+        reviewKeyboardShift = max(0, cardTop + reviewSave.frame.maxY + 16 - keyboardTop)
+        animateCardShift()
+    }
+
+    @objc private func keyboardWillHide(_ note: Notification) {
+        guard reviewKeyboardShift != 0 else { return }
+        reviewKeyboardShift = 0
+        animateCardShift()
+    }
+
+    private func animateCardShift() {
+        setNeedsLayout()
+        UIView.animate(withDuration: 0.25) { self.layoutIfNeeded() }
     }
 
     // MARK: - Actions
 
     @objc private func closeTapped() { onClose?() }
     @objc private func finishTapped() { onFinish?() }
-    @objc private func addTapped() { onDrawModeRequested?() }
+    @objc private func measureTapped() { onMeasureRequested?() }
     @objc private func arcCancelTapped() { onCancelArc?() }
 
-    @objc private func sheetCancelTapped() {
-        UIView.animate(withDuration: 0.2, animations: {
-            self.sheet.transform = CGAffineTransform(translationX: 0, y: 300)
-        }) { _ in
-            self.sheet.isHidden = true
-            self.setState(.idle)
-        }
+    @objc private func saveTapped() {
+        reviewField.resignFirstResponder()
+        onSaveItem?(reviewField.text?.trimmingCharacters(in: .whitespaces) ?? "")
     }
 
-    @objc private func sheetConfirmTapped() {
-        sheet.isHidden = true
-        onConfirmItem?(sheetLabel)
+    @objc private func remeasureTapped() {
+        reviewField.resignFirstResponder()
+        onRemeasure?()
     }
 
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
-        guard state == .idle else { return }
         let pt = gesture.location(in: self)
+        if state == .review {
+            // Tapping outside the card just dismisses the keyboard.
+            if !reviewCard.frame.contains(pt) { reviewField.resignFirstResponder() }
+            return
+        }
+        guard state == .idle else { return }
         for box in detections {
             let rect = CGRect(x: CGFloat(box.x) * bounds.width, y: CGFloat(box.y) * bounds.height,
                               width: CGFloat(box.w) * bounds.width, height: CGFloat(box.h) * bounds.height)
@@ -1144,83 +1303,11 @@ private class ScanOverlayView: UIView {
     }
 }
 
-// MARK: - DrawOverlayView
+// MARK: - UITextFieldDelegate
 
-private class DrawOverlayView: UIView {
-
-    var onBoxDrawn: ((CGRect, CGSize) -> Void)?
-    var onCancelled: (() -> Void)?
-
-    private var startPoint: CGPoint?
-    private var currentRect: CGRect?
-    private let shapeLayer = CAShapeLayer()
-    private let cancelBtn = UIButton(type: .system)
-    private let hintLabel = UILabel()
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        backgroundColor = UIColor.black.withAlphaComponent(0.3)
-        isUserInteractionEnabled = true
-
-        // Dot grid
-        let grid = UIView(frame: bounds.insetBy(dx: 32, dy: 32))
-        grid.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        grid.isUserInteractionEnabled = false
-        addSubview(grid)
-
-        shapeLayer.strokeColor = UIColor.white.cgColor
-        shapeLayer.fillColor = UIColor.white.withAlphaComponent(0.1).cgColor
-        shapeLayer.lineWidth = 2
-        shapeLayer.lineDashPattern = [6, 4]
-        layer.addSublayer(shapeLayer)
-
-        hintLabel.text = "Ziehe ein Rechteck um das Objekt"
-        hintLabel.textColor = UIColor.white.withAlphaComponent(0.8)
-        hintLabel.font = .systemFont(ofSize: 14, weight: .medium)
-        hintLabel.textAlignment = .center
-        addSubview(hintLabel)
-
-        cancelBtn.setTitle("Abbrechen", for: .normal)
-        cancelBtn.setTitleColor(.white, for: .normal)
-        cancelBtn.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
-        cancelBtn.backgroundColor = UIColor.white.withAlphaComponent(0.2)
-        cancelBtn.layer.cornerRadius = 12
-        cancelBtn.contentEdgeInsets = UIEdgeInsets(top: 12, left: 24, bottom: 12, right: 24)
-        cancelBtn.addTarget(self, action: #selector(cancel), for: .touchUpInside)
-        addSubview(cancelBtn)
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        let safe = safeAreaInsets
-        hintLabel.frame = CGRect(x: 32, y: bounds.height - 180 - safe.bottom, width: bounds.width - 64, height: 20)
-        cancelBtn.sizeToFit()
-        cancelBtn.frame = CGRect(x: (bounds.width - cancelBtn.frame.width) / 2,
-                                  y: bounds.height - safe.bottom - 70,
-                                  width: cancelBtn.frame.width, height: 48)
-    }
-
-    @objc private func cancel() { onCancelled?() }
-
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let pt = touches.first?.location(in: self) else { return }
-        if cancelBtn.frame.contains(pt) { return }
-        startPoint = pt
-    }
-
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let start = startPoint, let cur = touches.first?.location(in: self) else { return }
-        currentRect = CGRect(x: min(start.x, cur.x), y: min(start.y, cur.y),
-                             width: abs(cur.x - start.x), height: abs(cur.y - start.y))
-        if let r = currentRect { shapeLayer.path = UIBezierPath(roundedRect: r, cornerRadius: 6).cgPath }
-    }
-
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let rect = currentRect, rect.width > 20, rect.height > 20 else {
-            startPoint = nil; currentRect = nil; shapeLayer.path = nil; return
-        }
-        onBoxDrawn?(rect, bounds.size)
+extension ScanOverlayView: UITextFieldDelegate {
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        textField.resignFirstResponder()
+        return true
     }
 }

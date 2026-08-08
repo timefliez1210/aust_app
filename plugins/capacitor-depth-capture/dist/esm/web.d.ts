@@ -22,7 +22,10 @@ export declare class DepthCaptureWeb extends WebPlugin implements DepthCapturePl
         itemCount: number;
     }) => void): Promise<PluginListenerHandle>;
     addListener(event: 'sessionCancelled', handler: (data: Record<string, never>) => void): Promise<PluginListenerHandle>;
-    /** Simulate capturing one item (call from browser devtools for testing). */
-    simulateCapture(label: string): Promise<void>;
+    /**
+     * Simulate capturing one item (call from browser devtools for testing).
+     * `label` may be empty — that's the normal case for an unnamed measurement.
+     */
+    simulateCapture(label?: string): Promise<void>;
     private _captureFrame;
 }
