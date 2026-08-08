@@ -7,7 +7,6 @@ export type {
   DepthSupportResult,
   BoundingBox,
   Detection,
-  ArcProgress,
   ItemSavedEvent,
   ItemScan,
   ItemFrame,

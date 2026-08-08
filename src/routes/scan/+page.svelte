@@ -49,7 +49,7 @@
   // Photos first, name afterwards and only if the customer wants to: the volume
   // (here: server-side from the photos) is what matters, the label is filled in
   // by the backend when it's missing.
-  type WebState = 'idle' | 'capturing' | 'review';
+  type WebState = 'idle' | 'capturing' | 'review' | 'manual';
   let webState: WebState = $state('idle');
   let stream: MediaStream | null = null;
   let videoEl: HTMLVideoElement | undefined = $state();
@@ -59,6 +59,95 @@
   let savedFlash: string | null = $state(null);
 
   const suggestions = ['Sofa', 'Schrank', 'Bett', 'Tisch', 'Regal', 'Waschmaschine', 'Kommode', 'Kartons'];
+
+  // ── Manual entry ─────────────────────────────────────────────────────────
+  // Escape hatch for anything the photo estimate would get badly wrong, and the
+  // web counterpart of the native "Manuell" sheet. A customer-stated volume
+  // beats a guess, so it goes into the manifest exactly like a measured one.
+  /** Loading volume includes handling space — same factor the iOS OBB applies. */
+  const PACKING_FACTOR = 1.2;
+  let manualMode: 'dims' | 'volume' = $state('dims');
+  let manualName = $state('');
+  let manualL = $state('');
+  let manualW = $state('');
+  let manualH = $state('');
+  let manualVolume = $state('');
+  let manualError: string | null = $state(null);
+
+  /** Accepts German and English decimal separators. */
+  function parseNumber(raw: string): number | null {
+    const n = Number(raw.trim().replace(',', '.'));
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
+  function openManual() {
+    tapHaptic();
+    manualName = labelInput;
+    manualL = ''; manualW = ''; manualH = ''; manualVolume = '';
+    manualError = null;
+    manualMode = 'dims';
+    webState = 'manual';
+  }
+
+  function saveManual() {
+    let volumeM3: number | null = null;
+    let dimsM: number[] | null = null;
+
+    if (manualMode === 'dims') {
+      const l = parseNumber(manualL), b = parseNumber(manualW), h = parseNumber(manualH);
+      if (l == null || b == null || h == null) {
+        manualError = 'Bitte Länge, Breite und Höhe in Zentimetern angeben.';
+        return;
+      }
+      dimsM = [l / 100, b / 100, h / 100];
+      volumeM3 = dimsM[0] * dimsM[1] * dimsM[2] * PACKING_FACTOR;
+    } else {
+      const v = parseNumber(manualVolume);
+      if (v == null) {
+        manualError = 'Bitte ein Volumen in Kubikmetern angeben, z. B. 1,2.';
+        return;
+      }
+      volumeM3 = v;
+    }
+
+    // Backend rejects the whole manifest on an out-of-range volume, so catch it here.
+    if (volumeM3 < 0.005 || volumeM3 > 12) {
+      manualError = 'Das ergibt kein plausibles Volumen (0,005 – 12 m³).';
+      return;
+    }
+
+    // Keep a photo if we have one — the backend still names unlabelled items
+    // from it, and a frameless item would break the photo↔item mapping.
+    const frames = currentFrames.length > 0 ? currentFrames : snapshotFrame();
+    successHaptic();
+    const label = manualName.trim();
+    capture.addItem({
+      label,
+      frames: frames.map(f => ({ imageBase64: f, depthMapBase64: null, pose: null })),
+      arcDegrees: 0,
+      hasDepth: false,
+      volumeM3,
+      ...(dimsM ? { dimsM } : {}),
+      deviceConfidence: 0.85,
+    });
+    savedFlash = label || 'Objekt erfasst';
+    setTimeout(() => (savedFlash = null), 1400);
+    currentFrames = [];
+    labelInput = '';
+    webState = 'idle';
+  }
+
+  /** Grab a single frame off the live preview. Empty array if the camera failed. */
+  function snapshotFrame(): string[] {
+    if (!videoEl || videoEl.videoWidth === 0) return [];
+    const maxW = 1280;
+    const scale = Math.min(1, maxW / videoEl.videoWidth);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(videoEl.videoWidth * scale);
+    canvas.height = Math.round(videoEl.videoHeight * scale);
+    canvas.getContext('2d')!.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+    return [canvas.toDataURL('image/jpeg', 0.85).split(',')[1]];
+  }
 
   async function startWeb() {
     try {
@@ -128,6 +217,7 @@
     tapHaptic();
     currentFrames = [];
     labelInput = '';
+    manualError = null;
     webState = 'idle';
   }
 
@@ -247,6 +337,12 @@
               </button>
             {/if}
           </div>
+          <div class="flex justify-center mt-3">
+            <button onclick={openManual} class="text-[13px] font-medium underline underline-offset-4"
+              style="color: rgba(255,255,255,0.7);">
+              Maße stattdessen eintippen
+            </button>
+          </div>
 
         {:else if webState === 'capturing'}
           <!-- Capturing: straight to the camera, no naming up front -->
@@ -273,6 +369,52 @@
                 class="w-[72px] text-right text-[15px] font-semibold {currentFrames.length > 0 ? 'text-white' : 'text-white/30'}">
                 Weiter
               </button>
+            </div>
+          </div>
+
+        {:else if webState === 'manual'}
+          <!-- Manual entry: the customer's own numbers beat a photo estimate -->
+          <div class="mx-3 rounded-[20px] p-5" style="background: var(--ios-card);">
+            <p class="text-[17px] font-semibold text-label mb-1">Maße eintragen</p>
+            <p class="text-[12px] text-label-3 mb-3">
+              Für Objekte, die sich schlecht fotografieren lassen — oder wenn Sie die Maße kennen.
+            </p>
+            <input
+              bind:value={manualName}
+              placeholder="Bezeichnung (optional)"
+              class="ios-input bg-fill rounded-xl px-4 mb-3"
+            />
+            <div class="flex gap-2 mb-3">
+              <button onclick={() => { tapHaptic(); manualMode = 'dims'; manualError = null; }}
+                class="flex-1 h-9 rounded-full text-[13px] font-semibold {manualMode === 'dims' ? 'btn-filled' : 'bg-fill text-label'}">
+                Maße
+              </button>
+              <button onclick={() => { tapHaptic(); manualMode = 'volume'; manualError = null; }}
+                class="flex-1 h-9 rounded-full text-[13px] font-semibold {manualMode === 'volume' ? 'btn-filled' : 'bg-fill text-label'}">
+                Volumen
+              </button>
+            </div>
+            {#if manualMode === 'dims'}
+              <div class="flex gap-2 mb-2">
+                <input bind:value={manualL} inputmode="decimal" placeholder="Länge cm"
+                  class="ios-input bg-fill rounded-xl px-3 text-center flex-1" />
+                <input bind:value={manualW} inputmode="decimal" placeholder="Breite cm"
+                  class="ios-input bg-fill rounded-xl px-3 text-center flex-1" />
+                <input bind:value={manualH} inputmode="decimal" placeholder="Höhe cm"
+                  class="ios-input bg-fill rounded-xl px-3 text-center flex-1" />
+              </div>
+              <p class="text-[12px] text-label-3 mb-3">Außenmaße in Zentimetern. Ladespielraum rechnen wir dazu.</p>
+            {:else}
+              <input bind:value={manualVolume} inputmode="decimal" placeholder="Volumen in m³, z. B. 1,2"
+                class="ios-input bg-fill rounded-xl px-4 mb-2" />
+              <p class="text-[12px] text-label-3 mb-3">Volumen in Kubikmetern, so wie Sie es angeben.</p>
+            {/if}
+            {#if manualError}
+              <p class="text-[12px] text-red mb-3">{manualError}</p>
+            {/if}
+            <div class="flex gap-3">
+              <button onclick={cancelItem} class="btn-gray flex-1">Abbrechen</button>
+              <button onclick={saveManual} class="btn-filled flex-1">Sichern</button>
             </div>
           </div>
 
@@ -306,6 +448,11 @@
               </button>
               <button onclick={saveItem} class="btn-filled flex-1">Sichern</button>
             </div>
+            <!-- Keeps the photos already taken and attaches them to the typed volume. -->
+            <button onclick={openManual}
+              class="w-full text-center text-[13px] font-medium text-label-2 underline underline-offset-4 mt-3">
+              Maße stattdessen eintragen
+            </button>
           </div>
         {/if}
       </div>

@@ -10,9 +10,12 @@ export interface StoredItem {
   }[];
   arcDegrees: number;
   hasDepth: boolean;
-  /** On-device LiDAR volume estimate in m³ (null on non-LiDAR / failed segmentation). */
+  /**
+   * Volume in m³ incl. packing factor — measured on device or entered by hand.
+   * null when neither happened and the backend has to estimate from photos.
+   */
   volumeM3: number | null;
-  /** Gravity-aligned OBB dims [length, width, height] in metres. */
+  /** Dims [length, width, height] in metres: the OBB, or typed measurements. */
   dimsM: number[] | null;
   deviceConfidence: number | null;
 }

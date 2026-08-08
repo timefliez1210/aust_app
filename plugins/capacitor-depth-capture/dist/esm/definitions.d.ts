@@ -4,12 +4,15 @@ export interface DepthCapturePlugin {
     checkSupport(): Promise<DepthSupportResult>;
     /**
      * Start an AR session with fully native UI.
-     * On iOS: hides the WebView, sets up ARSCNView + native overlay controls,
-     * starts YOLO inference loop. All user interaction (measure button, detection
-     * taps, arc sweep, review + naming, item management) is handled natively.
+     * On iOS: hides the WebView, sets up ARSCNView + native overlay controls.
+     * All user interaction (measure button, guided sweep, review + naming, manual
+     * entry, item management) is handled natively.
      *
-     * The flow is measurement-first: the user measures whatever is in the reticle
-     * and names it afterwards — or not at all.
+     * The flow is measurement-first and guided: the user puts the object in the
+     * reticle, the plugin draws the measured box with its L/B/H in place and tells
+     * them where to move next, and the sweep ends by itself once the box has been
+     * seen from enough angles and stopped changing. Naming happens afterwards and
+     * is optional. YOLO runs silently and only pre-fills the name field.
      *
      * Emits sessionComplete when user taps "Fertig", sessionCancelled on close.
      */
@@ -52,7 +55,8 @@ export interface Detection {
     label: string;
     /**
      * German name from furniture_labels.json, e.g. "Sofa". Empty string if unmapped.
-     * Only used to pre-fill the (optional) name field after a measurement.
+     * Only used to pre-fill the (optional) name field after a measurement — the
+     * native UI never draws detections.
      */
     germanLabel: string;
     /** Confidence score 0–1. */
@@ -60,22 +64,17 @@ export interface Detection {
     /** Bounding box in normalized screen coordinates. */
     bbox: BoundingBox;
 }
-export interface ArcProgress {
-    /** Degrees of camera rotation accumulated since scan start. */
-    degrees: number;
-    /** Dominant rotation direction this frame. */
-    direction: 'left' | 'right' | 'up' | 'down';
-}
 export interface ItemSavedEvent {
     /** May be empty — naming is optional and happens server-side. */
     label: string;
     frameCount: number;
+    /** Orbit span covered while measuring, in degrees. Reporting only. */
     arcDegrees: number;
     hasDepth: boolean;
-    /** On-device volume estimate in m³ (LiDAR devices only). */
+    /** Volume in m³ — measured on device, or entered manually by the customer. */
     volumeM3?: number;
 }
-/** A complete item scan: one arc sweep around one piece of furniture. */
+/** A complete item scan: one guided sweep around one piece of furniture. */
 export interface ItemScan {
     /**
      * Customer-supplied name, **possibly empty**. Volume is what the capture is
@@ -84,18 +83,22 @@ export interface ItemScan {
      */
     label: string;
     frames: ItemFrame[];
+    /** Orbit span covered while measuring, in degrees. Reporting only. */
     arcDegrees: number;
     hasDepth: boolean;
     /**
-     * On-device volume estimate in m³, computed from LiDAR depth back-projection
-     * + gravity-aligned OBB (includes packing factor). Absent on non-LiDAR
-     * devices or when depth segmentation failed — the backend then estimates
-     * server-side.
+     * Volume in m³ including packing factor. Either measured on device (LiDAR
+     * depth back-projection + gravity-aligned OBB) or entered by the customer via
+     * manual entry. Absent when neither happened — the backend then estimates
+     * server-side from the photos.
      */
     volumeM3?: number;
-    /** Gravity-aligned OBB dimensions [length, width, height] in metres. */
+    /**
+     * Dimensions [length, width, height] in metres — the gravity-aligned OBB, or
+     * the customer's typed measurements. Absent when only a volume is known.
+     */
     dimsM?: number[];
-    /** Heuristic confidence [0, 1] for the on-device measurement. */
+    /** Heuristic confidence [0, 1] for the volume. */
     deviceConfidence?: number;
 }
 export interface ItemFrame {
