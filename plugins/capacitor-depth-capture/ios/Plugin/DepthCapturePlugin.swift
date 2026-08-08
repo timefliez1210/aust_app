@@ -149,10 +149,18 @@ private final class VolumeAccumulator {
     /// updates several times a second matters more than the last few points.
     private static let maxPoints = 40_000
 
-    /// The gate may only creep outwards this far per frame. Real furniture does
-    /// not grow; a jump this big is a segmentation leak, and letting it through
-    /// once is what lets the next frame leak further.
-    private static let maxGateGrowthPerFrame: Float = 0.04
+    /// Points this close above the detected floor plane belong to the floor.
+    private static let floorClearance: Float = 0.05
+    /// A horizontal surface this far below the seed is something the object
+    /// stands on, not part of it.
+    private static let supportDropBelowSeed: Float = 0.12
+    /// |normal · up| above this is a horizontal surface (≈ within 25°).
+    private static let horizontalNormalThreshold: Float = 0.90
+
+    /// The gate may only creep outwards this far per *frame*, and frames arrive
+    /// at 60 Hz — keep it small enough that a leak needs seconds of sustained
+    /// evidence to widen the gate, not a handful of bad frames.
+    private static let maxGateGrowthPerFrame: Float = 0.012
     private static let maxHorizontalRadius: Float = 1.5
     private static let maxHalfHeight: Float = 1.3
     /// The anchor follows the cloud slowly, so a few bad points can't walk the
@@ -200,7 +208,8 @@ private final class VolumeAccumulator {
                 confidenceMap: CVPixelBuffer?,
                 intrinsics k: simd_float3x3,
                 imageSize: CGSize,
-                cameraTransform: simd_float4x4) -> IngestOutcome {
+                cameraTransform: simd_float4x4,
+                floorY: Float?) -> IngestOutcome {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
@@ -248,6 +257,20 @@ private final class VolumeAccumulator {
             let yc = -(v - cy) * d / fy
             let world = cameraTransform * simd_float4(xc, yc, -d, 1)
             return simd_float3(world.x, world.y, world.z)
+        }
+        /// World-space surface normal from the depth gradient. Used to recognise
+        /// the surface an object stands on; nil at the grid border or on holes.
+        func surfaceNormal(_ gx: Int, _ gy: Int) -> simd_float3? {
+            guard gx > 0, gx < gw - 1, gy > 0, gy < gh - 1 else { return nil }
+            let dl = depthAt(gx - 1, gy), dr = depthAt(gx + 1, gy)
+            let du = depthAt(gx, gy - 1), dd = depthAt(gx, gy + 1)
+            guard dl.isFinite, dr.isFinite, du.isFinite, dd.isFinite,
+                  dl > 0.2, dr > 0.2, du > 0.2, dd > 0.2 else { return nil }
+            let n = simd_cross(backProject(gx + 1, gy, dr) - backProject(gx - 1, gy, dl),
+                               backProject(gx, gy + 1, dd) - backProject(gx, gy - 1, du))
+            let length = simd_length(n)
+            guard length > 1e-6 else { return nil }
+            return n / length
         }
         /// Median depth of a window, so a single bad pixel can't define the seed.
         func medianDepth(around gx: Int, _ gy: Int, half: Int) -> Float? {
@@ -318,6 +341,39 @@ private final class VolumeAccumulator {
         if let l = currentLock, !l.contains(seedWorld) {
             return .lostObject(centerWorld: seedWorld)
         }
+        // Seeding on the floor measures the floor. Refuse and let the customer
+        // aim at something.
+        if let floorY, seedWorld.y < floorY + Self.floorClearance {
+            return currentLock == nil ? .unusable : .lostObject(centerWorld: seedWorld)
+        }
+        // Before ARKit reports a floor plane there is nothing to compare a
+        // height against, and the normal test can't help either — a seed *on*
+        // the floor is at seed level by definition. So during acquisition only,
+        // decline a seed lying on a horizontal surface until the floor is known.
+        // Self-limiting: ARKit finds the floor within a second or two, after
+        // which a mattress at 20 cm is properly distinguishable from the tiles.
+        if currentLock == nil, floorY == nil,
+           let n = surfaceNormal(seedX, seedY), abs(n.y) > Self.horizontalNormalThreshold {
+            return .unusable
+        }
+
+        /// The support surface an object stands on is depth-continuous with it,
+        /// so region growing crawls straight from a fan's base out across the
+        /// whole floor — the flood is bounded only by the gate, which then grows
+        /// to fit it. Neither a distance gate nor percentile trimming can undo
+        /// that: the floor is genuinely close and genuinely dense.
+        ///
+        /// Two rejections, because each covers the other's blind spot. ARKit's
+        /// detected floor plane is authoritative but only exists once ARKit has
+        /// found it; the normal test needs no session state but must be limited
+        /// to points *below* the seed so it doesn't eat the top of the very
+        /// table or cabinet being measured.
+        func isSupportSurface(_ gx: Int, _ gy: Int, world: simd_float3) -> Bool {
+            if let floorY, world.y < floorY + Self.floorClearance { return true }
+            guard world.y < seedWorld.y - Self.supportDropBelowSeed else { return false }
+            guard let n = surfaceNormal(gx, gy) else { return false }
+            return abs(n.y) > Self.horizontalNormalThreshold
+        }
 
         var visited = [Bool](repeating: false, count: gw * gh)
         var region: [simd_float3] = []
@@ -347,6 +403,9 @@ private final class VolumeAccumulator {
                 } else {
                     guard simd_distance(world, seedWorld) < Self.acquisitionRadius else { continue }
                 }
+                // Not enqueued, so the flood cannot travel *through* the floor
+                // either — it stops at the object's footprint.
+                guard !isSupportSurface(nx, ny, world: world) else { continue }
                 queue.append((nx, ny, nd))
             }
         }
@@ -797,7 +856,10 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         bridge?.webView?.isHidden = true
 
         let config = ARWorldTrackingConfiguration()
-        config.planeDetection = []
+        // Horizontal planes are how we find the floor, which is what the
+        // segmentation has to refuse to measure. No anchor nodes are added, so
+        // nothing is drawn for them.
+        config.planeDetection = [.horizontal]
         if hasLidar { config.frameSemantics = .sceneDepth }
         sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
     }
@@ -920,7 +982,8 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
                                         confidenceMap: sceneDepth.confidenceMap,
                                         intrinsics: frame.camera.intrinsics,
                                         imageSize: frame.camera.imageResolution,
-                                        cameraTransform: frame.camera.transform)
+                                        cameraTransform: frame.camera.transform,
+                                        floorY: floorLevel(in: frame))
         handleTracking(outcome)
         guard !objectLost || scanVolume.objectLock == nil else {
             // Off the object: keep tracking state and guidance alive, but do not
@@ -1033,6 +1096,22 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         scanFrames.append(ItemFrame(imageBase64: imageBase64,
                                     depthMapBase64: depthBase64,
                                     pose: transformToFloatArray(frame.camera.transform)))
+    }
+
+    /// World Y of the floor: the lowest horizontal plane ARKit has found.
+    ///
+    /// Lowest, not nearest — a table top is also a horizontal plane, and
+    /// treating it as the floor would delete the object standing on it. Points
+    /// near the true floor are the only ones we refuse outright; everything
+    /// above survives on the normal test alone.
+    private func floorLevel(in frame: ARFrame) -> Float? {
+        var lowest: Float?
+        for anchor in frame.anchors {
+            guard let plane = anchor as? ARPlaneAnchor, plane.alignment == .horizontal else { continue }
+            let y = plane.transform.columns.3.y + plane.center.y
+            if lowest == nil || y < lowest! { lowest = y }
+        }
+        return lowest
     }
 
     /// Camera bearing around the object, bucketed. Bearing is measured in the
@@ -2007,9 +2086,13 @@ private class ScanOverlayView: UIView {
         countLabel.frame = CGRect(x: 28, y: 0, width: 96, height: 32)
         closeBtn.frame = CGRect(x: w - 60, y: safe.top + 4, width: 40, height: 40)
 
-        // Reticle: centred square with corner brackets
+        // Reticle: centred square with corner brackets.
+        // Dead centre, no optical nudge: the depth seed is taken at the exact
+        // centre of the camera image, which the portrait aspect-fill maps to the
+        // exact centre of the screen. Offsetting the reticle would aim the
+        // customer a few centimetres away from what actually gets measured.
         let side: CGFloat = min(w, h) * 0.6
-        let cy = h / 2 - 40
+        let cy = h / 2
         reticle.frame = CGRect(x: (w - side) / 2, y: cy - side / 2, width: side, height: side)
         reticleLayer.frame = reticle.bounds
         reticleLayer.path = cornerBracketPath(in: reticle.bounds, arm: side * 0.18, radius: 14).cgPath
