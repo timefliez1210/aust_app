@@ -141,6 +141,14 @@ jobs:
           ruby-version: "3.3"
           bundler-cache: true
 
+      # ── Compile gate (every branch) ──
+      # Runs before signing so a Swift compile error is reported as a Swift
+      # compile error, not swallowed by a signing failure. There is no local
+      # Xcode on the dev machine — this is the only place plugin Swift is
+      # type-checked before Codemagic.
+      - name: Build debug (simulator)
+        run: bundle exec fastlane ios build_debug
+
       # ── Release build + TestFlight upload (main branch only) ──
       - name: Import signing certificate
         if: github.ref == 'refs/heads/main'
@@ -173,8 +181,3 @@ jobs:
           APPLE_API_ISSUER:     ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
           GITHUB_RUN_NUMBER:    ${{ github.run_number }}
-
-      # ── Debug simulator build (PRs) ──
-      - name: Build debug (simulator)
-        if: github.ref != 'refs/heads/main'
-        run: bundle exec fastlane ios build_debug

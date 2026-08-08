@@ -5,7 +5,9 @@ default_platform(:ios)
 # ─── iOS ────────────────────────────────────────────────────────────────────
 
 platform :ios do
-  # Build a simulator debug build (no signing) — used for PRs
+  # Build a simulator debug build (no signing). Runs on every branch as the
+  # compile gate for the plugin's Swift — there is no local Xcode, so this is
+  # where type errors surface first.
   lane :build_debug do
     build_app(
       project: "ios/App/App.xcodeproj",

@@ -521,10 +521,13 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
                                 volumeM3: measured?.volume,
                                 dims: measured?.dims,
                                 deviceConfidence: measured?.confidence)
+        // Unpack the OBB here: `measured?.dims.map { … }` would chain onto the
+        // unwrapped simd_float3 (whose `map` hands out Floats), not the Optional.
+        let dimsArray: [Float]? = measured.map { [$0.dims.x, $0.dims.y, $0.dims.z] }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.overlay?.showReview(volumeM3: measured?.volume,
-                                     dims: measured?.dims.map { [$0.x, $0.y, $0.z] },
+                                     dims: dimsArray,
                                      suggestedLabel: self.scanSuggestedLabel,
                                      measurable: self.hasLidar)
         }
