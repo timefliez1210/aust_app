@@ -706,7 +706,7 @@ private final class VolumeAccumulator {
             var out = Set<SIMD2<Int32>>(minimumCapacity: f.count * 9)
             for c in f {
                 for dx in Int32(-1)...1 {
-                    for dz in Int32(-1)...1 { out.insert(SIMD2<Int32>(c.x + dx, c.z + dz)) }
+                    for dz in Int32(-1)...1 { out.insert(SIMD2<Int32>(c.x + dx, c.y + dz)) }
                 }
             }
             return out
