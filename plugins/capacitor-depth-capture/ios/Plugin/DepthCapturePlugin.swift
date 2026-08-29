@@ -117,6 +117,50 @@ private enum IngestOutcome {
     case lostObject(centerWorld: simd_float3?)
 }
 
+// MARK: - SegmentationMask
+
+/// The depth-grid cells that belonged to the tracked object in the frame just
+/// ingested — the segmentation itself, not a proxy for it.
+///
+/// The overlay draws this. It used to draw the convex hull of the *box*
+/// corners, which shows a box no matter what the segmentation actually grabbed:
+/// a fan whose pole dropped out and a fan measured properly look identical.
+/// With the mask, the first is visibly two blobs and the second is a fan.
+private struct SegmentationMask {
+    let gridWidth: Int
+    let gridHeight: Int
+    let stride: Int
+    let depthWidth: Int
+    let depthHeight: Int
+    let bits: [Bool]
+
+    /// Maximal horizontal runs of set cells, in normalized depth-image
+    /// coordinates. Run-length keeps the drawn path at a few hundred rectangles
+    /// instead of tens of thousands — the scrim is rebuilt many times a second,
+    /// and a path with one subpath per cell would not keep up.
+    func normalizedRuns() -> [CGRect] {
+        guard depthWidth > 0, depthHeight > 0, gridWidth > 0 else { return [] }
+        let cw = CGFloat(stride) / CGFloat(depthWidth)
+        let ch = CGFloat(stride) / CGFloat(depthHeight)
+        var rects: [CGRect] = []
+        for gy in 0..<gridHeight {
+            var runStart: Int?
+            for gx in 0...gridWidth {
+                let on = gx < gridWidth && bits[gy * gridWidth + gx]
+                if on, runStart == nil { runStart = gx }
+                if !on, let start = runStart {
+                    rects.append(CGRect(x: CGFloat(start) * cw,
+                                        y: CGFloat(gy) * ch,
+                                        width: CGFloat(gx - start) * cw,
+                                        height: ch))
+                    runStart = nil
+                }
+            }
+        }
+        return rects
+    }
+}
+
 // MARK: - VolumeAccumulator
 //
 // On-device volume estimation for LiDAR devices. The first frame acquires an
@@ -133,8 +177,30 @@ private enum IngestOutcome {
 // block on a full OBB fit.
 private final class VolumeAccumulator {
 
-    /// Subsample stride over the 256×192 depth grid.
-    private static let stride = 2
+    /// Subsample stride over the 256×192 depth grid. Full resolution, because
+    /// thin members are the whole problem: a fan's pole is one or two cells wide
+    /// at 2 m, and at stride 2 it vanishes — taking the only connection between
+    /// the base and the head with it.
+    private static let stride = 1
+    /// Half-width of the seed's median window, in grid cells (≈15 cm at 2 m).
+    private static let seedWindow = 12
+    /// Cell offset for depth-gradient normals. One cell at full resolution is
+    /// too short a baseline to be anything but noise.
+    private static let normalOffset = 2
+    /// How far the region grow may jump straight across cells that carry no
+    /// usable depth, to reconnect a thin member. Thin structures rarely read
+    /// *wrong*; they read *nothing*, and a 4-neighbour walk stops at the first
+    /// one-cell hole.
+    private static let maxBridge = 3
+    /// 8-neighbour: a pole that steps one cell sideways per row is diagonally
+    /// connected and nothing else.
+    private static let neighbourOffsets: [(Int, Int)] = [
+        (-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1),
+    ]
+    /// Footprint overlap (relative to the smaller of the two) at which a
+    /// separate cloud component counts as *stacked on* the object rather than
+    /// standing beside it. See `componentContainingAnchor`.
+    private static let stackOverlap: Float = 0.6
     /// Depth continuity threshold for region growing: max(4 cm, 2% of depth).
     private static let depthJump: Float = 0.04
     /// Acquisition only: how far the first frame's region may reach from its
@@ -173,10 +239,17 @@ private final class VolumeAccumulator {
     private var framesUsedStorage = 0
     private var seedDepthStorage: Float?
     private var lockStorage: ObjectLock?
+    private var lastMaskStorage: SegmentationMask?
 
     var framesUsed: Int {
         lock.lock(); defer { lock.unlock() }
         return framesUsedStorage
+    }
+
+    /// Segmentation of the most recently ingested frame, for the overlay.
+    var lastMask: SegmentationMask? {
+        lock.lock(); defer { lock.unlock() }
+        return lastMaskStorage
     }
 
     /// The tracked object, once acquired.
@@ -261,13 +334,14 @@ private final class VolumeAccumulator {
         /// World-space surface normal from the depth gradient. Used to recognise
         /// the surface an object stands on; nil at the grid border or on holes.
         func surfaceNormal(_ gx: Int, _ gy: Int) -> simd_float3? {
-            guard gx > 0, gx < gw - 1, gy > 0, gy < gh - 1 else { return nil }
-            let dl = depthAt(gx - 1, gy), dr = depthAt(gx + 1, gy)
-            let du = depthAt(gx, gy - 1), dd = depthAt(gx, gy + 1)
+            let o = Self.normalOffset
+            guard gx >= o, gx < gw - o, gy >= o, gy < gh - o else { return nil }
+            let dl = depthAt(gx - o, gy), dr = depthAt(gx + o, gy)
+            let du = depthAt(gx, gy - o), dd = depthAt(gx, gy + o)
             guard dl.isFinite, dr.isFinite, du.isFinite, dd.isFinite,
                   dl > 0.2, dr > 0.2, du > 0.2, dd > 0.2 else { return nil }
-            let n = simd_cross(backProject(gx + 1, gy, dr) - backProject(gx - 1, gy, dl),
-                               backProject(gx, gy + 1, dd) - backProject(gx, gy - 1, du))
+            let n = simd_cross(backProject(gx + o, gy, dr) - backProject(gx - o, gy, dl),
+                               backProject(gx, gy + o, dd) - backProject(gx, gy - o, du))
             let length = simd_length(n)
             guard length > 1e-6 else { return nil }
             return n / length
@@ -310,7 +384,7 @@ private final class VolumeAccumulator {
             seedX = px; seedY = py
         }
 
-        guard let seedDepth = medianDepth(around: seedX, seedY, half: 6) else {
+        guard let seedDepth = medianDepth(around: seedX, seedY, half: Self.seedWindow) else {
             return currentLock == nil
                 ? .unusable
                 : .lostObject(centerWorld: centerWorldPoint(gw: gw, gh: gh,
@@ -376,56 +450,101 @@ private final class VolumeAccumulator {
         }
 
         var visited = [Bool](repeating: false, count: gw * gh)
+        /// Every cell that ended up part of the object, weak ones included —
+        /// this is what the customer sees.
+        var inRegion = [Bool](repeating: false, count: gw * gh)
         var region: [simd_float3] = []
-        var queue: [(Int, Int, Float)] = [(seedX, seedY, seedRaw)]
+        /// A `weak` cell conducts but contributes no geometry. Low confidence is
+        /// the signature of a thin edge, where LiDAR blends the object with
+        /// whatever is behind it: dropping those cells outright (which the old
+        /// confidence filter did) severs a fan at the pole, and keeping their
+        /// depth would inflate the box with wall-blended readings. So they carry
+        /// the region across the pole and are measured by nothing.
+        var queue: [(x: Int, y: Int, d: Float, weak: Bool)] = [(seedX, seedY, seedRaw, false)]
         visited[seedY * gw + seedX] = true
         let maxRegion = Int(Double(gw * gh) * Self.maxRegionFraction)
 
         var qi = 0
         while qi < queue.count {
-            let (gx, gy, d) = queue[qi]
+            let (gx, gy, d, weak) = queue[qi]
             qi += 1
-            region.append(backProject(gx, gy, d))
-            if region.count > maxRegion { return .unusable }  // flooded into the room
+            inRegion[gy * gw + gx] = true
+            if !weak {
+                region.append(backProject(gx, gy, d))
+                if region.count > maxRegion { return .unusable }  // flooded into the room
+            }
 
-            for (nx, ny) in [(gx - 1, gy), (gx + 1, gy), (gx, gy - 1), (gx, gy + 1)] {
-                guard nx >= 0, nx < gw, ny >= 0, ny < gh, !visited[ny * gw + nx] else { continue }
-                visited[ny * gw + nx] = true
-                let nd = depthAt(nx, ny)
-                guard nd.isFinite, nd > 0.2, nd < 6.0, confidentAt(nx, ny),
-                      abs(nd - d) < max(Self.depthJump, 0.02 * d)
-                else { continue }
-                // The gate — the whole point of the lock. Anything reaching past
-                // the tracked object stops here instead of joining the cloud.
-                let world = backProject(nx, ny, nd)
-                if let l = currentLock {
-                    guard l.contains(world) else { continue }
-                } else {
-                    guard simd_distance(world, seedWorld) < Self.acquisitionRadius else { continue }
+            for (dx, dy) in Self.neighbourOffsets {
+                // Straight steps may jump a hole of up to `maxBridge` cells;
+                // diagonals never do, because a diagonal jump across a gap is as
+                // likely to land on the wall behind as on the far side of a pole.
+                var step = 1
+                while step <= Self.maxBridge {
+                    let nx = gx + dx * step, ny = gy + dy * step
+                    guard nx >= 0, nx < gw, ny >= 0, ny < gh else { break }
+                    let nd = depthAt(nx, ny)
+                    guard nd.isFinite, nd > 0.2, nd < 6.0 else {
+                        // No usable depth here: a hole, not a rejection.
+                        if dx != 0 && dy != 0 { break }
+                        step += 1
+                        continue
+                    }
+                    guard !visited[ny * gw + nx] else { break }
+                    visited[ny * gw + nx] = true
+                    // Continuity is judged against the cell we came from, with
+                    // the tolerance widened by the jump — a bridged gap cannot
+                    // be held to a single-cell tolerance.
+                    guard abs(nd - d) < max(Self.depthJump, 0.02 * d) * Float(step) else { break }
+                    // The gate — the whole point of the lock. Anything reaching
+                    // past the tracked object stops here instead of joining the
+                    // cloud.
+                    let world = backProject(nx, ny, nd)
+                    if let l = currentLock {
+                        guard l.contains(world) else { break }
+                    } else {
+                        guard simd_distance(world, seedWorld) < Self.acquisitionRadius else { break }
+                    }
+                    // Not enqueued, so the flood cannot travel *through* the
+                    // floor either — it stops at the object's footprint.
+                    guard !isSupportSurface(nx, ny, world: world) else { break }
+                    queue.append((nx, ny, nd, !confidentAt(nx, ny)))
+                    break
                 }
-                // Not enqueued, so the flood cannot travel *through* the floor
-                // either — it stops at the object's footprint.
-                guard !isSupportSurface(nx, ny, world: world) else { continue }
-                queue.append((nx, ny, nd))
             }
         }
-        guard region.count >= 150 else {
+        // Four times the cells per frame at stride 1, so four times the floor.
+        guard region.count >= 600 else {
             return currentLock == nil ? .unusable : .lostObject(centerWorld: seedWorld)
         }
 
-        // Fuse into the world cloud, capped per frame.
+        // Fuse into the world cloud, capped per frame. The sample has to be
+        // *unbiased*: the BFS emits points in flood order, which is roughly
+        // spatial, so keeping every Nth systematically thins whatever the flood
+        // reached last — usually the thin part we just fought to include.
         let cap = 6000
-        let keepEvery = max(1, region.count / cap)
         var fresh: [simd_float3] = []
-        fresh.reserveCapacity(min(region.count, cap) + 1)
-        for (i, p) in region.enumerated() where i % keepEvery == 0 { fresh.append(p) }
+        if region.count <= cap {
+            fresh = region
+        } else {
+            fresh.reserveCapacity(cap + 64)
+            let keepProbability = Double(cap) / Double(region.count)
+            var rng: UInt64 = 0x9E37_79B9_7F4A_7C15
+            for p in region {
+                rng = rng &* 6364136223846793005 &+ 1442695040888963407
+                if Double(rng >> 11) * 0x1p-53 < keepProbability { fresh.append(p) }
+            }
+        }
         guard !fresh.isEmpty else { return .unusable }
+
+        let mask = SegmentationMask(gridWidth: gw, gridHeight: gh, stride: s,
+                                    depthWidth: w, depthHeight: h, bits: inRegion)
 
         lock.lock()
         worldPoints.append(contentsOf: fresh)
         for p in fresh { pointSum += p }
         framesUsedStorage += 1
         lockStorage = Self.updatedLock(lockStorage, from: fresh)
+        lastMaskStorage = mask
         if worldPoints.count > Self.maxPoints { halveLocked() }
         lock.unlock()
         return .accepted
@@ -436,7 +555,7 @@ private final class VolumeAccumulator {
     private func centerWorldPoint(gw: Int, gh: Int,
                                   medianDepth: (Int, Int, Int) -> Float?,
                                   backProject: (Int, Int, Float) -> simd_float3) -> simd_float3? {
-        guard let d = medianDepth(gw / 2, gh / 2, 6) else { return nil }
+        guard let d = medianDepth(gw / 2, gh / 2, Self.seedWindow) else { return nil }
         return backProject(gw / 2, gh / 2, d)
     }
 
@@ -511,13 +630,23 @@ private final class VolumeAccumulator {
         return (worldPoints, framesUsedStorage, lockStorage?.anchor)
     }
 
-    /// Keep only the part of the cloud that is physically connected to the
-    /// anchor, at 6 cm voxel resolution.
+    /// Keep the part of the cloud that belongs to the object: its own component
+    /// at 6 cm voxel resolution, plus any component stacked directly above or
+    /// below it.
     ///
-    /// The gate stops *new* leaks, this cleans up whatever got in before the
+    /// The gate stops *new* leaks; this cleans up whatever got in before the
     /// lock tightened. Percentile trimming can't: it assumes outliers are a thin
     /// tail, and a bed is not a thin tail — it is a second dense blob that drags
     /// the box over both.
+    ///
+    /// Connectivity alone is not enough either. A pedestal fan is a base, a pole
+    /// one or two depth cells wide, and a head; every frame where the pole fails
+    /// to register leaves the head as a separate blob, and the box collapses
+    /// onto whichever half happens to hold the anchor. But the head sits *over*
+    /// the base — so a component whose footprint is contained in the anchor
+    /// component's footprint is part of the same standing object, while a bed
+    /// 40 cm to the side is not. That test is what recovers the parts the
+    /// segmentation could not physically reach.
     private static func componentContainingAnchor(_ anchor: simd_float3?,
                                                   points: [simd_float3]) -> [simd_float3] {
         guard let anchor, points.count > 50 else { return points }
@@ -543,29 +672,73 @@ private final class VolumeAccumulator {
             guard bestDistance < 1.0 else { return points }
         }
 
-        var reached: Set<SIMD3<Int32>> = [start]
-        var queue = [start]
-        var qi = 0
-        while qi < queue.count {
-            let c = queue[qi]; qi += 1
-            for dx in Int32(-1)...1 {
-                for dy in Int32(-1)...1 {
-                    for dz in Int32(-1)...1 where !(dx == 0 && dy == 0 && dz == 0) {
-                        let n = SIMD3<Int32>(c.x + dx, c.y + dy, c.z + dz)
-                        guard occupancy[n] != nil, !reached.contains(n) else { continue }
-                        reached.insert(n)
-                        queue.append(n)
+        // Label *every* component, not just the anchor's — the others are the
+        // candidates for the stacking test below.
+        var componentOf: [SIMD3<Int32>: Int] = [:]
+        componentOf.reserveCapacity(occupancy.count)
+        var components: [[SIMD3<Int32>]] = []
+        for key in occupancy.keys where componentOf[key] == nil {
+            let id = components.count
+            var reached: [SIMD3<Int32>] = [key]
+            componentOf[key] = id
+            var qi = 0
+            while qi < reached.count {
+                let c = reached[qi]; qi += 1
+                for dx in Int32(-1)...1 {
+                    for dy in Int32(-1)...1 {
+                        for dz in Int32(-1)...1 where !(dx == 0 && dy == 0 && dz == 0) {
+                            let n = SIMD3<Int32>(c.x + dx, c.y + dy, c.z + dz)
+                            guard occupancy[n] != nil, componentOf[n] == nil else { continue }
+                            componentOf[n] = id
+                            reached.append(n)
+                        }
                     }
                 }
             }
+            components.append(reached)
+        }
+        guard let anchorID = componentOf[start] else { return points }
+
+        let footprints = components.map { cells in Set(cells.map { SIMD2<Int32>($0.x, $0.z) }) }
+        /// Dilated by one cell: a pole is never perfectly plumb, and a head or a
+        /// shade overhangs its base by a few centimetres either way.
+        func dilated(_ f: Set<SIMD2<Int32>>) -> Set<SIMD2<Int32>> {
+            var out = Set<SIMD2<Int32>>(minimumCapacity: f.count * 9)
+            for c in f {
+                for dx in Int32(-1)...1 {
+                    for dz in Int32(-1)...1 { out.insert(SIMD2<Int32>(c.x + dx, c.z + dz)) }
+                }
+            }
+            return out
         }
 
-        var kept: [simd_float3] = []
-        kept.reserveCapacity(points.count)
-        for c in reached {
-            for i in occupancy[c] ?? [] { kept.append(points[i]) }
+        var kept: Set<Int> = [anchorID]
+        var keptFootprint = footprints[anchorID]
+        // Fixpoint, so a base → pole → head chain still joins up when the head
+        // only overlaps the pole. Overlap is measured against the *smaller*
+        // footprint, because either part may be the wider one.
+        var changed = true
+        while changed {
+            changed = false
+            let target = dilated(keptFootprint)
+            for id in components.indices where !kept.contains(id) {
+                let f = footprints[id]
+                let smaller = min(f.count, keptFootprint.count)
+                guard smaller > 0 else { continue }
+                let shared = f.reduce(0) { $0 + (target.contains($1) ? 1 : 0) }
+                guard Float(shared) / Float(smaller) >= Self.stackOverlap else { continue }
+                kept.insert(id)
+                keptFootprint.formUnion(f)
+                changed = true
+            }
         }
-        return kept
+
+        var result: [simd_float3] = []
+        result.reserveCapacity(points.count)
+        for (c, id) in componentOf where kept.contains(id) {
+            for i in occupancy[c] ?? [] { result.append(points[i]) }
+        }
+        return result
     }
 
     /// Fit the gravity-aligned OBB. Pure — safe to call on any thread.
@@ -642,6 +815,7 @@ private final class VolumeAccumulator {
         framesUsedStorage = 0
         seedDepthStorage = nil
         lockStorage = nil
+        lastMaskStorage = nil
         lock.unlock()
     }
 }
@@ -688,6 +862,9 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     private var frameCounter = 0
     private let yoloEveryNFrames = 12
     private var hasLidar = false
+    /// AR view size, cached on the main thread. The mask is built on the render
+    /// thread, and reading `arView.bounds` from there is a UIKit race.
+    private var viewportSize: CGSize = .zero
     private var sessionIntrinsics: simd_float3x3?
 
     // ── YOLO (silent) ─────────────────────────────────────────────────────
@@ -738,6 +915,10 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     private var measuring = false
     private var lastMeasureTime: TimeInterval = 0
     private static let measureInterval: TimeInterval = 0.25
+    /// The focus mask is redrawn on its own, faster clock: it tracks the object
+    /// itself rather than the fitted box, so it must not wait for a fit.
+    private var lastMaskTime: TimeInterval = 0
+    private static let maskInterval: TimeInterval = 0.05
     private let measureQueue = DispatchQueue(label: "aust.depthcapture.measure", qos: .userInitiated)
 
     /// Orbit span in degrees, reported with the item. Non-LiDAR devices have no
@@ -851,6 +1032,7 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         // Add to window (not rootVC.view, which IS the WKWebView in Capacitor)
         window.addSubview(sceneView)
         arView = sceneView
+        viewportSize = sceneView.bounds.size
 
         // Hide WebView entirely — native UI takes over
         bridge?.webView?.isHidden = true
@@ -985,6 +1167,7 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
                                         cameraTransform: frame.camera.transform,
                                         floorY: floorLevel(in: frame))
         handleTracking(outcome)
+        updateFocusMask(frame)
         guard !objectLost || scanVolume.objectLock == nil else {
             // Off the object: keep tracking state and guidance alive, but do not
             // capture frames — a photo of the wall is worse than no photo.
@@ -1234,6 +1417,43 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         return inCamera.x < 0
     }
 
+    // MARK: - Focus mask
+
+    /// Draw the segmented object.
+    ///
+    /// `SegmentationMask` is in depth-grid coordinates; `displayTransform` maps
+    /// normalized *image* coordinates to normalized viewport coordinates, which
+    /// covers the 90° rotation and the aspect-fill crop between the camera image
+    /// and the screen. Building the path in normalized image space and applying
+    /// one affine at the end keeps that transform in a single place.
+    private func updateFocusMask(_ frame: ARFrame) {
+        let now = CACurrentMediaTime()
+        guard now - lastMaskTime >= Self.maskInterval else { return }
+        lastMaskTime = now
+
+        guard scanActive, !objectLost, let mask = scanVolume.lastMask else {
+            DispatchQueue.main.async { [weak self] in self?.overlay?.updateFocusSilhouette(nil) }
+            return
+        }
+        let size = viewportSize
+        guard size.width > 1, size.height > 1 else { return }
+
+        let runs = mask.normalizedRuns()
+        guard !runs.isEmpty else {
+            DispatchQueue.main.async { [weak self] in self?.overlay?.updateFocusSilhouette(nil) }
+            return
+        }
+        let toView = frame.displayTransform(for: .portrait, viewportSize: size)
+            .concatenating(CGAffineTransform(scaleX: size.width, y: size.height))
+        let path = UIBezierPath()
+        for r in runs { path.append(UIBezierPath(rect: r)) }
+        path.apply(toView)
+
+        DispatchQueue.main.async { [weak self] in
+            self?.overlay?.updateFocusSilhouette(path)
+        }
+    }
+
     // MARK: - Live box
 
     /// Draw the measured object as a wireframe box and hand the overlay the
@@ -1274,50 +1494,9 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
                                      text: "\(prefix) \(Int((metres * 100).rounded())) cm"))
         }
 
-        // Focus silhouette: the convex hull of the eight projected corners.
-        // Everything outside it gets dimmed, so the customer can see at a glance
-        // what is inside the measurement — and, more usefully, when something
-        // that shouldn't be has crept in.
-        var corners: [CGPoint] = []
-        for sx in [Float(-0.5), 0.5] {
-            for sy in [Float(-0.5), 0.5] {
-                for sz in [Float(-0.5), 0.5] {
-                    if let p = project(simd_float3(sx, sy, sz)) { corners.append(p) }
-                }
-            }
-        }
-        let hull = corners.count >= 3 ? Self.convexHull(corners) : []
-
         DispatchQueue.main.async { [weak self] in
             self?.overlay?.updateDimensionTags(tags)
-            self?.overlay?.updateFocusSilhouette(hull)
         }
-    }
-
-    /// Andrew's monotone chain. Small n (≤8), so the sort dominates and this is
-    /// nowhere near hot enough to matter.
-    private static func convexHull(_ input: [CGPoint]) -> [CGPoint] {
-        let points = input.sorted { $0.x == $1.x ? $0.y < $1.y : $0.x < $1.x }
-        guard points.count >= 3 else { return points }
-        func cross(_ o: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
-            (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
-        }
-        var hull: [CGPoint] = []
-        for p in points {
-            while hull.count >= 2, cross(hull[hull.count - 2], hull[hull.count - 1], p) <= 0 {
-                hull.removeLast()
-            }
-            hull.append(p)
-        }
-        let lowerCount = hull.count + 1
-        for p in points.reversed() {
-            while hull.count >= lowerCount, cross(hull[hull.count - 2], hull[hull.count - 1], p) <= 0 {
-                hull.removeLast()
-            }
-            hull.append(p)
-        }
-        hull.removeLast()
-        return hull
     }
 
     private func makeBoxNode() -> SCNNode {
@@ -1330,9 +1509,12 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         // `fillMode = .lines` wireframes the *triangulated* mesh instead, which
         // puts a diagonal across every face — that reads as a mess, not as the
         // outline of the thing being measured.
+        // Deliberately faint. The mask is what the customer should be reading;
+        // the box is context for the L/B/H numbers, not the main event.
         let wireMat = SCNMaterial()
         wireMat.diffuse.contents = UIColor.white
         wireMat.emission.contents = UIColor.white
+        wireMat.transparency = 0.5
         wireMat.lightingModel = .constant
         wireMat.isDoubleSided = true
         wireMat.writesToDepthBuffer = false
@@ -1361,7 +1543,7 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
 
         let fill = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0)
         let fillMat = SCNMaterial()
-        fillMat.diffuse.contents = UIColor(red: 252/255, green: 96/255, blue: 24/255, alpha: 0.16)
+        fillMat.diffuse.contents = UIColor(red: 252/255, green: 96/255, blue: 24/255, alpha: 0.06)
         fillMat.lightingModel = .constant
         fillMat.isDoubleSided = true
         fillMat.writesToDepthBuffer = false
@@ -1379,7 +1561,7 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         boxNode?.isHidden = hidden
         if hidden {
             overlay?.updateDimensionTags([])
-            overlay?.updateFocusSilhouette([])
+            overlay?.updateFocusSilhouette(nil)
         }
     }
 
@@ -1387,7 +1569,7 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         boxNode?.removeFromParentNode()
         boxNode = nil
         overlay?.updateDimensionTags([])
-        overlay?.updateFocusSilhouette([])
+        overlay?.updateFocusSilhouette(nil)
     }
 
     // MARK: - Finishing
@@ -1699,6 +1881,7 @@ private class ScanOverlayView: UIView {
     /// Dims everything outside the measured box, so what is (and isn't) part of
     /// the measurement is visible rather than inferred.
     private let focusScrim = CAShapeLayer()
+    private let maskTint = CAShapeLayer()
 
     // ── Toast ────────────────────────────────────────────────────────────
     private let toastLabel = UILabel()
@@ -1842,6 +2025,14 @@ private class ScanOverlayView: UIView {
         focusScrim.fillColor = UIColor.black.withAlphaComponent(0.42).cgColor
         focusScrim.isHidden = true
         hud.layer.addSublayer(focusScrim)
+
+        // Tint on top of the cut-out, so the object reads as *selected* rather
+        // than merely un-dimmed. Non-zero winding: the mask is a union of
+        // non-overlapping run rectangles and must fill without internal seams.
+        maskTint.fillRule = .nonZero
+        maskTint.fillColor = UIColor(red: 252/255, green: 96/255, blue: 24/255, alpha: 0.22).cgColor
+        maskTint.isHidden = true
+        hud.layer.addSublayer(maskTint)
 
         // The instruction — one at a time, arrow first because that is the part
         // people act on without reading.
@@ -2112,6 +2303,7 @@ private class ScanOverlayView: UIView {
         // Measuring HUD
         hud.frame = bounds
         focusScrim.frame = bounds
+        maskTint.frame = bounds
         toastLabel.frame = CGRect(x: 24, y: safe.top + 140, width: w - 48, height: 44)
         let gcW = w - 40
         guidanceCard.frame = CGRect(x: 20, y: safe.top + 56, width: gcW, height: 72)
@@ -2204,7 +2396,7 @@ private class ScanOverlayView: UIView {
         }
         if newState != .measuring {
             updateDimensionTags([])
-            updateFocusSilhouette([])
+            updateFocusSilhouette(nil)
             hideToast()
             hasLiveVolume = false
             setAcceptEnabled(false)
@@ -2301,24 +2493,30 @@ private class ScanOverlayView: UIView {
         }
     }
 
-    /// Dim everything outside the measured box. An empty hull clears it.
-    func updateFocusSilhouette(_ hull: [CGPoint]) {
-        guard hull.count >= 3 else {
+    /// Light up the segmented object and dim everything else. A nil mask clears
+    /// both layers.
+    ///
+    /// The mask is the actual set of measured pixels, not the outline of the
+    /// box: what the customer sees lit up is exactly what is in the volume, so
+    /// a missing fan pole or a bed that crept in is visible while it is still
+    /// fixable.
+    func updateFocusSilhouette(_ mask: UIBezierPath?) {
+        guard let mask, !mask.isEmpty else {
             focusScrim.isHidden = true
+            maskTint.isHidden = true
             return
         }
-        let path = UIBezierPath(rect: bounds)
-        let cutout = UIBezierPath()
-        cutout.move(to: hull[0])
-        for p in hull.dropFirst() { cutout.addLine(to: p) }
-        cutout.close()
-        path.append(cutout)
-        // No implicit animation: the scrim has to track the box frame-for-frame,
-        // and a quarter-second default animation on every update reads as lag.
+        let scrim = UIBezierPath(rect: bounds)
+        scrim.append(mask)
+        // No implicit animation: the mask has to track the object
+        // frame-for-frame, and a quarter-second default animation on every
+        // update reads as lag.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        focusScrim.path = path.cgPath
+        focusScrim.path = scrim.cgPath
         focusScrim.isHidden = false
+        maskTint.path = mask.cgPath
+        maskTint.isHidden = false
         CATransaction.commit()
     }
 
