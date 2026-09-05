@@ -59,791 +59,8 @@ private struct DetectionBox {
     }
 }
 
-// MARK: - Measurement
-
-/// One reading of the fused point cloud: the box we draw and the numbers we show.
-private struct Measurement {
-    /// Loading volume in m³ (geometric OBB × packing factor).
-    let volume: Float
-    /// [length, width, height] in metres. Length ≥ width; height is along gravity.
-    let dims: simd_float3
-    let confidence: Float
-    /// OBB centre in ARKit world space.
-    let center: simd_float3
-    /// Rotation about world Y that aligns the box's local +X with `dims.x`.
-    let yaw: Float
-}
-
-// MARK: - ObjectLock
-
-/// The one object this measurement is about, tracked in world space.
-///
-/// Without it the segmentation re-decides what it is looking at on every frame
-/// ("whatever is in the middle"), and the fused cloud only ever grows — pan
-/// across a bed once and the bed is in the volume forever. The lock turns the
-/// sweep into *tracking a specific thing*: the seed is projected from `anchor`
-/// rather than taken from the reticle, and points outside the gate are dropped
-/// instead of accumulated.
-///
-/// The gate is a cylinder, not a sphere: furniture is tall-and-thin or
-/// wide-and-flat far more often than it is round, and an isotropic radius big
-/// enough for a standing fan's height is also big enough to swallow the bed
-/// next to it.
-private struct ObjectLock {
-    var anchor: simd_float3
-    /// Half-extent in the horizontal plane (XZ).
-    var horizontalRadius: Float
-    /// Half-extent along gravity (Y).
-    var halfHeight: Float
-
-    /// How far the object can reach from `anchor` in any direction — used to
-    /// sanity-check the seed depth against the distance to the anchor.
-    var reach: Float { max(horizontalRadius, halfHeight) }
-
-    func contains(_ p: simd_float3) -> Bool {
-        let dxz = simd_length(simd_float2(p.x - anchor.x, p.z - anchor.z))
-        return dxz <= horizontalRadius && abs(p.y - anchor.y) <= halfHeight
-    }
-}
-
-/// What one frame did to the model.
-private enum IngestOutcome {
-    case accepted
-    /// Frame carried no usable depth. Says nothing about tracking.
-    case unusable
-    /// The locked object is not where it should be. `centerWorld` is whatever
-    /// the reticle is on now, so the caller can decide whether the customer has
-    /// moved on to a different item.
-    case lostObject(centerWorld: simd_float3?)
-}
-
-// MARK: - SegmentationMask
-
-/// The depth-grid cells that belonged to the tracked object in the frame just
-/// ingested — the segmentation itself, not a proxy for it.
-///
-/// The overlay draws this. It used to draw the convex hull of the *box*
-/// corners, which shows a box no matter what the segmentation actually grabbed:
-/// a fan whose pole dropped out and a fan measured properly look identical.
-/// With the mask, the first is visibly two blobs and the second is a fan.
-private struct SegmentationMask {
-    let gridWidth: Int
-    let gridHeight: Int
-    let stride: Int
-    let depthWidth: Int
-    let depthHeight: Int
-    let bits: [Bool]
-
-    /// Maximal horizontal runs of set cells, in normalized depth-image
-    /// coordinates. Run-length keeps the drawn path at a few hundred rectangles
-    /// instead of tens of thousands — the scrim is rebuilt many times a second,
-    /// and a path with one subpath per cell would not keep up.
-    func normalizedRuns() -> [CGRect] {
-        guard depthWidth > 0, depthHeight > 0, gridWidth > 0 else { return [] }
-        let cw = CGFloat(stride) / CGFloat(depthWidth)
-        let ch = CGFloat(stride) / CGFloat(depthHeight)
-        var rects: [CGRect] = []
-        for gy in 0..<gridHeight {
-            var runStart: Int?
-            for gx in 0...gridWidth {
-                let on = gx < gridWidth && bits[gy * gridWidth + gx]
-                if on, runStart == nil { runStart = gx }
-                if !on, let start = runStart {
-                    rects.append(CGRect(x: CGFloat(start) * cw,
-                                        y: CGFloat(gy) * ch,
-                                        width: CGFloat(gx - start) * cw,
-                                        height: ch))
-                    runStart = nil
-                }
-            }
-        }
-        return rects
-    }
-}
-
-// MARK: - VolumeAccumulator
-//
-// On-device volume estimation for LiDAR devices. The first frame acquires an
-// object from the reticle; from then on the object is *tracked*: its anchor is
-// projected into each new frame to place the seed, the depth map is region-grown
-// from there, and every back-projected point must fall inside the lock's gate to
-// join the cloud. `measure()` keeps only the cloud component connected to the
-// anchor, trims it (2–98 percentile per axis) and fits a gravity-aligned
-// oriented bounding box (ARKit world: -Y is gravity).
-//
-// Points are ingested on the SceneKit render thread and measured on a
-// background queue, so every access to the cloud is behind `lock`. Measuring
-// copies the cloud out and computes off-lock — the render thread must never
-// block on a full OBB fit.
-private final class VolumeAccumulator {
-
-    /// Subsample stride over the 256×192 depth grid. Full resolution, because
-    /// thin members are the whole problem: a fan's pole is one or two cells wide
-    /// at 2 m, and at stride 2 it vanishes — taking the only connection between
-    /// the base and the head with it.
-    private static let stride = 1
-    /// Half-width of the seed's median window, in grid cells (≈15 cm at 2 m).
-    private static let seedWindow = 12
-    /// Cell offset for depth-gradient normals. One cell at full resolution is
-    /// too short a baseline to be anything but noise.
-    private static let normalOffset = 2
-    /// How far the region grow may jump straight across cells that carry no
-    /// usable depth, to reconnect a thin member. Thin structures rarely read
-    /// *wrong*; they read *nothing*, and a 4-neighbour walk stops at the first
-    /// one-cell hole.
-    private static let maxBridge = 3
-    /// 8-neighbour: a pole that steps one cell sideways per row is diagonally
-    /// connected and nothing else.
-    private static let neighbourOffsets: [(Int, Int)] = [
-        (-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1),
-    ]
-    /// Footprint overlap (relative to the smaller of the two) at which a
-    /// separate cloud component counts as *stacked on* the object rather than
-    /// standing beside it. See `componentContainingAnchor`.
-    private static let stackOverlap: Float = 0.6
-    /// Depth continuity threshold for region growing: max(4 cm, 2% of depth).
-    private static let depthJump: Float = 0.04
-    /// Acquisition only: how far the first frame's region may reach from its
-    /// seed. Kept tight — the gate can widen later, but an over-wide first frame
-    /// sizes the lock around the room.
-    private static let acquisitionRadius: Float = 0.85
-    /// A flood that swallows this fraction of the grid hit the walls/floor — discard frame.
-    private static let maxRegionFraction = 0.45
-    /// Loading volume includes handling space around the raw geometric OBB.
-    static let packingFactor: Float = 1.2
-    /// Cloud size ceiling. Beyond it the cloud is halved — a live box that
-    /// updates several times a second matters more than the last few points.
-    private static let maxPoints = 40_000
-
-    /// Points this close above the detected floor plane belong to the floor.
-    private static let floorClearance: Float = 0.05
-    /// A horizontal surface this far below the seed is something the object
-    /// stands on, not part of it.
-    private static let supportDropBelowSeed: Float = 0.12
-    /// |normal · up| above this is a horizontal surface (≈ within 25°).
-    private static let horizontalNormalThreshold: Float = 0.90
-
-    /// The gate may only creep outwards this far per *frame*, and frames arrive
-    /// at 60 Hz — keep it small enough that a leak needs seconds of sustained
-    /// evidence to widen the gate, not a handful of bad frames.
-    private static let maxGateGrowthPerFrame: Float = 0.012
-    private static let maxHorizontalRadius: Float = 1.5
-    private static let maxHalfHeight: Float = 1.3
-    /// The anchor follows the cloud slowly, so a few bad points can't walk the
-    /// gate onto the neighbouring furniture.
-    private static let anchorSmoothing: Float = 0.05
-
-    private let lock = NSLock()
-    private var worldPoints: [simd_float3] = []
-    private var pointSum = simd_float3(repeating: 0)
-    private var framesUsedStorage = 0
-    private var seedDepthStorage: Float?
-    private var lockStorage: ObjectLock?
-    private var lastMaskStorage: SegmentationMask?
-
-    var framesUsed: Int {
-        lock.lock(); defer { lock.unlock() }
-        return framesUsedStorage
-    }
-
-    /// Segmentation of the most recently ingested frame, for the overlay.
-    var lastMask: SegmentationMask? {
-        lock.lock(); defer { lock.unlock() }
-        return lastMaskStorage
-    }
-
-    /// The tracked object, once acquired.
-    var objectLock: ObjectLock? {
-        lock.lock(); defer { lock.unlock() }
-        return lockStorage
-    }
-
-    /// Anchor of the tracked object — what the customer orbits around.
-    var centroid: simd_float3? {
-        lock.lock(); defer { lock.unlock() }
-        return lockStorage?.anchor
-    }
-
-    /// Depth of the object at the seed in the most recent ingested frame.
-    /// Drives the "step back" hint. nil until the first frame lands.
-    var lastSeedDepth: Float? {
-        lock.lock(); defer { lock.unlock() }
-        return seedDepthStorage
-    }
-
-    /// Segment the tracked object out of one depth frame and fuse its points
-    /// into the world-space cloud. `intrinsics` and `imageSize` describe the RGB
-    /// image the depth map is registered to. `confidenceMap`, when present, is
-    /// ARKit's per-pixel `ARConfidenceLevel` — low-confidence depth around thin
-    /// edges is exactly the noise that used to inflate the box.
-    @discardableResult
-    func ingest(depthMap: CVPixelBuffer,
-                confidenceMap: CVPixelBuffer?,
-                intrinsics k: simd_float3x3,
-                imageSize: CGSize,
-                cameraTransform: simd_float4x4,
-                floorY: Float?) -> IngestOutcome {
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-
-        let w = CVPixelBufferGetWidth(depthMap)
-        let h = CVPixelBufferGetHeight(depthMap)
-        guard w > 0, h > 0, let base = CVPixelBufferGetBaseAddress(depthMap) else { return .unusable }
-        let rowStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
-        let ptr = base.bindMemory(to: Float32.self, capacity: rowStride * h)
-
-        // Confidence is a separate 8-bit plane at the same resolution.
-        var confPtr: UnsafeMutablePointer<UInt8>?
-        var confRowStride = 0
-        if let cm = confidenceMap,
-           CVPixelBufferGetWidth(cm) == w, CVPixelBufferGetHeight(cm) == h {
-            CVPixelBufferLockBaseAddress(cm, .readOnly)
-            confRowStride = CVPixelBufferGetBytesPerRow(cm)
-            confPtr = CVPixelBufferGetBaseAddress(cm)?.bindMemory(to: UInt8.self, capacity: confRowStride * h)
-        }
-        defer {
-            if confPtr != nil, let cm = confidenceMap { CVPixelBufferUnlockBaseAddress(cm, .readOnly) }
-        }
-
-        // Intrinsics are for the full RGB resolution — rescale to the depth grid.
-        let sx = Float(w) / Float(imageSize.width)
-        let sy = Float(h) / Float(imageSize.height)
-        let fx = k[0][0] * sx, fy = k[1][1] * sy
-        let cx = k[2][0] * sx, cy = k[2][1] * sy
-        guard fx > 0, fy > 0 else { return .unusable }
-
-        let s = Self.stride
-        let gw = w / s, gh = h / s
-        guard gw > 4, gh > 4 else { return .unusable }
-
-        func depthAt(_ gx: Int, _ gy: Int) -> Float {
-            ptr[(gy * s) * rowStride + gx * s]
-        }
-        /// ARConfidenceLevel.low (0) is discarded; medium and high are kept.
-        func confidentAt(_ gx: Int, _ gy: Int) -> Bool {
-            guard let cp = confPtr else { return true }
-            return cp[(gy * s) * confRowStride + gx * s] > 0
-        }
-        func backProject(_ gx: Int, _ gy: Int, _ d: Float) -> simd_float3 {
-            let u = Float(gx * s), v = Float(gy * s)
-            let xc = (u - cx) * d / fx
-            let yc = -(v - cy) * d / fy
-            let world = cameraTransform * simd_float4(xc, yc, -d, 1)
-            return simd_float3(world.x, world.y, world.z)
-        }
-        /// World-space surface normal from the depth gradient. Used to recognise
-        /// the surface an object stands on; nil at the grid border or on holes.
-        func surfaceNormal(_ gx: Int, _ gy: Int) -> simd_float3? {
-            let o = Self.normalOffset
-            guard gx >= o, gx < gw - o, gy >= o, gy < gh - o else { return nil }
-            let dl = depthAt(gx - o, gy), dr = depthAt(gx + o, gy)
-            let du = depthAt(gx, gy - o), dd = depthAt(gx, gy + o)
-            guard dl.isFinite, dr.isFinite, du.isFinite, dd.isFinite,
-                  dl > 0.2, dr > 0.2, du > 0.2, dd > 0.2 else { return nil }
-            let n = simd_cross(backProject(gx + o, gy, dr) - backProject(gx - o, gy, dl),
-                               backProject(gx, gy + o, dd) - backProject(gx, gy - o, du))
-            let length = simd_length(n)
-            guard length > 1e-6 else { return nil }
-            return n / length
-        }
-        /// Median depth of a window, so a single bad pixel can't define the seed.
-        func medianDepth(around gx: Int, _ gy: Int, half: Int) -> Float? {
-            var samples: [Float] = []
-            for y in max(0, gy - half)...min(gh - 1, gy + half) {
-                for x in max(0, gx - half)...min(gw - 1, gx + half) {
-                    let d = depthAt(x, y)
-                    if d.isFinite, d > 0.2, d < 6.0, confidentAt(x, y) { samples.append(d) }
-                }
-            }
-            guard samples.count >= 20 else { return nil }
-            samples.sort()
-            return samples[samples.count / 2]
-        }
-
-        let currentLock = objectLock
-        let camPos = simd_float3(cameraTransform.columns.3.x,
-                                 cameraTransform.columns.3.y,
-                                 cameraTransform.columns.3.z)
-
-        // ── Seed placement ────────────────────────────────────────────────
-        // Acquisition seeds from the reticle. After that the seed follows the
-        // object, not the phone: the anchor is projected back into this frame.
-        var seedX = gw / 2, seedY = gh / 2
-        if let l = currentLock {
-            let cam = simd_inverse(cameraTransform) * simd_float4(l.anchor, 1)
-            let dist = -cam.z
-            guard dist > 0.15 else { return .lostObject(centerWorld: nil) }
-            let u = cam.x * fx / dist + cx
-            let v = -cam.y * fy / dist + cy
-            let px = Int(u) / s, py = Int(v) / s
-            guard px >= 0, px < gw, py >= 0, py < gh else {
-                return .lostObject(centerWorld: centerWorldPoint(gw: gw, gh: gh,
-                                                                 medianDepth: medianDepth,
-                                                                 backProject: backProject))
-            }
-            seedX = px; seedY = py
-        }
-
-        guard let seedDepth = medianDepth(around: seedX, seedY, half: Self.seedWindow) else {
-            return currentLock == nil
-                ? .unusable
-                : .lostObject(centerWorld: centerWorldPoint(gw: gw, gh: gh,
-                                                            medianDepth: medianDepth,
-                                                            backProject: backProject))
-        }
-
-        // The seed must be at roughly the distance the anchor sits at. If the
-        // object moved out of view and something else is behind it, this fails
-        // — which is precisely the "we lost it" signal.
-        if let l = currentLock {
-            let expected = simd_distance(camPos, l.anchor)
-            guard abs(seedDepth - expected) <= l.reach + 0.30 else {
-                return .lostObject(centerWorld: centerWorldPoint(gw: gw, gh: gh,
-                                                                 medianDepth: medianDepth,
-                                                                 backProject: backProject))
-            }
-        }
-
-        lock.lock(); seedDepthStorage = seedDepth; lock.unlock()
-
-        // ── Region grow (BFS, 4-neighbour) across depth-continuous pixels ──
-        let seedRaw = depthAt(seedX, seedY)
-        guard seedRaw.isFinite, abs(seedRaw - seedDepth) < 0.3 else {
-            return currentLock == nil ? .unusable : .lostObject(centerWorld: nil)
-        }
-        let seedWorld = backProject(seedX, seedY, seedRaw)
-        if let l = currentLock, !l.contains(seedWorld) {
-            return .lostObject(centerWorld: seedWorld)
-        }
-        // Seeding on the floor measures the floor. Refuse and let the customer
-        // aim at something.
-        if let floorY, seedWorld.y < floorY + Self.floorClearance {
-            return currentLock == nil ? .unusable : .lostObject(centerWorld: seedWorld)
-        }
-        // Before ARKit reports a floor plane there is nothing to compare a
-        // height against, and the normal test can't help either — a seed *on*
-        // the floor is at seed level by definition. So during acquisition only,
-        // decline a seed lying on a horizontal surface until the floor is known.
-        // Self-limiting: ARKit finds the floor within a second or two, after
-        // which a mattress at 20 cm is properly distinguishable from the tiles.
-        if currentLock == nil, floorY == nil,
-           let n = surfaceNormal(seedX, seedY), abs(n.y) > Self.horizontalNormalThreshold {
-            return .unusable
-        }
-
-        /// The support surface an object stands on is depth-continuous with it,
-        /// so region growing crawls straight from a fan's base out across the
-        /// whole floor — the flood is bounded only by the gate, which then grows
-        /// to fit it. Neither a distance gate nor percentile trimming can undo
-        /// that: the floor is genuinely close and genuinely dense.
-        ///
-        /// Two rejections, because each covers the other's blind spot. ARKit's
-        /// detected floor plane is authoritative but only exists once ARKit has
-        /// found it; the normal test needs no session state but must be limited
-        /// to points *below* the seed so it doesn't eat the top of the very
-        /// table or cabinet being measured.
-        func isSupportSurface(_ gx: Int, _ gy: Int, world: simd_float3) -> Bool {
-            if let floorY, world.y < floorY + Self.floorClearance { return true }
-            guard world.y < seedWorld.y - Self.supportDropBelowSeed else { return false }
-            guard let n = surfaceNormal(gx, gy) else { return false }
-            return abs(n.y) > Self.horizontalNormalThreshold
-        }
-
-        var visited = [Bool](repeating: false, count: gw * gh)
-        /// Every cell that ended up part of the object, weak ones included —
-        /// this is what the customer sees.
-        var inRegion = [Bool](repeating: false, count: gw * gh)
-        var region: [simd_float3] = []
-        /// A `weak` cell conducts but contributes no geometry. Low confidence is
-        /// the signature of a thin edge, where LiDAR blends the object with
-        /// whatever is behind it: dropping those cells outright (which the old
-        /// confidence filter did) severs a fan at the pole, and keeping their
-        /// depth would inflate the box with wall-blended readings. So they carry
-        /// the region across the pole and are measured by nothing.
-        var queue: [(x: Int, y: Int, d: Float, weak: Bool)] = [(seedX, seedY, seedRaw, false)]
-        visited[seedY * gw + seedX] = true
-        let maxRegion = Int(Double(gw * gh) * Self.maxRegionFraction)
-
-        var qi = 0
-        while qi < queue.count {
-            let (gx, gy, d, weak) = queue[qi]
-            qi += 1
-            inRegion[gy * gw + gx] = true
-            if !weak {
-                region.append(backProject(gx, gy, d))
-                if region.count > maxRegion { return .unusable }  // flooded into the room
-            }
-
-            for (dx, dy) in Self.neighbourOffsets {
-                // Straight steps may jump a hole of up to `maxBridge` cells;
-                // diagonals never do, because a diagonal jump across a gap is as
-                // likely to land on the wall behind as on the far side of a pole.
-                var step = 1
-                while step <= Self.maxBridge {
-                    let nx = gx + dx * step, ny = gy + dy * step
-                    guard nx >= 0, nx < gw, ny >= 0, ny < gh else { break }
-                    let nd = depthAt(nx, ny)
-                    guard nd.isFinite, nd > 0.2, nd < 6.0 else {
-                        // No usable depth here: a hole, not a rejection.
-                        if dx != 0 && dy != 0 { break }
-                        step += 1
-                        continue
-                    }
-                    guard !visited[ny * gw + nx] else { break }
-                    visited[ny * gw + nx] = true
-                    // Continuity is judged against the cell we came from, with
-                    // the tolerance widened by the jump — a bridged gap cannot
-                    // be held to a single-cell tolerance.
-                    guard abs(nd - d) < max(Self.depthJump, 0.02 * d) * Float(step) else { break }
-                    // The gate — the whole point of the lock. Anything reaching
-                    // past the tracked object stops here instead of joining the
-                    // cloud.
-                    let world = backProject(nx, ny, nd)
-                    if let l = currentLock {
-                        guard l.contains(world) else { break }
-                    } else {
-                        guard simd_distance(world, seedWorld) < Self.acquisitionRadius else { break }
-                    }
-                    // Not enqueued, so the flood cannot travel *through* the
-                    // floor either — it stops at the object's footprint.
-                    guard !isSupportSurface(nx, ny, world: world) else { break }
-                    queue.append((nx, ny, nd, !confidentAt(nx, ny)))
-                    break
-                }
-            }
-        }
-        // Four times the cells per frame at stride 1, so four times the floor.
-        guard region.count >= 600 else {
-            return currentLock == nil ? .unusable : .lostObject(centerWorld: seedWorld)
-        }
-
-        // Fuse into the world cloud, capped per frame. The sample has to be
-        // *unbiased*: the BFS emits points in flood order, which is roughly
-        // spatial, so keeping every Nth systematically thins whatever the flood
-        // reached last — usually the thin part we just fought to include.
-        let cap = 6000
-        var fresh: [simd_float3] = []
-        if region.count <= cap {
-            fresh = region
-        } else {
-            fresh.reserveCapacity(cap + 64)
-            let keepProbability = Double(cap) / Double(region.count)
-            var rng: UInt64 = 0x9E37_79B9_7F4A_7C15
-            for p in region {
-                rng = rng &* 6364136223846793005 &+ 1442695040888963407
-                if Double(rng >> 11) * 0x1p-53 < keepProbability { fresh.append(p) }
-            }
-        }
-        guard !fresh.isEmpty else { return .unusable }
-
-        let mask = SegmentationMask(gridWidth: gw, gridHeight: gh, stride: s,
-                                    depthWidth: w, depthHeight: h, bits: inRegion)
-
-        lock.lock()
-        worldPoints.append(contentsOf: fresh)
-        for p in fresh { pointSum += p }
-        framesUsedStorage += 1
-        lockStorage = Self.updatedLock(lockStorage, from: fresh)
-        lastMaskStorage = mask
-        if worldPoints.count > Self.maxPoints { halveLocked() }
-        lock.unlock()
-        return .accepted
-    }
-
-    /// World point under the reticle, regardless of the lock — the caller uses
-    /// it to tell "lost the object" from "moved on to a different object".
-    private func centerWorldPoint(gw: Int, gh: Int,
-                                  medianDepth: (Int, Int, Int) -> Float?,
-                                  backProject: (Int, Int, Float) -> simd_float3) -> simd_float3? {
-        guard let d = medianDepth(gw / 2, gh / 2, Self.seedWindow) else { return nil }
-        return backProject(gw / 2, gh / 2, d)
-    }
-
-    /// Pull the gate in to fit the box we actually measured.
-    ///
-    /// Acquisition has to be generous — we don't know the object yet — and a
-    /// generous gate on frame one would otherwise persist for the whole sweep,
-    /// since growth is the only other adjustment. The measured OBB comes from
-    /// the anchor-connected component, so it is the best available statement of
-    /// "this is the object", and feeding it back makes the gate converge.
-    /// Only ever shrinks; widening stays on the slow per-frame path.
-    func tightenGate(to m: Measurement, minFrames: Int) {
-        lock.lock(); defer { lock.unlock() }
-        guard var l = lockStorage, framesUsedStorage >= minFrames else { return }
-        // Margin is deliberately fat: early in a sweep the box only covers the
-        // side seen so far, and clamping to that would lock out the rest.
-        let margin: Float = 0.25
-        let horizontal = 0.5 * simd_length(simd_float2(m.dims.x, m.dims.y)) + margin
-        let vertical = 0.5 * m.dims.z + margin
-        l.anchor += (m.center - l.anchor) * 0.30
-        l.horizontalRadius = max(0.30, min(l.horizontalRadius, horizontal))
-        l.halfHeight = max(0.30, min(l.halfHeight, vertical))
-        lockStorage = l
-    }
-
-    /// Acquire the gate on the first frame, then let it creep outwards slowly.
-    private static func updatedLock(_ existing: ObjectLock?, from points: [simd_float3]) -> ObjectLock? {
-        guard !points.isEmpty else { return existing }
-        var mean = simd_float3(repeating: 0)
-        for p in points { mean += p }
-        mean /= Float(points.count)
-
-        // 95th percentile extents, so a few stragglers don't size the gate.
-        var horizontal = points.map { simd_length(simd_float2($0.x - mean.x, $0.z - mean.z)) }
-        var vertical = points.map { abs($0.y - mean.y) }
-        horizontal.sort(); vertical.sort()
-        let idx = max(0, Int(Float(points.count - 1) * 0.95))
-        let wantH = min(Self.maxHorizontalRadius, horizontal[idx] + 0.12)
-        let wantV = min(Self.maxHalfHeight, vertical[idx] + 0.12)
-
-        guard var l = existing else {
-            return ObjectLock(anchor: mean,
-                              horizontalRadius: max(0.20, wantH),
-                              halfHeight: max(0.20, wantV))
-        }
-        l.anchor += (mean - l.anchor) * Self.anchorSmoothing
-        l.horizontalRadius = min(Self.maxHorizontalRadius,
-                                 max(l.horizontalRadius,
-                                     min(wantH, l.horizontalRadius + Self.maxGateGrowthPerFrame)))
-        l.halfHeight = min(Self.maxHalfHeight,
-                           max(l.halfHeight,
-                               min(wantV, l.halfHeight + Self.maxGateGrowthPerFrame)))
-        return l
-    }
-
-    /// Drop every second point. Called under `lock`.
-    private func halveLocked() {
-        var out: [simd_float3] = []
-        out.reserveCapacity(worldPoints.count / 2 + 1)
-        var sum = simd_float3(repeating: 0)
-        for (i, p) in worldPoints.enumerated() where i % 2 == 0 {
-            out.append(p)
-            sum += p
-        }
-        worldPoints = out
-        pointSum = sum
-    }
-
-    /// Copy the cloud out so the caller can measure it off the render thread.
-    func snapshot() -> (points: [simd_float3], frames: Int, anchor: simd_float3?) {
-        lock.lock(); defer { lock.unlock() }
-        return (worldPoints, framesUsedStorage, lockStorage?.anchor)
-    }
-
-    /// Keep the part of the cloud that belongs to the object: its own component
-    /// at 6 cm voxel resolution, plus any component stacked directly above or
-    /// below it.
-    ///
-    /// The gate stops *new* leaks; this cleans up whatever got in before the
-    /// lock tightened. Percentile trimming can't: it assumes outliers are a thin
-    /// tail, and a bed is not a thin tail — it is a second dense blob that drags
-    /// the box over both.
-    ///
-    /// Connectivity alone is not enough either. A pedestal fan is a base, a pole
-    /// one or two depth cells wide, and a head; every frame where the pole fails
-    /// to register leaves the head as a separate blob, and the box collapses
-    /// onto whichever half happens to hold the anchor. But the head sits *over*
-    /// the base — so a component whose footprint is contained in the anchor
-    /// component's footprint is part of the same standing object, while a bed
-    /// 40 cm to the side is not. That test is what recovers the parts the
-    /// segmentation could not physically reach.
-    private static func componentContainingAnchor(_ anchor: simd_float3?,
-                                                  points: [simd_float3]) -> [simd_float3] {
-        guard let anchor, points.count > 50 else { return points }
-        let voxel: Float = 0.06
-        func cell(_ p: simd_float3) -> SIMD3<Int32> {
-            SIMD3<Int32>(Int32(floor(p.x / voxel)), Int32(floor(p.y / voxel)), Int32(floor(p.z / voxel)))
-        }
-
-        var occupancy: [SIMD3<Int32>: [Int]] = [:]
-        occupancy.reserveCapacity(points.count / 4)
-        for (i, p) in points.enumerated() { occupancy[cell(p), default: []].append(i) }
-
-        // Start at the anchor's cell; if the anchor sits in a hollow (it is a
-        // centroid, not a surface point), start from the nearest occupied cell.
-        var start = cell(anchor)
-        if occupancy[start] == nil {
-            var bestDistance = Float.greatestFiniteMagnitude
-            for key in occupancy.keys {
-                let c = simd_float3(Float(key.x), Float(key.y), Float(key.z)) * voxel
-                let d = simd_distance(c, anchor)
-                if d < bestDistance { bestDistance = d; start = key }
-            }
-            guard bestDistance < 1.0 else { return points }
-        }
-
-        // Label *every* component, not just the anchor's — the others are the
-        // candidates for the stacking test below.
-        var componentOf: [SIMD3<Int32>: Int] = [:]
-        componentOf.reserveCapacity(occupancy.count)
-        var components: [[SIMD3<Int32>]] = []
-        for key in occupancy.keys where componentOf[key] == nil {
-            let id = components.count
-            var reached: [SIMD3<Int32>] = [key]
-            componentOf[key] = id
-            var qi = 0
-            while qi < reached.count {
-                let c = reached[qi]; qi += 1
-                for dx in Int32(-1)...1 {
-                    for dy in Int32(-1)...1 {
-                        for dz in Int32(-1)...1 where !(dx == 0 && dy == 0 && dz == 0) {
-                            let n = SIMD3<Int32>(c.x + dx, c.y + dy, c.z + dz)
-                            guard occupancy[n] != nil, componentOf[n] == nil else { continue }
-                            componentOf[n] = id
-                            reached.append(n)
-                        }
-                    }
-                }
-            }
-            components.append(reached)
-        }
-        guard let anchorID = componentOf[start] else { return points }
-
-        let footprints = components.map { cells in Set(cells.map { SIMD2<Int32>($0.x, $0.z) }) }
-        /// Dilated by one cell: a pole is never perfectly plumb, and a head or a
-        /// shade overhangs its base by a few centimetres either way.
-        func dilated(_ f: Set<SIMD2<Int32>>) -> Set<SIMD2<Int32>> {
-            var out = Set<SIMD2<Int32>>(minimumCapacity: f.count * 9)
-            for c in f {
-                for dx in Int32(-1)...1 {
-                    for dz in Int32(-1)...1 { out.insert(SIMD2<Int32>(c.x + dx, c.y + dz)) }
-                }
-            }
-            return out
-        }
-
-        var kept: Set<Int> = [anchorID]
-        var keptFootprint = footprints[anchorID]
-        // Fixpoint, so a base → pole → head chain still joins up when the head
-        // only overlaps the pole. Overlap is measured against the *smaller*
-        // footprint, because either part may be the wider one.
-        var changed = true
-        while changed {
-            changed = false
-            let target = dilated(keptFootprint)
-            for id in components.indices where !kept.contains(id) {
-                let f = footprints[id]
-                let smaller = min(f.count, keptFootprint.count)
-                guard smaller > 0 else { continue }
-                let shared = f.reduce(0) { $0 + (target.contains($1) ? 1 : 0) }
-                guard Float(shared) / Float(smaller) >= Self.stackOverlap else { continue }
-                kept.insert(id)
-                keptFootprint.formUnion(f)
-                changed = true
-            }
-        }
-
-        var result: [simd_float3] = []
-        result.reserveCapacity(points.count)
-        for (c, id) in componentOf where kept.contains(id) {
-            for i in occupancy[c] ?? [] { result.append(points[i]) }
-        }
-        return result
-    }
-
-    /// Fit the gravity-aligned OBB. Pure — safe to call on any thread.
-    static func measure(points rawPoints: [simd_float3],
-                        framesUsed: Int,
-                        anchor: simd_float3?) -> Measurement? {
-        let points = componentContainingAnchor(anchor, points: rawPoints)
-        guard framesUsed >= 1, points.count >= 400 else { return nil }
-
-        func trimmedExtent(_ values: [Float]) -> (lo: Float, hi: Float) {
-            let sorted = values.sorted()
-            let lo = sorted[Int(Float(sorted.count - 1) * 0.02)]
-            let hi = sorted[Int(Float(sorted.count - 1) * 0.98)]
-            return (lo, hi)
-        }
-
-        // Trim outliers per world axis, keeping points inside the trimmed box.
-        let ex = trimmedExtent(points.map { $0.x })
-        let ey = trimmedExtent(points.map { $0.y })
-        let ez = trimmedExtent(points.map { $0.z })
-        let pts = points.filter {
-            $0.x >= ex.lo && $0.x <= ex.hi &&
-            $0.y >= ey.lo && $0.y <= ey.hi &&
-            $0.z >= ez.lo && $0.z <= ez.hi
-        }
-        guard pts.count >= 300 else { return nil }
-
-        // Gravity-aligned OBB: height straight from Y; footprint via 2D PCA on XZ.
-        let height = ey.hi - ey.lo
-        let mx = pts.reduce(Float(0)) { $0 + $1.x } / Float(pts.count)
-        let mz = pts.reduce(Float(0)) { $0 + $1.z } / Float(pts.count)
-        var cxx: Float = 0, cxz: Float = 0, czz: Float = 0
-        for p in pts {
-            let dx = p.x - mx, dz = p.z - mz
-            cxx += dx * dx; cxz += dx * dz; czz += dz * dz
-        }
-        cxx /= Float(pts.count); cxz /= Float(pts.count); czz /= Float(pts.count)
-        // Principal axis angle of the 2×2 covariance matrix.
-        let theta = 0.5 * atan2(2 * cxz, cxx - czz)
-        let ct = cos(theta), st = sin(theta)
-        let a = trimmedExtent(pts.map { ($0.x - mx) * ct + ($0.z - mz) * st })
-        let b = trimmedExtent(pts.map { -($0.x - mx) * st + ($0.z - mz) * ct })
-        let da = a.hi - a.lo, db = b.hi - b.lo
-
-        let length = max(da, db), width = min(da, db)
-        guard height > 0.05, length > 0.05, width > 0.02 else { return nil }
-
-        let volume = length * width * height * Self.packingFactor
-        guard volume.isFinite, volume > 0.005, volume < 12.0 else { return nil }
-
-        // Box centre: midpoint in the rotated footprint frame, mapped back to world.
-        let ac = (a.lo + a.hi) / 2, bc = (b.lo + b.hi) / 2
-        let center = simd_float3(mx + ac * ct - bc * st,
-                                 (ey.lo + ey.hi) / 2,
-                                 mz + ac * st + bc * ct)
-
-        // A node rotated by φ about world Y maps its local +X to (cos φ, 0, -sin φ).
-        // The long footprint axis is `a` = (ct, 0, st) when da ≥ db, else `b`.
-        let yaw = da >= db ? -theta : -theta - .pi / 2
-
-        // More usable frames and denser clouds → higher confidence.
-        let confidence = min(0.9, 0.5 + 0.08 * Float(framesUsed) + 0.00001 * Float(pts.count))
-        return Measurement(volume: volume,
-                           dims: simd_float3(length, width, height),
-                           confidence: confidence,
-                           center: center,
-                           yaw: yaw)
-    }
-
-    func reset() {
-        lock.lock()
-        worldPoints.removeAll(keepingCapacity: true)
-        pointSum = simd_float3(repeating: 0)
-        framesUsedStorage = 0
-        seedDepthStorage = nil
-        lockStorage = nil
-        lastMaskStorage = nil
-        lock.unlock()
-    }
-}
-
-// MARK: - Guidance
-
-/// What the user has to do next to finish the measurement. Exactly one
-/// instruction at a time — a screen full of hints is a screen nobody reads.
-private enum Guidance {
-    /// No depth lock yet: the reticle isn't on an object.
-    case aim
-    /// Had the object, lost sight of it. The model is kept — pointing back at it
-    /// resumes rather than restarts.
-    case reacquire
-    /// Standing too close for the depth camera to see the whole item.
-    case stepBack
-    /// Walk around the item; `left` is the on-screen direction to move.
-    case orbit(left: Bool)
-    /// Non-LiDAR devices: no measurement, just photos from a few angles.
-    case photoSweep
-    /// Enough angles, waiting for the box to settle.
-    case hold
-    case done
-}
-
 // MARK: - DepthCapturePlugin
 
-@objc(DepthCapturePlugin)
 public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
 
     public let identifier = "DepthCapturePlugin"
@@ -862,82 +79,46 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     private var frameCounter = 0
     private let yoloEveryNFrames = 12
     private var hasLidar = false
-    /// AR view size, cached on the main thread. The mask is built on the render
-    /// thread, and reading `arView.bounds` from there is a UIKit race.
-    private var viewportSize: CGSize = .zero
+    private var canMesh = false
     private var sessionIntrinsics: simd_float3x3?
+    /// AR view size, cached on the main thread — the render thread must not
+    /// read `arView.bounds`.
+    private var viewportSize: CGSize = .zero
 
     // ── YOLO (silent) ─────────────────────────────────────────────────────
     private var visionModel: VNCoreMLModel?
     private var furnitureLabels: [String: String] = [:]
-    /// Best guess for whatever is in the reticle right now. Never drawn — it
-    /// only pre-fills the name field after a measurement, where the user can
-    /// clear it. Empty means "let the backend name it from the photo".
+    /// Best guess for whatever is in front of the camera. Never drawn — it only
+    /// pre-fills the (optional) name field in manual entry.
     private var silentLabelGuess = ""
 
-    // ── Measurement session ───────────────────────────────────────────────
-    private var scanActive = false
-    /// YOLO's guess frozen at the moment the sweep finished.
-    private var scanSuggestedLabel = ""
-    private var scanFrames: [ItemFrame] = []
-    private let scanVolume = VolumeAccumulator()
+    // ── Room sweep ────────────────────────────────────────────────────────
+    private var sweeping = false
+    /// Photos taken during the sweep, one of which ends up attached to each
+    /// object so the backend can name it.
+    private var sweepFrames: [ItemFrame] = []
+    private var sweepPoses: [simd_float4x4] = []
+    private var lastFrameCapture: TimeInterval = 0
+    private static let frameCaptureInterval: TimeInterval = 0.7
+    private static let maxSweepFrames = 40
 
-    /// Viewing angles around the object, as 15° buckets of the camera's bearing
-    /// from the object centroid. Coverage — not elapsed rotation — is what makes
-    /// an OBB trustworthy, so it is what drives both progress and completion.
-    private static let bucketCount = 24
-    private static let requiredBuckets = 5      // ≈ 75° of orbit
-    private static let requiredFrames = 6
-    private static let maxFrames = 16
-    private var capturedBuckets = Set<Int>()
-    private var currentBucket: Int?
+    /// The mesh is re-read on a background queue while the sweep continues, so
+    /// objects appear as they are found instead of all at once at the end.
+    private var scanning = false
+    private var lastScanTime: TimeInterval = 0
+    private static let scanInterval: TimeInterval = 1.5
+    private let scanQueue = DispatchQueue(label: "aust.depthcapture.rooms", qos: .userInitiated)
 
-    /// Object-tracking state. Losing the lock briefly is normal and silent;
-    /// losing it onto a clearly different object restarts the measurement.
-    private var lostFrames = 0
-    private var objectLost = false
-    private var refocusFrames = 0
-    private var refocusTarget: simd_float3?
-    /// ~0.4 s at 60 fps before we admit the object is gone.
-    private static let lostFrameThreshold = 24
-    /// ~0.75 s locked onto something else before restarting on it.
-    private static let refocusFrameThreshold = 45
-    /// How far past the gate a candidate must sit to count as a different item.
-    private static let refocusMargin: Float = 0.45
-
-    /// Last few volume readings — the box has settled when they agree.
-    private var volumeHistory: [Float] = []
-    private static let stabilityWindow = 4
-    private static let stabilityTolerance: Float = 0.10
-
-    /// Cached OBB, refreshed off the render thread a few times a second.
-    private var lastMeasurement: Measurement?
-    private var measuring = false
-    private var lastMeasureTime: TimeInterval = 0
-    private static let measureInterval: TimeInterval = 0.25
-    /// The focus mask is redrawn on its own, faster clock: it tracks the object
-    /// itself rather than the fitted box, so it must not wait for a fit.
-    private var lastMaskTime: TimeInterval = 0
-    private static let maskInterval: TimeInterval = 0.05
-    private let measureQueue = DispatchQueue(label: "aust.depthcapture.measure", qos: .userInitiated)
-
-    /// Orbit span in degrees, reported with the item. Non-LiDAR devices have no
-    /// centroid to orbit, so there the sweep is driven by camera rotation.
-    private var scanRefQuaternion: simd_quatf?
-    private var scanPrevQuaternion: simd_quatf?
-    private var scanAccumulatedDeg: Float = 0
-    private var scanLastCapturedDeg: Float = -Float.greatestFiniteMagnitude
-    private static let photoSweepEveryDeg: Float = 4
-    private static let photoSweepFrames = 8
-
-    // ── Live box ──────────────────────────────────────────────────────────
-    private var boxNode: SCNNode?
+    private var objects: [RoomObject] = []
+    private var nextObjectID = 0
+    private var selectedObjectID: Int?
+    private var boxNodes: [Int: SCNNode] = [:]
+    /// The selected object's node and dimensions, published for the render
+    /// thread so it never walks `objects` while the main thread rebuilds it.
+    private var selectedBox: (node: SCNNode, dims: simd_float3)?
 
     // ── Items ─────────────────────────────────────────────────────────────
     private var savedItems: [SavedItem] = []
-    /// Finished measurement awaiting confirmation in the review card.
-    /// Nothing reaches `savedItems` until the user taps "Sichern".
-    private var pendingItem: SavedItem?
 
     // ── Native UI ─────────────────────────────────────────────────────────
     private var overlay: ScanOverlayView?
@@ -946,24 +127,22 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func checkSupport(_ call: CAPPluginCall) {
         let supported = ARWorldTrackingConfiguration.isSupported
-        let lidar = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+        let lidar = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
         call.resolve(["supported": supported, "hasLidar": lidar])
     }
 
     @objc func startSession(_ call: CAPPluginCall) {
-        AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            guard granted else {
-                call.reject("Camera permission denied")
+            guard ARWorldTrackingConfiguration.isSupported else {
+                call.reject("AR wird auf diesem Gerät nicht unterstützt")
                 return
             }
-            DispatchQueue.main.async {
-                self.setupARView()
-                self.setupNativeOverlay()
-                self.loadFurnitureLabels()
-                self.loadYOLOModel()
-                call.resolve()
-            }
+            self.loadYOLOModel()
+            self.loadFurnitureLabels()
+            self.setupARView()
+            self.setupNativeOverlay()
+            call.resolve()
         }
     }
 
@@ -975,41 +154,40 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func getIntrinsics(_ call: CAPPluginCall) {
-        guard let intrinsics = sessionIntrinsics,
-              let frame = arView?.session.currentFrame else {
-            call.resolve(["fx": 0, "fy": 0, "cx": 0, "cy": 0, "width": 0, "height": 0])
+        guard let k = sessionIntrinsics,
+              let resolution = arView?.session.currentFrame?.camera.imageResolution else {
+            call.reject("Keine Kameradaten verfügbar")
             return
         }
-        let w = frame.camera.imageResolution.width
-        let h = frame.camera.imageResolution.height
         call.resolve([
-            "fx": intrinsics[0][0], "fy": intrinsics[1][1],
-            "cx": intrinsics[2][0], "cy": intrinsics[2][1],
-            "width": Int(w), "height": Int(h),
+            "fx": k[0][0], "fy": k[1][1], "cx": k[2][0], "cy": k[2][1],
+            "width": Int(resolution.width), "height": Int(resolution.height),
         ])
     }
 
     @objc func getAllItems(_ call: CAPPluginCall) {
-        let result = savedItems.map { item -> [String: Any] in
-            let frames = item.frames.map { f -> [String: Any] in
-                var fd: [String: Any] = ["imageBase64": f.imageBase64, "pose": f.pose]
-                fd["depthMapBase64"] = f.depthMapBase64 as Any
-                return fd
-            }
-            var dict: [String: Any] = [
-                "label": item.label, "frames": frames,
-                "arcDegrees": item.arcDegrees, "hasDepth": item.hasDepth,
+        let items: [[String: Any]] = savedItems.map { item in
+            var payload: [String: Any] = [
+                "label": item.label,
+                "arcDegrees": item.arcDegrees,
+                "hasDepth": item.hasDepth,
+                "frames": item.frames.map { frame -> [String: Any] in
+                    var f: [String: Any] = ["imageBase64": frame.imageBase64]
+                    f["depthMapBase64"] = frame.depthMapBase64 as Any
+                    f["pose"] = frame.pose
+                    return f
+                },
             ]
-            if let v = item.volumeM3 { dict["volumeM3"] = v }
-            if let d = item.dims { dict["dimsM"] = [d.x, d.y, d.z] }
-            if let c = item.deviceConfidence { dict["deviceConfidence"] = c }
-            return dict
+            if let volume = item.volumeM3 { payload["volumeM3"] = volume }
+            if let dims = item.dims { payload["dimsM"] = [dims.x, dims.y, dims.z] }
+            if let confidence = item.deviceConfidence { payload["deviceConfidence"] = confidence }
+            return payload
         }
-        call.resolve(["items": result])
+        call.resolve(["items": items])
     }
 
     @objc func clearItems(_ call: CAPPluginCall) {
-        savedItems = []
+        savedItems.removeAll()
         call.resolve()
     }
 
@@ -1022,6 +200,7 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         else { return }
 
         hasLidar = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+        canMesh = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
 
         let sceneView = ARSCNView(frame: window.bounds)
         sceneView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -1038,10 +217,17 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         bridge?.webView?.isHidden = true
 
         let config = ARWorldTrackingConfiguration()
-        // Horizontal planes are how we find the floor, which is what the
-        // segmentation has to refuse to measure. No anchor nodes are added, so
-        // nothing is drawn for them.
-        config.planeDetection = [.horizontal]
+        // Both alignments: the floor and the ceiling bound the room vertically,
+        // and the walls are what a sofa pushed against one would otherwise grow
+        // into. All three are what gets subtracted.
+        config.planeDetection = [.horizontal, .vertical]
+        // Classification is what lets a table stay furniture while a wall does
+        // not — plain `.mesh` would force us to guess that geometrically.
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+            config.sceneReconstruction = .meshWithClassification
+        } else if canMesh {
+            config.sceneReconstruction = .mesh
+        }
         if hasLidar { config.frameSemantics = .sceneDepth }
         sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
     }
@@ -1050,471 +236,339 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         guard let arView = arView,
               let window = arView.superview else { return }
 
-        let ov = ScanOverlayView(frame: window.bounds)
-        ov.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        ov.canMeasure = hasLidar
+        let view = ScanOverlayView(frame: window.bounds)
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.canMeasure = canMesh
 
-        ov.onClose = { [weak self] in
-            self?.teardownAll()
+        view.onClose = { [weak self] in
             self?.notifyListeners("sessionCancelled", data: [:])
+            self?.teardownAll()
         }
-        ov.onFinish = { [weak self] in
+        view.onStartSweep = { [weak self] in self?.beginSweep() }
+        view.onFinishSweep = { [weak self] in self?.finishSweep() }
+        view.onSelect = { [weak self] id in self?.selectObject(id < 0 ? nil : id) }
+        view.onMerge = { [weak self] first, second in self?.mergeObjects(first, second) }
+        view.onSplit = { [weak self] in self?.splitSelection() }
+        view.onDelete = { [weak self] in self?.deleteSelection() }
+        view.onRename = { [weak self] id, text in
+            self?.objects.first { $0.id == id }?.label = text
+        }
+        view.onSubmit = { [weak self] in self?.submitObjects() }
+        view.onManualRequested = { [weak self] in
             guard let self else { return }
-            self.notifyListeners("sessionComplete", data: ["itemCount": self.savedItems.count])
+            self.overlay?.showManualEntry(suggestedLabel: self.silentLabelGuess)
         }
-        ov.onMeasureRequested = { [weak self] in
-            self?.beginMeasurement()
-        }
-        ov.onCancelMeasurement = { [weak self] in
-            self?.abortScan()
-        }
-        // "Good enough" — take whatever has been measured so far.
-        ov.onAcceptEarly = { [weak self] in
-            self?.finalizeScan()
-        }
-        ov.onSaveItem = { [weak self] label in
-            self?.commitPendingItem(label: label)
-        }
-        ov.onRemeasure = { [weak self] in
+        view.onManualCancel = { [weak self] in
             guard let self else { return }
-            let suggestion = self.pendingItem?.label ?? ""
-            self.pendingItem = nil
-            self.beginMeasurement(suggestedLabel: suggestion)
+            self.overlay?.setState(self.objects.isEmpty && !self.sweeping ? .intro : .results)
         }
-        ov.onManualRequested = { [weak self] in
-            self?.beginManualEntry()
-        }
-        ov.onManualSubmit = { [weak self] entry in
-            self?.commitManualItem(entry)
-        }
-        ov.onManualCancel = { [weak self] in
-            self?.abortScan()
-        }
+        view.onManualSubmit = { [weak self] entry in self?.addManualObject(entry) }
 
-        window.addSubview(ov)
-        overlay = ov
+        window.addSubview(view)
+        overlay = view
     }
 
     private func teardownAll() {
-        overlay?.removeFromSuperview()
-        overlay = nil
-        removeBoxNode()
+        removeBoxNodes()
         arView?.session.pause()
         arView?.removeFromSuperview()
         arView = nil
-        scanActive = false
+        overlay?.removeFromSuperview()
+        overlay = nil
         bridge?.webView?.isHidden = false
+        sweeping = false
     }
 
-    // MARK: - Measurement session
+    // MARK: - Sweep
 
-    private func beginMeasurement(suggestedLabel: String? = nil) {
-        scanSuggestedLabel = suggestedLabel ?? silentLabelGuess
-        scanFrames = []
-        scanVolume.reset()
-        capturedBuckets.removeAll()
-        currentBucket = nil
-        volumeHistory.removeAll()
-        lastMeasurement = nil
-        lostFrames = 0
-        objectLost = false
-        refocusFrames = 0
-        refocusTarget = nil
-        scanRefQuaternion = nil
-        scanPrevQuaternion = nil
-        scanAccumulatedDeg = 0
-        scanLastCapturedDeg = -Float.greatestFiniteMagnitude
-        scanActive = true
-        DispatchQueue.main.async { [weak self] in
-            self?.overlay?.setState(.measuring)
-            self?.overlay?.updateGuidance(self?.hasLidar == true ? .aim : .photoSweep,
-                                          volumeM3: nil, progress: 0)
+    private func beginSweep() {
+        objects.removeAll()
+        nextObjectID = 0
+        selectedObjectID = nil
+        sweepFrames.removeAll()
+        sweepPoses.removeAll()
+        removeBoxNodes()
+        lastScanTime = 0
+        lastFrameCapture = 0
+        sweeping = true
+        overlay?.setState(.sweeping)
+        overlay?.updateSweep(objectCount: 0, totalVolume: 0)
+    }
+
+    /// End the sweep and freeze the list. One last read of the mesh, because the
+    /// customer usually taps Fertig right after pointing at the last thing.
+    private func finishSweep() {
+        guard sweeping else { return }
+        sweeping = false
+        rescan { [weak self] in
+            guard let self else { return }
+            self.assignRepresentativeFrames()
+            self.presentResults()
         }
     }
 
-    private func abortScan() {
-        scanActive = false
-        scanFrames = []
-        scanVolume.reset()
-        pendingItem = nil
-        lastMeasurement = nil
-        removeBoxNode()
-        DispatchQueue.main.async { [weak self] in
-            self?.overlay?.setState(.idle)
-        }
-    }
-
-    private func processScanFrame(_ frame: ARFrame) {
-        guard scanActive else { return }
-
-        // Orbit span, for reporting (and the only progress signal without LiDAR).
-        let quat = simd_quatf(frame.camera.transform)
-        if scanRefQuaternion == nil { scanRefQuaternion = quat; scanPrevQuaternion = quat }
-        if let prev = scanPrevQuaternion {
-            scanAccumulatedDeg += quaternionAngularDistance(prev, quat)
-            scanPrevQuaternion = quat
-        }
-
-        guard hasLidar else { return processPhotoSweepFrame(frame) }
-        guard let sceneDepth = frame.sceneDepth else { return }
-
-        // Always fuse depth — the cloud is what we are building. Only the
-        // (expensive) JPEG encode is gated on covering a new viewing angle.
-        let outcome = scanVolume.ingest(depthMap: sceneDepth.depthMap,
-                                        confidenceMap: sceneDepth.confidenceMap,
-                                        intrinsics: frame.camera.intrinsics,
-                                        imageSize: frame.camera.imageResolution,
-                                        cameraTransform: frame.camera.transform,
-                                        floorY: floorLevel(in: frame))
-        handleTracking(outcome)
-        updateFocusMask(frame)
-        guard !objectLost || scanVolume.objectLock == nil else {
-            // Off the object: keep tracking state and guidance alive, but do not
-            // capture frames — a photo of the wall is worse than no photo.
-            refreshMeasurement(frame)
+    /// Re-read the mesh and rebuild the object list.
+    ///
+    /// Everything expensive happens on `scanQueue`; the render thread only
+    /// copies the anchor list out of the current frame. Labels the customer has
+    /// already typed survive by id, so a rescan never eats their typing.
+    private func rescan(completion: (() -> Void)? = nil) {
+        guard canMesh, let frame = arView?.session.currentFrame else {
+            completion?()
             return
         }
+        guard !scanning else { completion?(); return }
+        scanning = true
 
-        let camPos = simd_float3(frame.camera.transform.columns.3.x,
-                                 frame.camera.transform.columns.3.y,
-                                 frame.camera.transform.columns.3.z)
-        if let c = scanVolume.centroid {
-            let bucket = bearingBucket(camera: camPos, centroid: c)
-            currentBucket = bucket
-            if !capturedBuckets.contains(bucket) && scanFrames.count < Self.maxFrames {
-                capturedBuckets.insert(bucket)
-                captureFrame(frame, depth: sceneDepth.depthMap)
-            } else if scanFrames.isEmpty {
-                captureFrame(frame, depth: sceneDepth.depthMap)
-            }
-        } else if scanFrames.isEmpty {
-            captureFrame(frame, depth: sceneDepth.depthMap)
-        }
+        let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+        let planeAnchors = frame.anchors.compactMap { $0 as? ARPlaneAnchor }
 
-        refreshMeasurement(frame)
-    }
-
-    /// Track whether we still have the object, and decide when the customer has
-    /// simply moved on to a different one.
-    ///
-    /// Losing the object for a moment is normal — a hand passes, the phone
-    /// swings wide. Only a sustained lock on something clearly elsewhere counts
-    /// as a new object, and then the measurement restarts rather than silently
-    /// fusing two pieces of furniture into one box.
-    private func handleTracking(_ outcome: IngestOutcome) {
-        switch outcome {
-        case .accepted:
-            lostFrames = 0
-            refocusFrames = 0
-            refocusTarget = nil
-            if objectLost {
-                objectLost = false
-                DispatchQueue.main.async { [weak self] in self?.overlay?.hideToast() }
-            }
-
-        case .unusable:
-            break  // says nothing about tracking
-
-        case .lostObject(let centerWorld):
-            lostFrames += 1
-            if lostFrames >= Self.lostFrameThreshold && !objectLost {
-                objectLost = true
-            }
-            guard let candidate = centerWorld, let lock = scanVolume.objectLock else { return }
-            // A different object means "clearly somewhere else", not "just
-            // outside the gate" — otherwise the far side of a wardrobe would
-            // count as a new item.
-            let displacement = simd_distance(candidate, lock.anchor)
-            guard displacement > lock.reach + Self.refocusMargin else {
-                refocusFrames = 0
-                return
-            }
-            if let target = refocusTarget, simd_distance(target, candidate) < 0.35 {
-                refocusFrames += 1
-                refocusTarget = target + (candidate - target) * 0.2
-            } else {
-                refocusTarget = candidate
-                refocusFrames = 1
-            }
-            if refocusFrames >= Self.refocusFrameThreshold { refocusOnNewObject() }
-        }
-    }
-
-    /// Start over on whatever the customer is now looking at. Everything tied to
-    /// the old object goes — cloud, lock, coverage, frames — because a half
-    /// measurement of a fan must not become part of a bed.
-    private func refocusOnNewObject() {
-        scanVolume.reset()
-        scanFrames = []
-        capturedBuckets.removeAll()
-        currentBucket = nil
-        volumeHistory.removeAll()
-        lastMeasurement = nil
-        lostFrames = 0
-        refocusFrames = 0
-        refocusTarget = nil
-        objectLost = false
-        DispatchQueue.main.async { [weak self] in
-            self?.removeBoxNode()
-            self?.overlay?.showToast("Anderes Objekt erkannt — Messung neu gestartet")
-        }
-    }
-
-    /// Non-LiDAR fallback: no cloud, no box — just photos from a few angles.
-    private func processPhotoSweepFrame(_ frame: ARFrame) {
-        if scanAccumulatedDeg - scanLastCapturedDeg >= Self.photoSweepEveryDeg || scanFrames.isEmpty {
-            scanLastCapturedDeg = scanAccumulatedDeg
-            captureFrame(frame, depth: nil)
-        }
-        let progress = Float(scanFrames.count) / Float(Self.photoSweepFrames)
-        DispatchQueue.main.async { [weak self] in
-            self?.overlay?.updateGuidance(.photoSweep, volumeM3: nil, progress: min(1, progress))
-        }
-        if scanFrames.count >= Self.photoSweepFrames { finalizeScan() }
-    }
-
-    private func captureFrame(_ frame: ARFrame, depth: CVPixelBuffer?) {
-        let imageBase64 = pixelBufferToJPEGBase64(frame.capturedImage)
-        let depthBase64 = depth.flatMap { depthMapToBase64PNG($0) }
-        scanFrames.append(ItemFrame(imageBase64: imageBase64,
-                                    depthMapBase64: depthBase64,
-                                    pose: transformToFloatArray(frame.camera.transform)))
-    }
-
-    /// World Y of the floor: the lowest horizontal plane ARKit has found.
-    ///
-    /// Lowest, not nearest — a table top is also a horizontal plane, and
-    /// treating it as the floor would delete the object standing on it. Points
-    /// near the true floor are the only ones we refuse outright; everything
-    /// above survives on the normal test alone.
-    private func floorLevel(in frame: ARFrame) -> Float? {
-        var lowest: Float?
-        for anchor in frame.anchors {
-            guard let plane = anchor as? ARPlaneAnchor, plane.alignment == .horizontal else { continue }
-            let y = plane.transform.columns.3.y + plane.center.y
-            if lowest == nil || y < lowest! { lowest = y }
-        }
-        return lowest
-    }
-
-    /// Camera bearing around the object, bucketed. Bearing is measured in the
-    /// horizontal plane only — how far the user has walked around the item.
-    private func bearingBucket(camera: simd_float3, centroid c: simd_float3) -> Int {
-        let bearing = atan2(camera.x - c.x, camera.z - c.z)   // [-π, π]
-        let norm = (bearing + .pi) / (2 * .pi)                // [0, 1]
-        return min(Self.bucketCount - 1, max(0, Int(norm * Float(Self.bucketCount))))
-    }
-
-    /// Re-fit the OBB off the render thread, at most a few times a second, then
-    /// push the box + numbers + next instruction to the UI.
-    private func refreshMeasurement(_ frame: ARFrame) {
-        let now = CACurrentMediaTime()
-        guard !measuring, now - lastMeasureTime >= Self.measureInterval else {
-            // Between fits, keep the box glued to the world by re-projecting the
-            // cached measurement against the current camera pose.
-            updateBox(with: lastMeasurement, frame: frame)
-            return
-        }
-        measuring = true
-        lastMeasureTime = now
-        let snap = scanVolume.snapshot()
-        measureQueue.async { [weak self] in
-            let m = VolumeAccumulator.measure(points: snap.points,
-                                              framesUsed: snap.frames,
-                                              anchor: snap.anchor)
+        scanQueue.async { [weak self] in
+            let found = RoomScanner.objects(from: meshAnchors, planeAnchors: planeAnchors)
             DispatchQueue.main.async {
-                guard let self, self.scanActive else { self?.measuring = false; return }
-                self.measuring = false
-                self.lastMeasurement = m
-                if let m {
-                    self.recordVolume(m.volume)
-                    self.scanVolume.tightenGate(to: m, minFrames: Self.requiredFrames)
-                }
-                self.publishGuidance()
+                guard let self else { return }
+                self.scanning = false
+                self.adopt(found)
+                completion?()
             }
         }
-        updateBox(with: lastMeasurement, frame: frame)
     }
 
-    private func recordVolume(_ v: Float) {
-        volumeHistory.append(v)
-        if volumeHistory.count > Self.stabilityWindow { volumeHistory.removeFirst() }
-    }
+    /// Replace the auto-detected objects while keeping everything the customer
+    /// has touched: manual entries have no mesh behind them and would otherwise
+    /// vanish on the next rescan, and typed labels are matched back by position.
+    private func adopt(_ found: [RoomObject]) {
+        let manual = objects.filter { !$0.hasGeometry }
+        let previous = objects.filter { $0.hasGeometry }
 
-    /// True once the last few readings agree — a box that still grows every
-    /// frame has not seen the whole object yet.
-    private var volumeIsStable: Bool {
-        guard volumeHistory.count >= Self.stabilityWindow,
-              let lo = volumeHistory.min(), let hi = volumeHistory.max(), lo > 0 else { return false }
-        return (hi - lo) / lo <= Self.stabilityTolerance
-    }
-
-    /// Decide the single next instruction, push it to the overlay, and finish
-    /// the measurement once nothing is left to ask for.
-    private func publishGuidance() {
-        guard scanActive, let frame = arView?.session.currentFrame else { return }
-
-        let coverage = min(1, Float(capturedBuckets.count) / Float(Self.requiredBuckets))
-        let progress = lastMeasurement == nil ? 0 : coverage * (volumeIsStable ? 1.0 : 0.85)
-
-        guard let m = lastMeasurement, let c = scanVolume.centroid else {
-            overlay?.updateGuidance(.aim, volumeM3: nil, progress: 0)
-            return
-        }
-
-        // Lost sight of it: the model stays, so this is "point back at it", not
-        // "start again". Never finish a measurement from a stale box.
-        if objectLost {
-            overlay?.updateGuidance(.reacquire, volumeM3: m.volume, progress: progress)
-            return
-        }
-
-        if let d = scanVolume.lastSeedDepth, d < 0.6 {
-            overlay?.updateGuidance(.stepBack, volumeM3: m.volume, progress: progress)
-            return
-        }
-
-        if capturedBuckets.count < Self.requiredBuckets || scanFrames.count < Self.requiredFrames {
-            let camPos = simd_float3(frame.camera.transform.columns.3.x,
-                                     frame.camera.transform.columns.3.y,
-                                     frame.camera.transform.columns.3.z)
-            let left = orbitDirectionIsLeft(camera: camPos, centroid: c, frame: frame)
-            overlay?.updateGuidance(.orbit(left: left), volumeM3: m.volume, progress: progress)
-            return
-        }
-
-        guard volumeIsStable else {
-            overlay?.updateGuidance(.hold, volumeM3: m.volume, progress: progress)
-            return
-        }
-
-        overlay?.updateGuidance(.done, volumeM3: m.volume, progress: 1)
-        finalizeScan()
-    }
-
-    /// Which way to walk to reach the nearest viewing angle we still lack.
-    /// Resolved by projecting the target standpoint into the camera's own
-    /// portrait-oriented space, so the arrow can't come out mirrored.
-    private func orbitDirectionIsLeft(camera: simd_float3, centroid c: simd_float3, frame: ARFrame) -> Bool {
-        let here = currentBucket ?? bearingBucket(camera: camera, centroid: c)
-        var target = here
-        var bestDistance = Int.max
-        for offset in 1...(Self.bucketCount / 2) {
-            for candidate in [(here + offset) % Self.bucketCount,
-                              (here - offset + Self.bucketCount) % Self.bucketCount] {
-                if !capturedBuckets.contains(candidate) && offset < bestDistance {
-                    bestDistance = offset
-                    target = candidate
-                }
+        var adopted: [RoomObject] = []
+        for object in found {
+            object.id = nextObjectID
+            nextObjectID += 1
+            // Carry a label across if a previous object sat in the same place.
+            if let match = previous.first(where: {
+                !$0.label.isEmpty && simd_distance($0.box.center, object.box.center) < 0.25
+            }) {
+                object.label = match.label
             }
-            if bestDistance < Int.max { break }
+            adopted.append(object)
         }
-
-        let radius = simd_length(simd_float2(camera.x - c.x, camera.z - c.z))
-        let beta = (Float(target) + 0.5) / Float(Self.bucketCount) * 2 * .pi - .pi
-        let standpoint = simd_float3(c.x + radius * sin(beta), camera.y, c.z + radius * cos(beta))
-        let inCamera = frame.camera.viewMatrix(for: .portrait) * simd_float4(standpoint, 1)
-        return inCamera.x < 0
+        objects = adopted + manual
+        if let selected = selectedObjectID, !objects.contains(where: { $0.id == selected }) {
+            selectedObjectID = nil
+        }
+        rebuildBoxNodes()
+        let total = objects.reduce(Float(0)) { $0 + $1.volume }
+        if sweeping {
+            overlay?.updateSweep(objectCount: objects.count, totalVolume: total)
+        }
     }
 
-    // MARK: - Focus mask
+    private func presentResults() {
+        overlay?.setState(.results)
+        refreshResults()
+    }
 
-    /// Draw the segmented object.
+    private func refreshResults() {
+        let rows = objects.map {
+            ResultRow(id: $0.id, label: $0.label, volumeM3: $0.volume, dims: $0.box.dims)
+        }
+        overlay?.showResults(rows)
+        overlay?.selectRow(selectedObjectID)
+        rebuildBoxNodes()
+    }
+
+    // MARK: - Editing the found objects
+
+    private func selectObject(_ id: Int?) {
+        selectedObjectID = id
+        rebuildBoxNodes()
+    }
+
+    private func mergeObjects(_ firstID: Int, _ secondID: Int) {
+        guard let first = objects.first(where: { $0.id == firstID }),
+              let second = objects.first(where: { $0.id == secondID }),
+              first.id != second.id else { return }
+        guard first.hasGeometry, second.hasGeometry else {
+            overlay?.showToast("Manuelle Objekte lassen sich nicht zusammenfassen")
+            return
+        }
+        guard let merged = RoomScanner.merged(first, second, id: nextObjectID) else {
+            overlay?.showToast("Zusammenfassen nicht möglich")
+            return
+        }
+        nextObjectID += 1
+        objects.removeAll { $0.id == first.id || $0.id == second.id }
+        objects.append(merged)
+        objects.sort { $0.volume > $1.volume }
+        selectedObjectID = merged.id
+        refreshResults()
+    }
+
+    private func splitSelection() {
+        guard let id = selectedObjectID,
+              let object = objects.first(where: { $0.id == id }) else { return }
+        guard object.hasGeometry else {
+            overlay?.showToast("Manuelle Objekte lassen sich nicht teilen")
+            return
+        }
+        let parts = RoomScanner.split(object, startingID: nextObjectID)
+        guard parts.count >= 2 else {
+            overlay?.showToast("Dieses Objekt lässt sich nicht teilen")
+            return
+        }
+        nextObjectID += parts.count
+        objects.removeAll { $0.id == id }
+        objects.append(contentsOf: parts)
+        objects.sort { $0.volume > $1.volume }
+        selectedObjectID = parts.first?.id
+        refreshResults()
+    }
+
+    private func deleteSelection() {
+        guard let id = selectedObjectID else { return }
+        objects.removeAll { $0.id == id }
+        selectedObjectID = nil
+        refreshResults()
+    }
+
+    private func addManualObject(_ entry: ManualEntry) {
+        let dims = entry.dims ?? simd_float3(repeating: cbrt(max(entry.volumeM3, 0.001)))
+        let box = OrientedBox(center: .zero, dims: dims, yaw: 0)
+        let object = RoomObject(id: nextObjectID, points: [], box: box)
+        nextObjectID += 1
+        object.label = entry.label
+        // A typed volume is taken as given; a typed L×W×H goes through the same
+        // packing factor as a measured one.
+        object.typedVolume = entry.dims == nil ? entry.volumeM3 : nil
+        objects.append(object)
+        objects.sort { $0.volume > $1.volume }
+        selectedObjectID = object.id
+        presentResults()
+    }
+
+    // MARK: - Frames
+
+    /// Attach the photo that saw each object best, so the backend can name it.
     ///
-    /// `SegmentationMask` is in depth-grid coordinates; `displayTransform` maps
-    /// normalized *image* coordinates to normalized viewport coordinates, which
-    /// covers the 90° rotation and the aspect-fill crop between the camera image
-    /// and the screen. Building the path in normalized image space and applying
-    /// one affine at the end keeps that transform in a single place.
-    private func updateFocusMask(_ frame: ARFrame) {
+    /// "Best" is the frame whose camera has the object in front of it and
+    /// nearest — good enough for a naming pass, and the manifest only needs one
+    /// frame per item for `representative_frame_per_item` to line up.
+    private func assignRepresentativeFrames() {
+        guard !sweepPoses.isEmpty else { return }
+        for object in objects where object.hasGeometry {
+            var best: (index: Int, distance: Float)?
+            for (i, pose) in sweepPoses.enumerated() {
+                let camera = simd_float3(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
+                let local = simd_inverse(pose) * simd_float4(object.box.center, 1)
+                guard -local.z > 0.3 else { continue }   // behind the camera
+                let distance = simd_distance(camera, object.box.center)
+                if best == nil || distance < best!.distance { best = (i, distance) }
+            }
+            object.frameIndex = best?.index
+        }
+    }
+
+    // MARK: - Submitting
+
+    private func submitObjects() {
+        savedItems = objects.map { object in
+            let frames: [ItemFrame]
+            if let index = object.frameIndex, index < sweepFrames.count {
+                frames = [sweepFrames[index]]
+            } else {
+                frames = []
+            }
+            return SavedItem(label: object.label,
+                             frames: frames,
+                             arcDegrees: 0,
+                             hasDepth: object.hasGeometry,
+                             volumeM3: object.volume,
+                             dims: object.typedVolume == nil ? object.box.dims : nil,
+                             deviceConfidence: object.hasGeometry ? 0.8 : nil)
+        }
+        for item in savedItems {
+            notifyListeners("itemSaved", data: [
+                "label": item.label,
+                "frameCount": item.frames.count,
+                "arcDegrees": item.arcDegrees,
+                "hasDepth": item.hasDepth,
+                "volumeM3": item.volumeM3 as Any,
+            ])
+        }
+        notifyListeners("sessionComplete", data: ["itemCount": savedItems.count])
+    }
+
+    // MARK: - Per-frame work
+
+    private func processSweepFrame(_ frame: ARFrame) {
         let now = CACurrentMediaTime()
-        guard now - lastMaskTime >= Self.maskInterval else { return }
-        lastMaskTime = now
 
-        guard scanActive, !objectLost, let mask = scanVolume.lastMask else {
-            DispatchQueue.main.async { [weak self] in self?.overlay?.updateFocusSilhouette(nil) }
-            return
+        if now - lastFrameCapture >= Self.frameCaptureInterval,
+           sweepFrames.count < Self.maxSweepFrames {
+            lastFrameCapture = now
+            captureFrame(frame)
         }
-        let size = viewportSize
-        guard size.width > 1, size.height > 1 else { return }
-
-        let runs = mask.normalizedRuns()
-        guard !runs.isEmpty else {
-            DispatchQueue.main.async { [weak self] in self?.overlay?.updateFocusSilhouette(nil) }
-            return
-        }
-        let toView = frame.displayTransform(for: .portrait, viewportSize: size)
-            .concatenating(CGAffineTransform(scaleX: size.width, y: size.height))
-        let path = UIBezierPath()
-        for r in runs { path.append(UIBezierPath(rect: r)) }
-        path.apply(toView)
-
-        DispatchQueue.main.async { [weak self] in
-            self?.overlay?.updateFocusSilhouette(path)
+        if now - lastScanTime >= Self.scanInterval {
+            lastScanTime = now
+            rescan()
         }
     }
 
-    // MARK: - Live box
+    private func captureFrame(_ frame: ARFrame) {
+        let image = pixelBufferToJPEGBase64(frame.capturedImage)
+        guard !image.isEmpty else { return }
+        sweepFrames.append(ItemFrame(imageBase64: image,
+                                     depthMapBase64: nil,
+                                     pose: transformToFloatArray(frame.camera.transform)))
+        sweepPoses.append(frame.camera.transform)
+    }
 
-    /// Draw the measured object as a wireframe box and hand the overlay the
-    /// screen positions of its L/W/H edges, so the numbers sit on the edges
-    /// they describe.
-    private func updateBox(with m: Measurement?, frame: ARFrame) {
+    // MARK: - Boxes
+
+    /// One wireframe box per object, the selected one in orange. Rebuilt whole
+    /// rather than diffed: merges and splits renumber everything, and a dozen
+    /// boxes is nothing to SceneKit.
+    private func rebuildBoxNodes() {
         guard let arView else { return }
-        guard let m else {
-            DispatchQueue.main.async { [weak self] in self?.setBoxHidden(true) }
-            return
+        removeBoxNodes()
+        var selected: (node: SCNNode, dims: simd_float3)?
+        for object in objects where object.hasGeometry {
+            let selected = object.id == selectedObjectID
+            let node = makeBoxNode(selected: selected)
+            node.simdPosition = object.box.center
+            node.simdOrientation = simd_quatf(angle: object.box.yaw, axis: simd_float3(0, 1, 0))
+            node.scale = SCNVector3(object.box.dims.x, object.box.dims.z, object.box.dims.y)
+            arView.scene.rootNode.addChildNode(node)
+            boxNodes[object.id] = node
+            if selected == nil, object.id == selectedObjectID {
+                selected = (node, object.box.dims)
+            }
         }
-
-        let node = boxNode ?? makeBoxNode()
-        node.isHidden = false
-        node.simdPosition = m.center
-        node.simdOrientation = simd_quatf(angle: m.yaw, axis: simd_float3(0, 1, 0))
-        node.scale = SCNVector3(m.dims.x, m.dims.z, m.dims.y)  // local X=length, Y=height, Z=width
-
-        /// Project a point in the box's local unit space to screen coordinates.
-        /// nil when it falls behind the camera.
-        func project(_ local: simd_float3) -> CGPoint? {
-            let world = node.simdConvertPosition(local, to: nil)
-            let p = arView.projectPoint(SCNVector3(world))
-            guard p.z > 0, p.z < 1 else { return nil }
-            return CGPoint(x: CGFloat(p.x), y: CGFloat(p.y))
-        }
-
-        // Edge midpoints of the unit box, one per dimension.
-        let anchors: [(simd_float3, String, Float)] = [
-            (simd_float3(0, -0.5, 0.5), "L", m.dims.x),
-            (simd_float3(0.5, -0.5, 0), "B", m.dims.y),
-            (simd_float3(0.5, 0, 0.5), "H", m.dims.z),
-        ]
-        var tags: [DimensionTag] = []
-        for (local, prefix, metres) in anchors {
-            guard let point = project(local) else { continue }
-            tags.append(DimensionTag(point: point,
-                                     text: "\(prefix) \(Int((metres * 100).rounded())) cm"))
-        }
-
-        DispatchQueue.main.async { [weak self] in
-            self?.overlay?.updateDimensionTags(tags)
-        }
+        selectedBox = selected
     }
 
-    private func makeBoxNode() -> SCNNode {
-        let container = SCNNode()
+    private func removeBoxNodes() {
+        for (_, node) in boxNodes { node.removeFromParentNode() }
+        boxNodes.removeAll()
+        selectedBox = nil
+        overlay?.updateDimensionTags([])
+    }
 
-        // Unit box, scaled per measurement — mutating geometry every fit would
-        // rebuild the mesh several times a second.
-        //
+    private func makeBoxNode(selected: Bool) -> SCNNode {
+        let container = SCNNode()
+        let tint = selected
+            ? UIColor(red: 252/255, green: 96/255, blue: 24/255, alpha: 1)
+            : UIColor.white
+
         // The 12 edges are drawn as explicit line primitives. An SCNBox with
         // `fillMode = .lines` wireframes the *triangulated* mesh instead, which
         // puts a diagonal across every face — that reads as a mess, not as the
         // outline of the thing being measured.
-        // Deliberately faint. The mask is what the customer should be reading;
-        // the box is context for the L/B/H numbers, not the main event.
         let wireMat = SCNMaterial()
-        wireMat.diffuse.contents = UIColor.white
-        wireMat.emission.contents = UIColor.white
-        wireMat.transparency = 0.5
+        wireMat.diffuse.contents = tint
+        wireMat.emission.contents = tint
+        wireMat.transparency = selected ? 1.0 : 0.45
         wireMat.lightingModel = .constant
         wireMat.isDoubleSided = true
         wireMat.writesToDepthBuffer = false
@@ -1541,131 +595,51 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         wire.materials = [wireMat]
         container.addChildNode(SCNNode(geometry: wire))
 
-        let fill = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0)
-        let fillMat = SCNMaterial()
-        fillMat.diffuse.contents = UIColor(red: 252/255, green: 96/255, blue: 24/255, alpha: 0.06)
-        fillMat.lightingModel = .constant
-        fillMat.isDoubleSided = true
-        fillMat.writesToDepthBuffer = false
-        fillMat.readsFromDepthBuffer = false
-        fill.materials = [fillMat]
-        container.addChildNode(SCNNode(geometry: fill))
+        if selected {
+            let fill = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0)
+            let fillMat = SCNMaterial()
+            fillMat.diffuse.contents = tint.withAlphaComponent(0.14)
+            fillMat.lightingModel = .constant
+            fillMat.isDoubleSided = true
+            fillMat.writesToDepthBuffer = false
+            fillMat.readsFromDepthBuffer = false
+            fill.materials = [fillMat]
+            container.addChildNode(SCNNode(geometry: fill))
+        }
 
         container.renderingOrder = 100
-        arView?.scene.rootNode.addChildNode(container)
-        boxNode = container
         return container
     }
 
-    private func setBoxHidden(_ hidden: Bool) {
-        boxNode?.isHidden = hidden
-        if hidden {
-            overlay?.updateDimensionTags([])
-            overlay?.updateFocusSilhouette(nil)
+    /// Pin L/B/H to the edges of the selected object's box.
+    ///
+    /// Reads one cached handle rather than the live object list: this runs on
+    /// the render thread, and the list is rebuilt on the main one by every
+    /// merge, split and rescan.
+    private func updateDimensionTags() {
+        guard let arView, let selected = selectedBox else {
+            DispatchQueue.main.async { [weak self] in self?.overlay?.updateDimensionTags([]) }
+            return
         }
-    }
-
-    private func removeBoxNode() {
-        boxNode?.removeFromParentNode()
-        boxNode = nil
-        overlay?.updateDimensionTags([])
-        overlay?.updateFocusSilhouette(nil)
-    }
-
-    // MARK: - Finishing
-
-    /// End the measurement and hand it to the review card. Nothing is saved yet.
-    private func finalizeScan() {
-        guard scanActive else { return }
-        scanActive = false
-        let snap = scanVolume.snapshot()
-        let measured = VolumeAccumulator.measure(points: snap.points,
-                                                 framesUsed: snap.frames,
-                                                 anchor: snap.anchor) ?? lastMeasurement
-        let spanDeg = Float(capturedBuckets.count) * (360.0 / Float(Self.bucketCount))
-        pendingItem = SavedItem(label: scanSuggestedLabel,
-                                frames: scanFrames,
-                                arcDegrees: hasLidar ? spanDeg : scanAccumulatedDeg,
-                                hasDepth: scanFrames.contains { $0.depthMapBase64 != nil },
-                                volumeM3: measured?.volume,
-                                dims: measured?.dims,
-                                deviceConfidence: measured?.confidence)
-        // Unpack the OBB here: `measured?.dims.map { … }` would chain onto the
-        // unwrapped simd_float3 (whose `map` hands out Floats), not the Optional.
-        let dimsArray: [Float]? = measured.map { [$0.dims.x, $0.dims.y, $0.dims.z] }
-        let suggestion = scanSuggestedLabel
-        let measurable = hasLidar
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.removeBoxNode()
-            self.overlay?.showReview(volumeM3: measured?.volume,
-                                     dims: dimsArray,
-                                     suggestedLabel: suggestion,
-                                     measurable: measurable)
+        let node = selected.node, dims = selected.dims
+        func project(_ local: simd_float3) -> CGPoint? {
+            let world = node.simdConvertPosition(local, to: nil)
+            let p = arView.projectPoint(SCNVector3(world))
+            guard p.z > 0, p.z < 1 else { return nil }
+            return CGPoint(x: CGFloat(p.x), y: CGFloat(p.y))
         }
-    }
-
-    /// Save the reviewed item. `label` may be empty — the backend names it from
-    /// the photo, so a blank name never costs a measurement.
-    private func commitPendingItem(label: String) {
-        guard var item = pendingItem else { return }
-        item.label = label.trimmingCharacters(in: .whitespaces)
-        pendingItem = nil
-        savedItems.append(item)
-        announceSaved(item)
-    }
-
-    // MARK: - Manual entry
-
-    /// Escape hatch for items the depth camera can't handle — glass, mirrors,
-    /// black leather, anything wedged into a corner. Keeps one photo so the
-    /// item still has something the backend can look at.
-    private func beginManualEntry() {
-        if scanFrames.isEmpty, let frame = arView?.session.currentFrame {
-            captureFrame(frame, depth: nil)
-        }
-        scanActive = false
-        removeBoxNode()
-        let suggestion = scanSuggestedLabel.isEmpty ? silentLabelGuess : scanSuggestedLabel
-        DispatchQueue.main.async { [weak self] in
-            self?.overlay?.showManualEntry(suggestedLabel: suggestion)
-        }
-    }
-
-    private func commitManualItem(_ entry: ManualEntry) {
-        let frames = scanFrames
-        scanFrames = []
-        scanVolume.reset()
-        let item = SavedItem(label: entry.label.trimmingCharacters(in: .whitespaces),
-                             frames: frames,
-                             arcDegrees: 0,
-                             hasDepth: false,
-                             volumeM3: entry.volumeM3,
-                             dims: entry.dims,
-                             // Customer-stated numbers: trusted, but not more
-                             // than a clean on-device measurement.
-                             deviceConfidence: 0.85)
-        savedItems.append(item)
-        announceSaved(item)
-    }
-
-    private func announceSaved(_ item: SavedItem) {
-        var eventData: [String: Any] = [
-            "label": item.label, "frameCount": item.frames.count,
-            "arcDegrees": item.arcDegrees, "hasDepth": item.hasDepth,
+        let anchors: [(simd_float3, String, Float)] = [
+            (simd_float3(0, -0.5, 0.5), "L", dims.x),
+            (simd_float3(0.5, -0.5, 0), "B", dims.y),
+            (simd_float3(0.5, 0, 0.5), "H", dims.z),
         ]
-        if let v = item.volumeM3 { eventData["volumeM3"] = v }
-        notifyListeners("itemSaved", data: eventData)
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.scanFrames = []
-            self.overlay?.updateItemCount(self.savedItems.count)
-            self.overlay?.showSavedFlash(label: item.label, volumeM3: item.volumeM3)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-                self?.overlay?.setState(.idle)
-            }
+        var tags: [DimensionTag] = []
+        for (local, prefix, metres) in anchors {
+            guard let point = project(local) else { continue }
+            tags.append(DimensionTag(point: point,
+                                     text: "\(prefix) \(Int((metres * 100).rounded())) cm"))
         }
+        DispatchQueue.main.async { [weak self] in self?.overlay?.updateDimensionTags(tags) }
     }
 
     // MARK: - YOLO (silent)
@@ -1777,15 +751,14 @@ extension DepthCapturePlugin: ARSCNViewDelegate {
         guard let frame = arView?.session.currentFrame else { return }
         if sessionIntrinsics == nil { sessionIntrinsics = frame.camera.intrinsics }
 
-        if scanActive {
-            processScanFrame(frame)
-        } else if pendingItem == nil {
-            // Keep a name suggestion warm for the review card. Nothing is drawn.
-            frameCounter += 1
-            if frameCounter % yoloEveryNFrames == 0 {
-                let buf = frame.capturedImage
-                DispatchQueue.global(qos: .utility).async { [weak self] in self?.runYOLO(on: buf) }
-            }
+        if sweeping { processSweepFrame(frame) }
+        updateDimensionTags()
+
+        // Keep a name suggestion warm for the manual sheet. Nothing is drawn.
+        frameCounter += 1
+        if frameCounter % yoloEveryNFrames == 0 {
+            let buf = frame.capturedImage
+            DispatchQueue.global(qos: .utility).async { [weak self] in self?.runYOLO(on: buf) }
         }
     }
 }
@@ -1806,37 +779,135 @@ private struct ManualEntry {
     let dims: simd_float3?
 }
 
+/// One object in the results list.
+private struct ResultRow {
+    let id: Int
+    let label: String
+    let volumeM3: Float
+    let dims: simd_float3
+}
+
+// MARK: - ResultRowView
+
+/// One found object: its volume, and an optional name.
+///
+/// The volume is set in the largest type on the row because it is the thing
+/// being confirmed; the name is a text field the customer may simply ignore,
+/// as everywhere else in this app.
+private class ResultRowView: UIView, UITextFieldDelegate {
+    let id: Int
+    let nameField = UITextField()
+    private let volumeLabel = UILabel()
+    private let dimsLabel = UILabel()
+    private let bullet = UIView()
+
+    var onTap: ((Int) -> Void)?
+    var onRename: ((Int, String) -> Void)?
+
+    var isSelected = false {
+        didSet {
+            backgroundColor = isSelected
+                ? UIColor(red: 252/255, green: 96/255, blue: 24/255, alpha: 0.14)
+                : .clear
+            bullet.backgroundColor = isSelected
+                ? UIColor(red: 252/255, green: 96/255, blue: 24/255, alpha: 1)
+                : UIColor(red: 200/255, green: 203/255, blue: 209/255, alpha: 1)
+        }
+    }
+
+    init(row: ResultRow) {
+        id = row.id
+        super.init(frame: .zero)
+        layer.cornerRadius = 14
+
+        bullet.layer.cornerRadius = 5
+        addSubview(bullet)
+
+        volumeLabel.text = String(format: "%.2f m³", row.volumeM3)
+        volumeLabel.font = .systemFont(ofSize: 19, weight: .bold)
+        volumeLabel.textColor = UIColor(red: 2/255, green: 36/255, blue: 72/255, alpha: 1)
+        addSubview(volumeLabel)
+
+        dimsLabel.text = String(format: "%.0f × %.0f × %.0f cm",
+                                row.dims.x * 100, row.dims.y * 100, row.dims.z * 100)
+        dimsLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        dimsLabel.textColor = UIColor(red: 116/255, green: 119/255, blue: 127/255, alpha: 1)
+        addSubview(dimsLabel)
+
+        nameField.text = row.label
+        nameField.placeholder = "Bezeichnung (optional)"
+        nameField.font = .systemFont(ofSize: 15)
+        nameField.textColor = UIColor(red: 2/255, green: 36/255, blue: 72/255, alpha: 1)
+        nameField.backgroundColor = UIColor(red: 230/255, green: 232/255, blue: 234/255, alpha: 1)
+        nameField.layer.cornerRadius = 10
+        nameField.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 10, height: 1))
+        nameField.leftViewMode = .always
+        nameField.returnKeyType = .done
+        nameField.autocorrectionType = .no
+        nameField.delegate = self
+        nameField.addTarget(self, action: #selector(nameChanged), for: .editingChanged)
+        addSubview(nameField)
+
+        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
+        isSelected = false
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        bullet.frame = CGRect(x: 14, y: 20, width: 10, height: 10)
+        volumeLabel.frame = CGRect(x: 34, y: 10, width: 130, height: 24)
+        dimsLabel.frame = CGRect(x: 34, y: 34, width: 150, height: 16)
+        nameField.frame = CGRect(x: 186, y: 14, width: bounds.width - 200, height: 36)
+    }
+
+    @objc private func tapped() { onTap?(id) }
+    @objc private func nameChanged() {
+        onRename?(id, nameField.text?.trimmingCharacters(in: .whitespaces) ?? "")
+    }
+
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        textField.resignFirstResponder()
+        return true
+    }
+}
+
 // MARK: - ScanOverlayView (100% native UI)
 //
-// Guided measurement UI. One instruction at a time, the measured box drawn in
-// place with its L/B/H on the matching edges, and a manual escape hatch for
-// objects LiDAR can't see. Detection is never drawn — it only pre-fills a name.
+// The flow is: sweep the room once, then confirm the objects that fell out of
+// it. There is no per-object measuring ritual and no reticle — nothing here
+// depends on an object fitting into one camera frame, because the mesh the
+// objects come from does not.
 
-private class ScanOverlayView: UIView {
+private class ScanOverlayView: UIView, UITextFieldDelegate {
 
-    enum State { case idle, measuring, review, manual, itemSaved }
+    enum State { case intro, sweeping, results, manual }
 
     // Callbacks
     var onClose: (() -> Void)?
-    var onFinish: (() -> Void)?
-    /// Measure whatever is in the reticle — no name required.
-    var onMeasureRequested: (() -> Void)?
-    var onCancelMeasurement: (() -> Void)?
-    /// Take the current measurement without covering every remaining angle.
-    var onAcceptEarly: (() -> Void)?
-    /// Save the reviewed item; empty means "let the backend name it".
-    var onSaveItem: ((String) -> Void)?
-    var onRemeasure: (() -> Void)?
+    var onStartSweep: (() -> Void)?
+    var onFinishSweep: (() -> Void)?
+    var onSelect: ((Int) -> Void)?
+    var onMerge: ((Int, Int) -> Void)?
+    var onSplit: (() -> Void)?
+    var onDelete: (() -> Void)?
+    var onRename: ((Int, String) -> Void)?
+    /// Hand the confirmed objects over and close the session.
+    var onSubmit: (() -> Void)?
     var onManualRequested: (() -> Void)?
     var onManualSubmit: ((ManualEntry) -> Void)?
     var onManualCancel: (() -> Void)?
 
-    /// False on devices without LiDAR — the copy then promises photos, not metres.
-    var canMeasure = true { didSet { updateHint() } }
+    /// False on devices without LiDAR — there is no mesh to subtract a room
+    /// from, so the copy promises photos rather than metres.
+    var canMeasure = true { didSet { updateIntro() } }
 
-    private var state: State = .idle
-    private var itemCount = 0
-    private var hasLiveVolume = false
+    private var state: State = .intro
+    private var rows: [ResultRowView] = []
+    private var selectedID: Int?
+    /// Set while the customer is picking the second object of a merge.
+    private var mergePending = false
 
     private static let navy = UIColor(red: 2/255, green: 36/255, blue: 72/255, alpha: 1)
     private static let orange = UIColor(red: 252/255, green: 96/255, blue: 24/255, alpha: 1)
@@ -1850,52 +921,36 @@ private class ScanOverlayView: UIView {
     private let countLabel = UILabel()
     private let closeBtn = UIButton(type: .system)
 
-    // ── Reticle ──────────────────────────────────────────────────────────
-    // Segmentation seeds from the frame centre, so "what's in the middle gets
-    // measured" is a hard rule of the pipeline — the UI has to say it.
-    private let reticle = UIView()
-    private let reticleLayer = CAShapeLayer()
+    // ── Intro ────────────────────────────────────────────────────────────
+    private let introCard = UIView()
+    private let introTitle = UILabel()
+    private let introBody = UILabel()
+    private let introStart = UIButton(type: .system)
+    private let introManual = UIButton(type: .system)
 
-    // ── Idle bottom bar ──────────────────────────────────────────────────
-    private let bottomBar = UIView()
-    private let measureBtn = UIButton(type: .custom)
-    private let measureRing = CAShapeLayer()
-    private let finishBtn = UIButton(type: .system)
-    private let manualBtn = UIButton(type: .system)
-    private let hintLabel = UILabel()
-
-    // ── Measuring HUD ────────────────────────────────────────────────────
+    // ── Sweeping HUD ─────────────────────────────────────────────────────
     private let hud = UIView()
-    private let guidanceCard = UIView()
-    private let guidanceArrow = UILabel()
-    private let guidanceText = UILabel()
-    private let volumePill = UILabel()
-    private let progressTrack = UIView()
-    private let progressFill = UIView()
-    private var progressValue: Float = 0
-    private let hudCancel = UIButton(type: .system)
-    private let hudManual = UIButton(type: .system)
-    private let hudAccept = UIButton(type: .system)
-    /// One label per dimension, positioned over the box edge it describes.
+    private let sweepHint = UILabel()
+    private let sweepStats = UILabel()
+    private let sweepFinish = UIButton(type: .system)
+    /// One label per dimension of the selected object, over the edge it names.
     private var dimLabels: [UILabel] = []
-    /// Dims everything outside the measured box, so what is (and isn't) part of
-    /// the measurement is visible rather than inferred.
-    private let focusScrim = CAShapeLayer()
-    private let maskTint = CAShapeLayer()
+
+    // ── Results ──────────────────────────────────────────────────────────
+    private let resultsCard = UIView()
+    private let resultsTitle = UILabel()
+    private let resultsScroll = UIScrollView()
+    private let actionBar = UIView()
+    private let mergeBtn = UIButton(type: .system)
+    private let splitBtn = UIButton(type: .system)
+    private let deleteBtn = UIButton(type: .system)
+    private let totalLabel = UILabel()
+    private let submitBtn = UIButton(type: .system)
+    private let addManualBtn = UIButton(type: .system)
 
     // ── Toast ────────────────────────────────────────────────────────────
     private let toastLabel = UILabel()
     private var toastHideWork: DispatchWorkItem?
-
-    // ── Review card ──────────────────────────────────────────────────────
-    private let reviewCard = UIView()
-    private let reviewTitle = UILabel()
-    private let reviewVolume = UILabel()
-    private let reviewDims = UILabel()
-    private let reviewField = UITextField()
-    private let reviewFieldHint = UILabel()
-    private let reviewSave = UIButton(type: .system)
-    private let reviewRemeasure = UIButton(type: .system)
 
     // ── Manual card ──────────────────────────────────────────────────────
     private let manualCard = UIView()
@@ -1913,26 +968,18 @@ private class ScanOverlayView: UIView {
 
     private var cardKeyboardShift: CGFloat = 0
 
-    // ── Saved flash ──────────────────────────────────────────────────────
-    private let flashView = UIView()
-    private let flashCheck = UILabel()
-    private let flashLabel = UILabel()
-    private let flashSub = UILabel()
-
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         isUserInteractionEnabled = true
         buildTopBar()
-        buildReticle()
-        buildBottomBar()
+        buildIntro()
         buildHUD()
-        buildReviewCard()
+        buildResults()
         buildManualCard()
-        buildFlash()
         addTapGesture()
         observeKeyboard()
-        setState(.idle)
+        setState(.intro)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -1963,135 +1010,65 @@ private class ScanOverlayView: UIView {
         addSubview(closeBtn)
     }
 
-    private func buildReticle() {
-        reticle.isUserInteractionEnabled = false
-        reticleLayer.fillColor = UIColor.clear.cgColor
-        reticleLayer.strokeColor = UIColor.white.withAlphaComponent(0.9).cgColor
-        reticleLayer.lineWidth = 3
-        reticleLayer.lineCap = .round
-        reticle.layer.addSublayer(reticleLayer)
-        addSubview(reticle)
-    }
+    private func buildIntro() {
+        introCard.backgroundColor = Self.cardBg
+        introCard.layer.cornerRadius = 24
+        introCard.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        addSubview(introCard)
 
-    private func buildBottomBar() {
-        bottomBar.backgroundColor = .clear
-        addSubview(bottomBar)
+        introTitle.text = "Raum erfassen"
+        introTitle.font = .systemFont(ofSize: 26, weight: .bold)
+        introTitle.textColor = Self.navy
+        introCard.addSubview(introTitle)
 
-        hintLabel.textColor = UIColor.white.withAlphaComponent(0.85)
-        hintLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        hintLabel.textAlignment = .center
-        hintLabel.backgroundColor = UIColor.black.withAlphaComponent(0.7)
-        hintLabel.layer.cornerRadius = 12
-        hintLabel.clipsToBounds = true
-        bottomBar.addSubview(hintLabel)
+        introBody.font = .systemFont(ofSize: 15)
+        introBody.textColor = Self.subtle
+        introBody.numberOfLines = 4
+        introCard.addSubview(introBody)
 
-        // Primary action: a shutter-style measure button. Everything else on this
-        // screen is secondary to it.
-        measureBtn.backgroundColor = .clear
-        measureBtn.setImage(UIImage(systemName: "ruler.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: 24, weight: .bold)), for: .normal)
-        measureBtn.tintColor = Self.navy
-        measureBtn.addTarget(self, action: #selector(measureTapped), for: .touchUpInside)
-        measureRing.fillColor = UIColor.white.cgColor
-        measureRing.strokeColor = UIColor.white.withAlphaComponent(0.45).cgColor
-        measureRing.lineWidth = 4
-        measureBtn.layer.insertSublayer(measureRing, at: 0)
-        bottomBar.addSubview(measureBtn)
+        stylePrimary(introStart, title: "Erfassung starten")
+        introStart.addTarget(self, action: #selector(startSweepTapped), for: .touchUpInside)
+        introCard.addSubview(introStart)
 
-        manualBtn.backgroundColor = UIColor.black.withAlphaComponent(0.8)
-        manualBtn.layer.cornerRadius = 12
-        manualBtn.setTitle("Manuell", for: .normal)
-        manualBtn.setTitleColor(.white, for: .normal)
-        manualBtn.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
-        manualBtn.addTarget(self, action: #selector(manualTapped), for: .touchUpInside)
-        bottomBar.addSubview(manualBtn)
+        styleSecondary(introManual, title: "Maße eintragen")
+        introManual.addTarget(self, action: #selector(manualTapped), for: .touchUpInside)
+        introCard.addSubview(introManual)
 
-        finishBtn.backgroundColor = UIColor.black.withAlphaComponent(0.8)
-        finishBtn.layer.cornerRadius = 12
-        finishBtn.setTitle("Fertig", for: .normal)
-        finishBtn.setTitleColor(.white, for: .normal)
-        finishBtn.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
-        finishBtn.alpha = 0.4
-        finishBtn.isEnabled = false
-        finishBtn.addTarget(self, action: #selector(finishTapped), for: .touchUpInside)
-        bottomBar.addSubview(finishBtn)
+        updateIntro()
     }
 
     private func buildHUD() {
         hud.isHidden = true
         addSubview(hud)
 
-        // Even-odd fill: the full screen minus the box silhouette.
-        focusScrim.fillRule = .evenOdd
-        focusScrim.fillColor = UIColor.black.withAlphaComponent(0.42).cgColor
-        focusScrim.isHidden = true
-        hud.layer.addSublayer(focusScrim)
+        sweepHint.text = "Gehen Sie langsam durch den Raum und richten Sie die Kamera auf alle Möbel."
+        sweepHint.font = .systemFont(ofSize: 15, weight: .semibold)
+        sweepHint.textColor = .white
+        sweepHint.textAlignment = .center
+        sweepHint.numberOfLines = 3
+        sweepHint.backgroundColor = UIColor.black.withAlphaComponent(0.78)
+        sweepHint.layer.cornerRadius = 20
+        sweepHint.clipsToBounds = true
+        hud.addSubview(sweepHint)
 
-        // Tint on top of the cut-out, so the object reads as *selected* rather
-        // than merely un-dimmed. Non-zero winding: the mask is a union of
-        // non-overlapping run rectangles and must fill without internal seams.
-        maskTint.fillRule = .nonZero
-        maskTint.fillColor = UIColor(red: 252/255, green: 96/255, blue: 24/255, alpha: 0.22).cgColor
-        maskTint.isHidden = true
-        hud.layer.addSublayer(maskTint)
+        // Live count, so the sweep has visible progress without a progress bar
+        // pretending to know how big the room is.
+        sweepStats.font = .systemFont(ofSize: 26, weight: .bold)
+        sweepStats.textColor = .white
+        sweepStats.textAlignment = .center
+        sweepStats.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        sweepStats.layer.cornerRadius = 22
+        sweepStats.clipsToBounds = true
+        sweepStats.text = "0 Objekte"
+        hud.addSubview(sweepStats)
 
-        // The instruction — one at a time, arrow first because that is the part
-        // people act on without reading.
-        guidanceCard.backgroundColor = UIColor.black.withAlphaComponent(0.78)
-        guidanceCard.layer.cornerRadius = 20
-        hud.addSubview(guidanceCard)
-
-        guidanceArrow.font = .systemFont(ofSize: 30, weight: .bold)
-        guidanceArrow.textColor = Self.orange
-        guidanceArrow.textAlignment = .center
-        guidanceCard.addSubview(guidanceArrow)
-
-        guidanceText.font = .systemFont(ofSize: 15, weight: .semibold)
-        guidanceText.textColor = .white
-        guidanceText.numberOfLines = 2
-        guidanceCard.addSubview(guidanceText)
-
-        volumePill.font = .systemFont(ofSize: 26, weight: .bold)
-        volumePill.textColor = .white
-        volumePill.textAlignment = .center
-        volumePill.backgroundColor = UIColor.black.withAlphaComponent(0.6)
-        volumePill.layer.cornerRadius = 22
-        volumePill.clipsToBounds = true
-        hud.addSubview(volumePill)
-
-        progressTrack.backgroundColor = UIColor.white.withAlphaComponent(0.2)
-        progressTrack.layer.cornerRadius = 3
-        progressTrack.clipsToBounds = true
-        hud.addSubview(progressTrack)
-        progressFill.backgroundColor = Self.orange
-        progressTrack.addSubview(progressFill)
-
-        hudCancel.setTitle("Abbrechen", for: .normal)
-        hudCancel.setTitleColor(.white, for: .normal)
-        hudCancel.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
-        hudCancel.backgroundColor = UIColor.white.withAlphaComponent(0.18)
-        hudCancel.layer.cornerRadius = 12
-        hudCancel.addTarget(self, action: #selector(cancelMeasurementTapped), for: .touchUpInside)
-        hud.addSubview(hudCancel)
-
-        hudManual.setTitle("Manuell", for: .normal)
-        hudManual.setTitleColor(.white, for: .normal)
-        hudManual.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
-        hudManual.backgroundColor = UIColor.white.withAlphaComponent(0.18)
-        hudManual.layer.cornerRadius = 12
-        hudManual.addTarget(self, action: #selector(manualTapped), for: .touchUpInside)
-        hud.addSubview(hudManual)
-
-        // Escape from a measurement that is "good enough" without walking the
-        // last few degrees. Enabled as soon as there is any volume at all.
-        hudAccept.setTitle("Übernehmen", for: .normal)
-        hudAccept.setTitleColor(.white, for: .normal)
-        hudAccept.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
-        hudAccept.backgroundColor = Self.orange
-        hudAccept.layer.cornerRadius = 12
-        hudAccept.alpha = 0.35
-        hudAccept.isEnabled = false
-        hudAccept.addTarget(self, action: #selector(acceptEarlyTapped), for: .touchUpInside)
-        hud.addSubview(hudAccept)
+        sweepFinish.backgroundColor = Self.orange
+        sweepFinish.layer.cornerRadius = 14
+        sweepFinish.setTitle("Fertig", for: .normal)
+        sweepFinish.setTitleColor(.white, for: .normal)
+        sweepFinish.titleLabel?.font = .systemFont(ofSize: 17, weight: .bold)
+        sweepFinish.addTarget(self, action: #selector(finishSweepTapped), for: .touchUpInside)
+        hud.addSubview(sweepFinish)
 
         toastLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         toastLabel.textColor = .white
@@ -2104,42 +1081,47 @@ private class ScanOverlayView: UIView {
         addSubview(toastLabel)
     }
 
-    private func buildReviewCard() {
-        reviewCard.backgroundColor = Self.cardBg
-        reviewCard.layer.cornerRadius = 24
-        reviewCard.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
-        reviewCard.isHidden = true
-        addSubview(reviewCard)
+    private func buildResults() {
+        resultsCard.backgroundColor = Self.cardBg
+        resultsCard.layer.cornerRadius = 24
+        resultsCard.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        resultsCard.isHidden = true
+        addSubview(resultsCard)
 
-        reviewTitle.font = .systemFont(ofSize: 13, weight: .semibold)
-        reviewTitle.textColor = Self.subtle
-        reviewCard.addSubview(reviewTitle)
+        resultsTitle.font = .systemFont(ofSize: 20, weight: .bold)
+        resultsTitle.textColor = Self.navy
+        resultsCard.addSubview(resultsTitle)
 
-        reviewVolume.font = .systemFont(ofSize: 40, weight: .bold)
-        reviewVolume.textColor = Self.navy
-        reviewCard.addSubview(reviewVolume)
+        resultsScroll.showsVerticalScrollIndicator = true
+        resultsScroll.keyboardDismissMode = .interactive
+        resultsCard.addSubview(resultsScroll)
 
-        reviewDims.font = .systemFont(ofSize: 14, weight: .regular)
-        reviewDims.textColor = Self.subtle
-        reviewDims.numberOfLines = 2
-        reviewCard.addSubview(reviewDims)
+        // Only meaningful with something selected, so it starts hidden rather
+        // than disabled — a bar of dead buttons is worse than no bar.
+        actionBar.isHidden = true
+        resultsCard.addSubview(actionBar)
+        styleSmall(mergeBtn, title: "Zusammenfassen")
+        mergeBtn.addTarget(self, action: #selector(mergeTapped), for: .touchUpInside)
+        actionBar.addSubview(mergeBtn)
+        styleSmall(splitBtn, title: "Teilen")
+        splitBtn.addTarget(self, action: #selector(splitTapped), for: .touchUpInside)
+        actionBar.addSubview(splitBtn)
+        styleSmall(deleteBtn, title: "Löschen")
+        deleteBtn.setTitleColor(UIColor.systemRed, for: .normal)
+        deleteBtn.addTarget(self, action: #selector(deleteTapped), for: .touchUpInside)
+        actionBar.addSubview(deleteBtn)
 
-        styleField(reviewField, placeholder: "Bezeichnung (optional)")
-        reviewCard.addSubview(reviewField)
+        totalLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        totalLabel.textColor = Self.navy
+        resultsCard.addSubview(totalLabel)
 
-        reviewFieldHint.text = "Ohne Bezeichnung erkennen wir das Objekt automatisch."
-        reviewFieldHint.font = .systemFont(ofSize: 12)
-        reviewFieldHint.textColor = UIColor(red: 142/255, green: 145/255, blue: 152/255, alpha: 1)
-        reviewFieldHint.numberOfLines = 2
-        reviewCard.addSubview(reviewFieldHint)
+        styleSecondary(addManualBtn, title: "Objekt manuell")
+        addManualBtn.addTarget(self, action: #selector(manualTapped), for: .touchUpInside)
+        resultsCard.addSubview(addManualBtn)
 
-        styleSecondary(reviewRemeasure, title: "Erneut messen")
-        reviewRemeasure.addTarget(self, action: #selector(remeasureTapped), for: .touchUpInside)
-        reviewCard.addSubview(reviewRemeasure)
-
-        stylePrimary(reviewSave, title: "Sichern")
-        reviewSave.addTarget(self, action: #selector(saveTapped), for: .touchUpInside)
-        reviewCard.addSubview(reviewSave)
+        stylePrimary(submitBtn, title: "Weiter")
+        submitBtn.addTarget(self, action: #selector(submitTapped), for: .touchUpInside)
+        resultsCard.addSubview(submitBtn)
     }
 
     private func buildManualCard() {
@@ -2149,12 +1131,12 @@ private class ScanOverlayView: UIView {
         manualCard.isHidden = true
         addSubview(manualCard)
 
-        manualTitle.text = "Manuell eintragen"
-        manualTitle.font = .systemFont(ofSize: 20, weight: .bold)
+        manualTitle.text = "Maße eintragen"
+        manualTitle.font = .systemFont(ofSize: 22, weight: .bold)
         manualTitle.textColor = Self.navy
         manualCard.addSubview(manualTitle)
 
-        manualSubtitle.text = "Für Objekte, die sich nicht messen lassen — Glas, Spiegel, dunkles Leder."
+        manualSubtitle.text = "Für Glas, Spiegel und alles, was der Scan nicht sieht."
         manualSubtitle.font = .systemFont(ofSize: 13)
         manualSubtitle.textColor = Self.subtle
         manualSubtitle.numberOfLines = 2
@@ -2167,16 +1149,14 @@ private class ScanOverlayView: UIView {
         manualMode.addTarget(self, action: #selector(manualModeChanged), for: .valueChanged)
         manualCard.addSubview(manualMode)
 
-        for (field, placeholder) in [(manualL, "Länge cm"), (manualW, "Breite cm"), (manualH, "Höhe cm")] {
-            styleField(field, placeholder: placeholder)
-            field.keyboardType = .decimalPad
-            field.textAlignment = .center
-            manualCard.addSubview(field)
+        styleField(manualL, placeholder: "Länge cm")
+        styleField(manualW, placeholder: "Breite cm")
+        styleField(manualH, placeholder: "Höhe cm")
+        styleField(manualVolume, placeholder: "Volumen m³")
+        for f in [manualL, manualW, manualH, manualVolume] {
+            f.keyboardType = .decimalPad
+            manualCard.addSubview(f)
         }
-        styleField(manualVolume, placeholder: "Volumen in m³, z. B. 1,2")
-        manualVolume.keyboardType = .decimalPad
-        manualVolume.isHidden = true
-        manualCard.addSubview(manualVolume)
 
         manualHint.font = .systemFont(ofSize: 12)
         manualHint.textColor = UIColor(red: 142/255, green: 145/255, blue: 152/255, alpha: 1)
@@ -2197,55 +1177,37 @@ private class ScanOverlayView: UIView {
     private func styleField(_ field: UITextField, placeholder: String) {
         field.placeholder = placeholder
         field.font = .systemFont(ofSize: 16)
+        field.textColor = Self.navy
         field.backgroundColor = Self.fieldBg
         field.layer.cornerRadius = 12
-        field.autocapitalizationType = .sentences
-        field.returnKeyType = .done
-        field.clearButtonMode = .whileEditing
-        field.delegate = self
-        field.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 14, height: 1))
+        field.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 12, height: 1))
         field.leftViewMode = .always
+        field.returnKeyType = .done
+        field.delegate = self
     }
 
     private func stylePrimary(_ button: UIButton, title: String) {
-        button.backgroundColor = Self.navy
-        button.layer.cornerRadius = 12
         button.setTitle(title, for: .normal)
         button.setTitleColor(.white, for: .normal)
-        button.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
+        button.titleLabel?.font = .systemFont(ofSize: 17, weight: .bold)
+        button.backgroundColor = Self.orange
+        button.layer.cornerRadius = 14
     }
 
     private func styleSecondary(_ button: UIButton, title: String) {
-        button.backgroundColor = Self.fieldBg
-        button.layer.cornerRadius = 12
         button.setTitle(title, for: .normal)
-        button.setTitleColor(UIColor(red: 67/255, green: 71/255, blue: 78/255, alpha: 1), for: .normal)
-        button.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
+        button.setTitleColor(Self.navy, for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
+        button.backgroundColor = UIColor.white
+        button.layer.cornerRadius = 14
     }
 
-    private func buildFlash() {
-        flashView.backgroundColor = UIColor.black.withAlphaComponent(0.6)
-        flashView.isHidden = true
-        addSubview(flashView)
-
-        flashCheck.text = "✓"
-        flashCheck.font = .systemFont(ofSize: 40, weight: .bold)
-        flashCheck.textColor = .white
-        flashCheck.textAlignment = .center
-        flashCheck.backgroundColor = UIColor(red: 34/255, green: 197/255, blue: 94/255, alpha: 1)
-        flashCheck.layer.cornerRadius = 40
-        flashCheck.clipsToBounds = true
-        flashView.addSubview(flashCheck)
-
-        flashLabel.textColor = .white
-        flashLabel.font = .systemFont(ofSize: 22, weight: .bold)
-        flashLabel.textAlignment = .center
-        flashView.addSubview(flashLabel)
-
-        flashSub.textColor = UIColor.white.withAlphaComponent(0.7)
-        flashSub.font = .systemFont(ofSize: 14)
-        flashSub.textAlignment = .center
-        flashView.addSubview(flashSub)
+    private func styleSmall(_ button: UIButton, title: String) {
+        button.setTitle(title, for: .normal)
+        button.setTitleColor(Self.navy, for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+        button.backgroundColor = .white
+        button.layer.cornerRadius = 11
     }
 
     private func addTapGesture() {
@@ -2255,220 +1217,138 @@ private class ScanOverlayView: UIView {
     }
 
     private func observeKeyboard() {
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(keyboardWillChange(_:)),
-            name: UIResponder.keyboardWillShowNotification, object: nil)
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(keyboardWillHide(_:)),
-            name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillChange(_:)),
+                                               name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillHide(_:)),
+                                               name: UIResponder.keyboardWillHideNotification, object: nil)
     }
 
     // MARK: - Layout
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let safe = safeAreaInsets
-        let w = bounds.width
-        let h = bounds.height
+        let safeTop = safeAreaInsets.top
+        let safeBottom = safeAreaInsets.bottom
+        let w = bounds.width, h = bounds.height
 
-        // Top bar
-        countPill.frame = CGRect(x: 20, y: safe.top + 8, width: 130, height: 32)
+        countPill.frame = CGRect(x: 16, y: safeTop + 10, width: 132, height: 32)
         countDot.frame = CGRect(x: 12, y: 12, width: 8, height: 8)
-        countLabel.frame = CGRect(x: 28, y: 0, width: 96, height: 32)
-        closeBtn.frame = CGRect(x: w - 60, y: safe.top + 4, width: 40, height: 40)
+        countLabel.frame = CGRect(x: 28, y: 0, width: 100, height: 32)
+        closeBtn.frame = CGRect(x: w - 56, y: safeTop + 6, width: 40, height: 40)
 
-        // Reticle: centred square with corner brackets.
-        // Dead centre, no optical nudge: the depth seed is taken at the exact
-        // centre of the camera image, which the portrait aspect-fill maps to the
-        // exact centre of the screen. Offsetting the reticle would aim the
-        // customer a few centimetres away from what actually gets measured.
-        let side: CGFloat = min(w, h) * 0.6
-        let cy = h / 2
-        reticle.frame = CGRect(x: (w - side) / 2, y: cy - side / 2, width: side, height: side)
-        reticleLayer.frame = reticle.bounds
-        reticleLayer.path = cornerBracketPath(in: reticle.bounds, arm: side * 0.18, radius: 14).cgPath
+        // Intro
+        let introHeight: CGFloat = 268 + safeBottom
+        introCard.frame = CGRect(x: 0, y: h - introHeight, width: w, height: introHeight)
+        introTitle.frame = CGRect(x: 22, y: 24, width: w - 44, height: 32)
+        introBody.frame = CGRect(x: 22, y: 62, width: w - 44, height: 82)
+        introStart.frame = CGRect(x: 22, y: 156, width: w - 44, height: 52)
+        introManual.frame = CGRect(x: 22, y: 216, width: w - 44, height: 44)
 
-        // Idle bottom bar
-        let bbH: CGFloat = 150
-        bottomBar.frame = CGRect(x: 0, y: h - bbH - safe.bottom, width: w, height: bbH)
-        hintLabel.frame = CGRect(x: (w - 320) / 2, y: 8, width: 320, height: 28)
-        let btn: CGFloat = 78
-        measureBtn.frame = CGRect(x: (w - btn) / 2, y: 52, width: btn, height: btn)
-        measureRing.frame = measureBtn.bounds
-        measureRing.path = UIBezierPath(ovalIn: measureBtn.bounds.insetBy(dx: 8, dy: 8)).cgPath
-        let sideBtnY = 52 + (btn - 44) / 2
-        manualBtn.frame = CGRect(x: 20, y: sideBtnY, width: 92, height: 44)
-        finishBtn.frame = CGRect(x: w - 112 - 20, y: sideBtnY, width: 112, height: 44)
-
-        // Measuring HUD
+        // Sweeping
         hud.frame = bounds
-        focusScrim.frame = bounds
-        maskTint.frame = bounds
-        toastLabel.frame = CGRect(x: 24, y: safe.top + 140, width: w - 48, height: 44)
-        let gcW = w - 40
-        guidanceCard.frame = CGRect(x: 20, y: safe.top + 56, width: gcW, height: 72)
-        guidanceArrow.frame = CGRect(x: 16, y: 16, width: 44, height: 40)
-        guidanceText.frame = CGRect(x: 68, y: 12, width: gcW - 84, height: 48)
+        sweepHint.frame = CGRect(x: 24, y: safeTop + 62, width: w - 48, height: 76)
+        sweepStats.frame = CGRect(x: w / 2 - 96, y: h - safeBottom - 148, width: 192, height: 44)
+        sweepFinish.frame = CGRect(x: 24, y: h - safeBottom - 88, width: w - 48, height: 54)
 
-        let hudBtnY = h - safe.bottom - 66
-        volumePill.frame = CGRect(x: (w - 200) / 2, y: hudBtnY - 92, width: 200, height: 44)
-        progressTrack.frame = CGRect(x: 40, y: hudBtnY - 34, width: w - 80, height: 6)
-        layoutProgressFill()
-        let hudBtnW = (w - 40 - 24) / 3
-        hudCancel.frame = CGRect(x: 20, y: hudBtnY, width: hudBtnW, height: 50)
-        hudManual.frame = CGRect(x: 20 + hudBtnW + 12, y: hudBtnY, width: hudBtnW, height: 50)
-        hudAccept.frame = CGRect(x: 20 + 2 * (hudBtnW + 12), y: hudBtnY, width: hudBtnW, height: 50)
+        // Results
+        let resultsHeight = min(h * 0.66, 520) + safeBottom
+        resultsCard.frame = CGRect(x: 0, y: h - resultsHeight + cardKeyboardShift,
+                                   width: w, height: resultsHeight)
+        resultsTitle.frame = CGRect(x: 22, y: 20, width: w - 44, height: 26)
+        let listTop: CGFloat = 56
+        let footerHeight: CGFloat = 132 + safeBottom
+        let barHeight: CGFloat = actionBar.isHidden ? 0 : 44
+        resultsScroll.frame = CGRect(x: 14, y: listTop, width: w - 28,
+                                     height: max(80, resultsHeight - listTop - footerHeight - barHeight))
+        layoutRows()
+        actionBar.frame = CGRect(x: 14, y: resultsScroll.frame.maxY + 4, width: w - 28, height: barHeight)
+        let third = (w - 28 - 16) / 3
+        mergeBtn.frame = CGRect(x: 0, y: 2, width: third, height: 36)
+        splitBtn.frame = CGRect(x: third + 8, y: 2, width: third, height: 36)
+        deleteBtn.frame = CGRect(x: 2 * third + 16, y: 2, width: third, height: 36)
 
-        // Review card
-        let reviewH: CGFloat = 330 + safe.bottom
-        reviewCard.frame = CGRect(x: 0, y: h - reviewH - cardKeyboardShift, width: w, height: reviewH)
-        reviewTitle.frame = CGRect(x: 24, y: 24, width: w - 48, height: 18)
-        reviewVolume.frame = CGRect(x: 24, y: 44, width: w - 48, height: 48)
-        reviewDims.frame = CGRect(x: 24, y: 94, width: w - 48, height: 34)
-        reviewField.frame = CGRect(x: 24, y: 134, width: w - 48, height: 48)
-        reviewFieldHint.frame = CGRect(x: 24, y: 188, width: w - 48, height: 32)
-        let rbW = (w - 60) / 2
-        reviewRemeasure.frame = CGRect(x: 24, y: 232, width: rbW, height: 50)
-        reviewSave.frame = CGRect(x: 24 + rbW + 12, y: 232, width: rbW, height: 50)
+        let footerTop = resultsCard.bounds.height - footerHeight
+        totalLabel.frame = CGRect(x: 22, y: footerTop + 4, width: w - 44, height: 22)
+        addManualBtn.frame = CGRect(x: 22, y: footerTop + 30, width: w - 44, height: 40)
+        submitBtn.frame = CGRect(x: 22, y: footerTop + 76, width: w - 44, height: 52)
 
         // Manual card
-        let manualCardH: CGFloat = 400 + safe.bottom
-        manualCard.frame = CGRect(x: 0, y: h - manualCardH - cardKeyboardShift, width: w, height: manualCardH)
-        manualTitle.frame = CGRect(x: 24, y: 22, width: w - 48, height: 26)
-        manualSubtitle.frame = CGRect(x: 24, y: 50, width: w - 48, height: 34)
-        manualName.frame = CGRect(x: 24, y: 92, width: w - 48, height: 46)
-        manualMode.frame = CGRect(x: 24, y: 148, width: w - 48, height: 34)
-        let triW = (w - 48 - 20) / 3
-        manualL.frame = CGRect(x: 24, y: 194, width: triW, height: 46)
-        manualW.frame = CGRect(x: 24 + triW + 10, y: 194, width: triW, height: 46)
-        manualH.frame = CGRect(x: 24 + 2 * (triW + 10), y: 194, width: triW, height: 46)
-        manualVolume.frame = CGRect(x: 24, y: 194, width: w - 48, height: 46)
-        manualHint.frame = CGRect(x: 24, y: 248, width: w - 48, height: 32)
-        manualCancelBtn.frame = CGRect(x: 24, y: 292, width: rbW, height: 50)
-        manualSaveBtn.frame = CGRect(x: 24 + rbW + 12, y: 292, width: rbW, height: 50)
+        let manualHeight: CGFloat = 452 + safeBottom
+        manualCard.frame = CGRect(x: 0, y: h - manualHeight + cardKeyboardShift, width: w, height: manualHeight)
+        manualTitle.frame = CGRect(x: 22, y: 22, width: w - 44, height: 28)
+        manualSubtitle.frame = CGRect(x: 22, y: 52, width: w - 44, height: 34)
+        manualName.frame = CGRect(x: 22, y: 94, width: w - 44, height: 48)
+        manualMode.frame = CGRect(x: 22, y: 152, width: w - 44, height: 34)
+        let fieldWidth = (w - 44 - 16) / 3
+        manualL.frame = CGRect(x: 22, y: 198, width: fieldWidth, height: 48)
+        manualW.frame = CGRect(x: 22 + fieldWidth + 8, y: 198, width: fieldWidth, height: 48)
+        manualH.frame = CGRect(x: 22 + 2 * (fieldWidth + 8), y: 198, width: fieldWidth, height: 48)
+        manualVolume.frame = CGRect(x: 22, y: 198, width: w - 44, height: 48)
+        manualHint.frame = CGRect(x: 22, y: 252, width: w - 44, height: 34)
+        manualCancelBtn.frame = CGRect(x: 22, y: 296, width: w - 44, height: 44)
+        manualSaveBtn.frame = CGRect(x: 22, y: 348, width: w - 44, height: 52)
 
-        // Flash
-        flashView.frame = bounds
-        flashCheck.frame = CGRect(x: (w - 80) / 2, y: h / 2 - 80, width: 80, height: 80)
-        flashLabel.frame = CGRect(x: 20, y: h / 2 + 16, width: w - 40, height: 30)
-        flashSub.frame = CGRect(x: 20, y: h / 2 + 50, width: w - 40, height: 20)
+        toastLabel.frame = CGRect(x: 30, y: safeTop + 150, width: w - 60, height: 46)
     }
 
-    private func layoutProgressFill() {
-        progressFill.frame = CGRect(x: 0, y: 0,
-                                    width: progressTrack.bounds.width * CGFloat(progressValue),
-                                    height: progressTrack.bounds.height)
-    }
-
-    /// Four corner brackets — a viewfinder frame that leaves the object visible.
-    private func cornerBracketPath(in rect: CGRect, arm: CGFloat, radius: CGFloat) -> UIBezierPath {
-        let path = UIBezierPath()
-        let corners: [(CGPoint, CGFloat, CGFloat)] = [
-            (CGPoint(x: rect.minX, y: rect.minY), 1, 1),
-            (CGPoint(x: rect.maxX, y: rect.minY), -1, 1),
-            (CGPoint(x: rect.maxX, y: rect.maxY), -1, -1),
-            (CGPoint(x: rect.minX, y: rect.maxY), 1, -1),
-        ]
-        for (corner, sx, sy) in corners {
-            path.move(to: CGPoint(x: corner.x + sx * radius, y: corner.y + sy * arm))
-            path.addLine(to: CGPoint(x: corner.x + sx * radius, y: corner.y + sy * radius))
-            path.addLine(to: CGPoint(x: corner.x + sx * arm, y: corner.y + sy * radius))
+    private func layoutRows() {
+        let rowHeight: CGFloat = 64
+        let width = resultsScroll.bounds.width
+        for (i, row) in rows.enumerated() {
+            row.frame = CGRect(x: 0, y: CGFloat(i) * (rowHeight + 6), width: width, height: rowHeight)
         }
-        return path
+        resultsScroll.contentSize = CGSize(
+            width: width,
+            height: CGFloat(rows.count) * (rowHeight + 6))
     }
 
     // MARK: - State
 
     func setState(_ newState: State) {
         state = newState
-        let idle = newState == .idle
-        bottomBar.isHidden = !idle
-        // During measuring the AR box replaces the reticle — the object is
-        // already identified, so a second frame around it would just be noise.
-        reticle.isHidden = newState != .idle
-        hud.isHidden = newState != .measuring
-        flashView.isHidden = newState != .itemSaved
-        if newState != .review { reviewCard.isHidden = true }
-        if newState != .manual { manualCard.isHidden = true }
-        if newState != .review && newState != .manual {
+        introCard.isHidden = newState != .intro
+        hud.isHidden = newState != .sweeping
+        resultsCard.isHidden = newState != .results
+        manualCard.isHidden = newState != .manual
+        if newState != .manual && newState != .results {
             endEditing(true)
             cardKeyboardShift = 0
         }
-        if newState != .measuring {
-            updateDimensionTags([])
-            updateFocusSilhouette(nil)
-            hideToast()
-            hasLiveVolume = false
-            setAcceptEnabled(false)
+        if newState != .results {
+            selectedID = nil
+            mergePending = false
+            actionBar.isHidden = true
         }
-        updateHint()
+        if newState != .sweeping { updateDimensionTags([]) }
         setNeedsLayout()
     }
 
     func updateItemCount(_ count: Int) {
-        itemCount = count
-        countLabel.text = "\(count) \(count == 1 ? "Objekt" : "Objekte")"
+        countLabel.text = count == 1 ? "1 Objekt" : "\(count) Objekte"
         countDot.backgroundColor = count > 0
-            ? UIColor(red: 74/255, green: 222/255, blue: 128/255, alpha: 1)
+            ? Self.orange
             : UIColor.white.withAlphaComponent(0.3)
-        finishBtn.isEnabled = count > 0
-        finishBtn.alpha = count > 0 ? 1.0 : 0.4
-        finishBtn.setTitle(count > 0 ? "Fertig (\(count))" : "Fertig", for: .normal)
     }
 
-    // MARK: - Measuring feedback
-
-    /// One instruction, the live volume, and how far along we are. Called a few
-    /// times a second while measuring.
-    func updateGuidance(_ guidance: Guidance, volumeM3: Float?, progress: Float) {
-        switch guidance {
-        case .aim:
-            guidanceArrow.text = "◎"
-            guidanceText.text = "Objekt mittig anvisieren und ruhig halten"
-        case .reacquire:
-            guidanceArrow.text = "◎"
-            guidanceText.text = "Objekt aus dem Blick verloren — wieder anvisieren"
-        case .stepBack:
-            guidanceArrow.text = "↔"
-            guidanceText.text = "Etwas zurücktreten — das Objekt passt nicht ganz ins Bild"
-        case .orbit(let left):
-            guidanceArrow.text = left ? "←" : "→"
-            guidanceText.text = left
-                ? "Langsam nach links um das Objekt gehen"
-                : "Langsam nach rechts um das Objekt gehen"
-        case .photoSweep:
-            guidanceArrow.text = "↻"
-            guidanceText.text = "Langsam um das Objekt gehen — wir sammeln Fotos aus mehreren Winkeln"
-        case .hold:
-            guidanceArrow.text = "✓"
-            guidanceText.text = "Fast fertig — Objekt noch einen Moment im Blick behalten"
-        case .done:
-            guidanceArrow.text = "✓"
-            guidanceText.text = "Messung abgeschlossen"
-        }
-
-        if let v = volumeM3 {
-            volumePill.text = "≈ \(Self.formatVolume(v)) m³"
-            volumePill.isHidden = false
-            hasLiveVolume = true
-        } else {
-            volumePill.isHidden = !canMeasure
-            volumePill.text = "– m³"
-            hasLiveVolume = false
-        }
-        setAcceptEnabled(hasLiveVolume)
-
-        progressValue = max(0, min(1, progress))
-        UIView.animate(withDuration: 0.2) { self.layoutProgressFill() }
+    private func updateIntro() {
+        introBody.text = canMeasure
+            ? "Wir erfassen den Raum einmal komplett und erkennen daraus jedes Möbelstück mit seinem Volumen. Danach prüfen Sie die Liste."
+            : "Dieses Gerät hat keinen LiDAR-Sensor. Wir nehmen Fotos auf und ermitteln die Volumen anschließend für Sie."
+        introStart.setTitle(canMeasure ? "Erfassung starten" : "Aufnahme starten", for: .normal)
     }
 
-    private func setAcceptEnabled(_ enabled: Bool) {
-        hudAccept.isEnabled = enabled
-        hudAccept.alpha = enabled ? 1.0 : 0.35
+    // MARK: - Sweeping feedback
+
+    /// Live count during the sweep. Objects appear as they are found, which is
+    /// the only honest progress signal — nothing here knows how big the room is.
+    func updateSweep(objectCount: Int, totalVolume: Float) {
+        sweepStats.text = objectCount == 0
+            ? "suche…"
+            : String(format: "%d Objekte · %.1f m³", objectCount, totalVolume)
+        updateItemCount(objectCount)
     }
 
-    /// Position the L/B/H readouts over the box edges they belong to. Labels are
-    /// pooled — the tag count changes every frame as edges rotate out of view.
+    /// Dimension readouts for the selected object, pinned to its box edges.
     func updateDimensionTags(_ tags: [DimensionTag]) {
         while dimLabels.count < tags.count {
             let label = UILabel()
@@ -2476,9 +1356,9 @@ private class ScanOverlayView: UIView {
             label.textColor = .white
             label.textAlignment = .center
             label.backgroundColor = UIColor.black.withAlphaComponent(0.72)
-            label.layer.cornerRadius = 11
+            label.layer.cornerRadius = 9
             label.clipsToBounds = true
-            hud.addSubview(label)
+            addSubview(label)
             dimLabels.append(label)
         }
         for (i, label) in dimLabels.enumerated() {
@@ -2486,103 +1366,82 @@ private class ScanOverlayView: UIView {
             let tag = tags[i]
             label.isHidden = false
             label.text = tag.text
-            let size = CGSize(width: 92, height: 22)
+            let size = CGSize(width: 88, height: 24)
             label.frame = CGRect(x: tag.point.x - size.width / 2,
                                  y: tag.point.y - size.height / 2,
                                  width: size.width, height: size.height)
         }
     }
 
-    /// Light up the segmented object and dim everything else. A nil mask clears
-    /// both layers.
-    ///
-    /// The mask is the actual set of measured pixels, not the outline of the
-    /// box: what the customer sees lit up is exactly what is in the volume, so
-    /// a missing fan pole or a bed that crept in is visible while it is still
-    /// fixable.
-    func updateFocusSilhouette(_ mask: UIBezierPath?) {
-        guard let mask, !mask.isEmpty else {
-            focusScrim.isHidden = true
-            maskTint.isHidden = true
+    // MARK: - Results
+
+    func showResults(_ newRows: [ResultRow]) {
+        for row in rows { row.removeFromSuperview() }
+        rows = newRows.map { row in
+            let view = ResultRowView(row: row)
+            view.onTap = { [weak self] id in self?.rowTapped(id) }
+            view.onRename = { [weak self] id, text in self?.onRename?(id, text) }
+            resultsScroll.addSubview(view)
+            return view
+        }
+        let total = newRows.reduce(Float(0)) { $0 + $1.volumeM3 }
+        resultsTitle.text = newRows.isEmpty
+            ? "Nichts gefunden"
+            : (newRows.count == 1 ? "1 Objekt gefunden" : "\(newRows.count) Objekte gefunden")
+        totalLabel.text = String(format: "Gesamt %.1f m³", total)
+        submitBtn.isEnabled = !newRows.isEmpty
+        submitBtn.alpha = newRows.isEmpty ? 0.4 : 1
+        updateItemCount(newRows.count)
+        applySelection()
+        setNeedsLayout()
+    }
+
+    /// Highlight one row from the outside — used when the plugin re-selects
+    /// after a merge or a split.
+    func selectRow(_ id: Int?) {
+        selectedID = id
+        applySelection()
+    }
+
+    private func rowTapped(_ id: Int) {
+        if mergePending, let first = selectedID, first != id {
+            mergePending = false
+            onMerge?(first, id)
             return
         }
-        let scrim = UIBezierPath(rect: bounds)
-        scrim.append(mask)
-        // No implicit animation: the mask has to track the object
-        // frame-for-frame, and a quarter-second default animation on every
-        // update reads as lag.
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        focusScrim.path = scrim.cgPath
-        focusScrim.isHidden = false
-        maskTint.path = mask.cgPath
-        maskTint.isHidden = false
-        CATransaction.commit()
+        mergePending = false
+        selectedID = (selectedID == id) ? nil : id
+        applySelection()
+        onSelect?(selectedID ?? -1)
     }
+
+    private func applySelection() {
+        for row in rows { row.isSelected = row.id == selectedID }
+        let hadBar = actionBar.isHidden
+        actionBar.isHidden = selectedID == nil
+        splitBtn.isEnabled = !mergePending
+        mergeBtn.setTitle(mergePending ? "Zweites wählen…" : "Zusammenfassen", for: .normal)
+        if hadBar != actionBar.isHidden { setNeedsLayout() }
+    }
+
+    /// The id the plugin should act on, or nil.
+    var selection: Int? { selectedID }
 
     // MARK: - Toast
 
-    /// Brief, non-blocking notice. Used when the measurement restarts on a
-    /// different object — the customer needs to know it happened, but stopping
-    /// them to confirm it would be worse than the restart itself.
     func showToast(_ text: String) {
-        toastLabel.text = text
         toastHideWork?.cancel()
+        toastLabel.text = text
         bringSubviewToFront(toastLabel)
-        UIView.animate(withDuration: 0.2) { self.toastLabel.alpha = 1 }
-        let work = DispatchWorkItem { [weak self] in
-            UIView.animate(withDuration: 0.3) { self?.toastLabel.alpha = 0 }
-        }
+        UIView.animate(withDuration: 0.18) { self.toastLabel.alpha = 1 }
+        let work = DispatchWorkItem { [weak self] in self?.hideToast() }
         toastHideWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.4, execute: work)
     }
 
     func hideToast() {
         toastHideWork?.cancel()
-        guard toastLabel.alpha > 0 else { return }
-        UIView.animate(withDuration: 0.25) { self.toastLabel.alpha = 0 }
-    }
-
-    // MARK: - Review
-
-    /// Present the finished measurement for confirmation. `volumeM3 == nil` means
-    /// the sweep produced no usable measurement (or the device has no LiDAR) —
-    /// the photos are still worth keeping, the backend estimates from them.
-    func showReview(volumeM3: Float?, dims: [Float]?, suggestedLabel: String, measurable: Bool) {
-        if let v = volumeM3 {
-            reviewTitle.text = "GEMESSENES VOLUMEN"
-            reviewVolume.text = "≈ \(Self.formatVolume(v)) m³"
-            reviewVolume.textColor = Self.navy
-            if let d = dims, d.count == 3 {
-                reviewDims.text = "\(Self.formatCm(d[0])) × \(Self.formatCm(d[1])) × \(Self.formatCm(d[2])) cm  ·  inkl. Ladespielraum"
-            } else {
-                reviewDims.text = "inkl. Ladespielraum"
-            }
-            reviewSave.setTitle("Sichern", for: .normal)
-        } else if measurable {
-            reviewTitle.text = "MESSUNG UNVOLLSTÄNDIG"
-            reviewVolume.text = "Kein Volumen"
-            reviewVolume.textColor = Self.orange
-            reviewDims.text = "Erneut messen — oder die Maße von Hand eintragen."
-            reviewSave.setTitle("Trotzdem sichern", for: .normal)
-        } else {
-            reviewTitle.text = "AUFNAHME GESPEICHERT"
-            reviewVolume.text = "Fotos erfasst"
-            reviewVolume.textColor = Self.navy
-            reviewDims.text = "Dieses Gerät misst nicht — wir berechnen das Volumen aus den Fotos."
-            reviewSave.setTitle("Sichern", for: .normal)
-        }
-        reviewField.text = suggestedLabel
-
-        setState(.review)
-        reviewCard.isHidden = false
-        presentCard(reviewCard)
-    }
-
-    func showSavedFlash(label: String, volumeM3: Float? = nil) {
-        flashLabel.text = volumeM3.map { "≈ \(Self.formatVolume($0)) m³" } ?? "Gespeichert"
-        flashSub.text = label.isEmpty ? "wird automatisch benannt" : label
-        setState(.itemSaved)
+        UIView.animate(withDuration: 0.2) { self.toastLabel.alpha = 0 }
     }
 
     // MARK: - Manual entry
@@ -2590,139 +1449,89 @@ private class ScanOverlayView: UIView {
     func showManualEntry(suggestedLabel: String) {
         manualName.text = suggestedLabel
         manualL.text = ""; manualW.text = ""; manualH.text = ""; manualVolume.text = ""
-        manualMode.selectedSegmentIndex = 0
-        updateManualMode()
+        for f in [manualL, manualW, manualH, manualVolume] { f.layer.borderWidth = 0 }
         setState(.manual)
-        manualCard.isHidden = false
-        presentCard(manualCard)
-    }
-
-    private func presentCard(_ card: UIView) {
-        // Lay out first: on the very first present the card still has a zero
-        // frame, and sliding in from zero is just a pop.
-        layoutIfNeeded()
-        card.transform = CGAffineTransform(translationX: 0, y: card.bounds.height)
-        UIView.animate(withDuration: 0.28) { card.transform = .identity }
+        manualCard.transform = CGAffineTransform(translationX: 0, y: manualCard.bounds.height)
+        UIView.animate(withDuration: 0.28, delay: 0, usingSpringWithDamping: 0.86,
+                       initialSpringVelocity: 0.4, options: [.curveEaseOut]) {
+            self.manualCard.transform = .identity
+        }
     }
 
     @objc private func manualModeChanged() { updateManualMode() }
 
     private func updateManualMode() {
-        let byDims = manualMode.selectedSegmentIndex == 0
-        manualL.isHidden = !byDims
-        manualW.isHidden = !byDims
-        manualH.isHidden = !byDims
-        manualVolume.isHidden = byDims
-        manualHint.text = byDims
-            ? "Außenmaße in Zentimetern. Ladespielraum rechnen wir dazu."
-            : "Volumen in Kubikmetern, so wie Sie es angeben."
-    }
-
-    /// Accepts both German and English decimal separators — the numeric keypad
-    /// shows whichever the device locale prefers.
-    private static func parseNumber(_ text: String?) -> Float? {
-        guard let raw = text?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
-        return Float(raw.replacingOccurrences(of: ",", with: "."))
-    }
-
-    // MARK: - Private
-
-    private func updateHint() {
-        guard state == .idle else { return }
-        if !canMeasure {
-            hintLabel.text = "  Objekt in den Rahmen nehmen und aufnehmen  "
-        } else if itemCount == 0 {
-            hintLabel.text = "  Objekt in den Rahmen nehmen und messen  "
-        } else {
-            hintLabel.text = "  Nächstes Objekt messen oder abschließen  "
-        }
-    }
-
-    /// German decimals: 1.4 m³ reads as "1,4".
-    private static func formatVolume(_ v: Float) -> String {
-        String(format: "%.1f", v).replacingOccurrences(of: ".", with: ",")
-    }
-
-    private static func formatCm(_ m: Float) -> String {
-        String(Int((m * 100).rounded()))
+        let dimsMode = manualMode.selectedSegmentIndex == 0
+        manualL.isHidden = !dimsMode
+        manualW.isHidden = !dimsMode
+        manualH.isHidden = !dimsMode
+        manualVolume.isHidden = dimsMode
+        manualHint.text = dimsMode
+            ? "Wir rechnen Packmaß und Ladevolumen automatisch dazu."
+            : "Das Volumen übernehmen wir genau so, wie Sie es eintragen."
     }
 
     // MARK: - Keyboard
 
     @objc private func keyboardWillChange(_ note: Notification) {
-        guard let card = activeCard,
-              let frameValue = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue
-        else { return }
-        // Lift the card just enough to keep its buttons above the keyboard.
-        let keyboardTop = bounds.height - frameValue.cgRectValue.height
-        let cardBottom = card.frame.maxY + cardKeyboardShift
-        cardKeyboardShift = max(0, cardBottom - keyboardTop + 12)
+        guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+        let overlap = max(0, bounds.height - frame.origin.y)
+        cardKeyboardShift = -overlap * 0.86
         animateCardShift()
     }
 
     @objc private func keyboardWillHide(_ note: Notification) {
-        guard cardKeyboardShift != 0 else { return }
         cardKeyboardShift = 0
         animateCardShift()
     }
 
-    private var activeCard: UIView? {
-        switch state {
-        case .review: return reviewCard
-        case .manual: return manualCard
-        default: return nil
-        }
-    }
-
     private func animateCardShift() {
-        setNeedsLayout()
-        UIView.animate(withDuration: 0.25) { self.layoutIfNeeded() }
+        UIView.animate(withDuration: 0.24) {
+            self.setNeedsLayout()
+            self.layoutIfNeeded()
+        }
     }
 
     // MARK: - Actions
 
     @objc private func closeTapped() { onClose?() }
-    @objc private func finishTapped() { onFinish?() }
-    @objc private func measureTapped() { onMeasureRequested?() }
-    @objc private func cancelMeasurementTapped() { onCancelMeasurement?() }
-    @objc private func acceptEarlyTapped() { onAcceptEarly?() }
+    @objc private func startSweepTapped() { onStartSweep?() }
+    @objc private func finishSweepTapped() { onFinishSweep?() }
+    @objc private func submitTapped() { endEditing(true); onSubmit?() }
     @objc private func manualTapped() { onManualRequested?() }
     @objc private func manualCancelTapped() { endEditing(true); onManualCancel?() }
+    @objc private func deleteTapped() { onDelete?() }
+    @objc private func splitTapped() { onSplit?() }
 
-    @objc private func saveTapped() {
-        endEditing(true)
-        onSaveItem?(reviewField.text?.trimmingCharacters(in: .whitespaces) ?? "")
-    }
-
-    @objc private func remeasureTapped() {
-        endEditing(true)
-        onRemeasure?()
+    /// Merging needs two objects, so the first tap arms it and the next row tap
+    /// completes it. Anything else — including tapping the same row again —
+    /// disarms, because a half-armed mode the customer forgot about is how you
+    /// end up merging a wardrobe into a lamp.
+    @objc private func mergeTapped() {
+        guard selectedID != nil else { return }
+        mergePending.toggle()
+        applySelection()
+        if mergePending { showToast("Zweites Objekt antippen") } else { hideToast() }
     }
 
     @objc private func manualSaveTapped() {
         endEditing(true)
         let label = manualName.text?.trimmingCharacters(in: .whitespaces) ?? ""
-
+        func number(_ field: UITextField) -> Float? {
+            let text = (field.text ?? "").replacingOccurrences(of: ",", with: ".")
+            guard let value = Float(text), value > 0 else { return nil }
+            return value
+        }
         if manualMode.selectedSegmentIndex == 0 {
-            guard let l = Self.parseNumber(manualL.text),
-                  let b = Self.parseNumber(manualW.text),
-                  let hh = Self.parseNumber(manualH.text),
-                  l > 0, b > 0, hh > 0 else {
+            guard let l = number(manualL), let w = number(manualW), let h = number(manualH) else {
                 flagManual([manualL, manualW, manualH])
                 return
             }
-            let dims = simd_float3(l / 100, b / 100, hh / 100)
-            // Same packing factor the measured path applies, so a typed sofa and
-            // a scanned sofa price the same.
-            let volume = dims.x * dims.y * dims.z * VolumeAccumulator.packingFactor
-            guard volume.isFinite, volume >= 0.005, volume <= 12.0 else {
-                flagManual([manualL, manualW, manualH])
-                return
-            }
+            let dims = simd_float3(l / 100, w / 100, h / 100)
+            let volume = dims.x * dims.y * dims.z * RoomScanner.packingFactor
             onManualSubmit?(ManualEntry(label: label, volumeM3: volume, dims: dims))
         } else {
-            guard let v = Self.parseNumber(manualVolume.text),
-                  v.isFinite, v >= 0.005, v <= 12.0 else {
+            guard let v = number(manualVolume) else {
                 flagManual([manualVolume])
                 return
             }
@@ -2730,27 +1539,20 @@ private class ScanOverlayView: UIView {
         }
     }
 
-    /// Nudge the offending fields rather than throwing up an alert.
     private func flagManual(_ fields: [UITextField]) {
-        for field in fields where !field.isHidden {
-            field.layer.borderColor = Self.orange.cgColor
-            field.layer.borderWidth = 1.5
+        for f in fields where (f.text ?? "").isEmpty || Float((f.text ?? "").replacingOccurrences(of: ",", with: ".")) == nil {
+            f.layer.borderWidth = 1.5
+            f.layer.borderColor = UIColor.systemRed.cgColor
         }
-        UIView.animate(withDuration: 0.25, delay: 1.4, options: []) {
-            for field in fields { field.layer.borderWidth = 0 }
-        }
+        showToast("Bitte gültige Zahlen eintragen")
     }
 
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
-        guard let card = activeCard else { return }
-        // Tapping outside the open card just dismisses the keyboard.
-        if !card.frame.contains(gesture.location(in: self)) { endEditing(true) }
+        let point = gesture.location(in: self)
+        if state == .manual, !manualCard.frame.contains(point) { endEditing(true) }
+        if state == .results, !resultsCard.frame.contains(point) { endEditing(true) }
     }
-}
 
-// MARK: - UITextFieldDelegate
-
-extension ScanOverlayView: UITextFieldDelegate {
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
         textField.resignFirstResponder()
         return true
