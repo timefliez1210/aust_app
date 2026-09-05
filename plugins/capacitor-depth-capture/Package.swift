@@ -3,8 +3,9 @@ import PackageDescription
 
 let package = Package(
     name: "CapacitorDepthCapture",
-    // 16, to match the podspec: ARPlaneAnchor.planeExtent is iOS 16+.
-    platforms: [.iOS(.v16)],
+    // Must stay at 15: the app target Capacitor generates for SPM is iOS 15,
+    // and a higher floor here fails the whole build.
+    platforms: [.iOS(.v15)],
     products: [
         .library(
             name: "CapacitorDepthCapture",

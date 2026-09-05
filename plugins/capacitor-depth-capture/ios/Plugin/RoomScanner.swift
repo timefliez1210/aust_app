@@ -65,8 +65,15 @@ private struct RoomPlane {
     init(anchor: ARPlaneAnchor) {
         inverse = simd_inverse(anchor.transform)
         center = anchor.center
-        halfWidth = anchor.planeExtent.width / 2
-        halfHeight = anchor.planeExtent.height / 2
+        // `planeExtent` is iOS 16, and the SPM app target Capacitor generates
+        // is iOS 15 — so the deprecated `extent` still has to carry the floor.
+        if #available(iOS 16.0, *) {
+            halfWidth = anchor.planeExtent.width / 2
+            halfHeight = anchor.planeExtent.height / 2
+        } else {
+            halfWidth = anchor.extent.x / 2
+            halfHeight = anchor.extent.z / 2
+        }
     }
 
     /// True when `p` lies on this plane's surface, within its footprint.
