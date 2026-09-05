@@ -534,16 +534,14 @@ public class DepthCapturePlugin: CAPPlugin, CAPBridgedPlugin {
         removeBoxNodes()
         var selected: (node: SCNNode, dims: simd_float3)?
         for object in objects where object.hasGeometry {
-            let selected = object.id == selectedObjectID
-            let node = makeBoxNode(selected: selected)
+            let isSelected = object.id == selectedObjectID
+            let node = makeBoxNode(selected: isSelected)
             node.simdPosition = object.box.center
             node.simdOrientation = simd_quatf(angle: object.box.yaw, axis: simd_float3(0, 1, 0))
             node.scale = SCNVector3(object.box.dims.x, object.box.dims.z, object.box.dims.y)
             arView.scene.rootNode.addChildNode(node)
             boxNodes[object.id] = node
-            if selected == nil, object.id == selectedObjectID {
-                selected = (node, object.box.dims)
-            }
+            if isSelected, selected == nil { selected = (node, object.box.dims) }
         }
         selectedBox = selected
     }
