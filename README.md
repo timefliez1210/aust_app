@@ -1,42 +1,44 @@
-# sv
+# app — Mobile Customer Scan App
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+SvelteKit + Capacitor mobile app for iOS/Android. Customers scan their
+furniture and get a moving quote; see [AGENTS.md](AGENTS.md) for the capture
+architecture, routes, and constraints.
 
-## Creating a project
-
-If you're seeing this, you've probably already done this step. Congrats!
-
-```sh
-# create a new project
-npx sv create my-app
-```
-
-To recreate this project with the same configuration:
-
-```sh
-# recreate this project
-npx sv create --template minimal --types ts --no-install alex_aust_app
-```
+This directory is a git submodule of `aust_backend`
+(`git@github.com:timefliez1210/aust_app.git`) — a change here needs a commit in
+this submodule *and* a submodule-pointer commit in the parent repo.
 
 ## Developing
 
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
+```sh
+npm install
+npm run dev              # vite dev server (web capture flow only — no ARKit)
+```
+
+## Type-checking
 
 ```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
+npm run check
 ```
 
 ## Building
 
-To create a production version of your app:
-
 ```sh
 npm run build
+npm run preview           # preview the production web build
 ```
 
-You can preview the production build with `npm run preview`.
+The web build only exercises the Android/web in-page capture flow. Native iOS
+capture (`plugins/capacitor-depth-capture/`) requires the Capacitor iOS project
+and a real device with LiDAR to test meaningfully — Xcode builds happen in CI
+(Codemagic and `.github/workflows/mobile.yml`), not locally. See
+[AGENTS.md](AGENTS.md) for current CI status.
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+## Native projects
+
+The `ios/`/`android/` Capacitor projects are generated, not committed:
+
+```sh
+npx cap add ios
+npx cap sync
+```
