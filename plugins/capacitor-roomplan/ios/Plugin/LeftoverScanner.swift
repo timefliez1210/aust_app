@@ -167,9 +167,12 @@ final class LeftoverScanner {
                 let d = depth[i]
                 guard d > 0.3, d < 4.0 else { continue }
                 // Pixel rays are y-down / z-forward; ARKit's camera is y-up / z-back.
-                let local = simd_float4((Float(u) - cx) / fx * d, -(Float(v) - cy) / fy * d, -d, 1)
-                let p = transform * local
-                let cell = Self.cell(simd_float3(p.x, p.y, p.z), Self.voxel)
+                let x: Float = (Float(u) - cx) / fx * d
+                let y: Float = -(Float(v) - cy) / fy * d
+                let local = simd_float4(x, y, -d, 1)
+                let p: simd_float4 = transform * local
+                let world = simd_float3(p.x, p.y, p.z)
+                let cell = Self.cell(world, Self.voxel)
                 let n = depthHits[cell] ?? 0
                 if n < .max { depthHits[cell] = n + 1 }
             }
@@ -221,9 +224,12 @@ final class LeftoverScanner {
                 points = Self.meshPoints(meshes)
                 diagnostics["source"] = "mesh"
             } else if !self.depthHits.isEmpty {
-                points = self.depthHits.compactMap { cell, hits in
-                    hits >= Self.minDepthHits ? (simd_float3(cell) + 0.5) * Self.voxel : nil
+                var fused: [simd_float3] = []
+                for (cell, hits) in self.depthHits where hits >= Self.minDepthHits {
+                    let corner = simd_float3(Float(cell.x), Float(cell.y), Float(cell.z))
+                    fused.append((corner + simd_float3(repeating: 0.5)) * Self.voxel)
                 }
+                points = fused
                 diagnostics["source"] = "depth"
             } else {
                 points = []
@@ -253,7 +259,7 @@ final class LeftoverScanner {
             let reason: String?
             if min(box.dims.x, box.dims.y, box.dims.z) < Self.minSide {
                 reason = "tiny"
-            } else if box.dims.x * box.dims.y * box.dims.z > Self.maxBoxVolume {
+            } else if box.volume > Self.maxBoxVolume {
                 reason = "huge"
             } else if let floor = geometry.floorY, box.bottom > floor + Self.maxBottomAboveFloor {
                 reason = "hanging"
@@ -267,8 +273,9 @@ final class LeftoverScanner {
         }
         diagnostics["rejected"] = rejections
 
-        let accepted = boxes.filter { !$0.rejected }.map(\.box)
-            .sorted { $0.dims.x * $0.dims.y * $0.dims.z > $1.dims.x * $1.dims.y * $1.dims.z }
+        var accepted: [Box] = []
+        for entry in boxes where !entry.rejected { accepted.append(entry.box) }
+        accepted.sort { (a: Box, b: Box) -> Bool in a.volume > b.volume }
         return accepted.enumerated().map { index, box in
             Leftover(dims: box.dims, imageBase64: index < Self.maxPhotos ? photo(of: box) : nil)
         }
@@ -287,25 +294,32 @@ final class LeftoverScanner {
             var hi = -lo
             var visible = true
             for c in corners {
-                let p = view * simd_float4(c, 1)
+                let p: simd_float4 = view * simd_float4(c, 1)
                 guard p.z < -0.2 else { visible = false; break }
-                let uv = simd_float2(frame.fx * p.x / -p.z + frame.cx, frame.fy * -p.y / -p.z + frame.cy)
+                let depth: Float = -p.z
+                let u: Float = frame.fx * p.x / depth + frame.cx
+                let v: Float = frame.fy * -p.y / depth + frame.cy
+                let uv = simd_float2(u, v)
                 lo = simd_min(lo, uv); hi = simd_max(hi, uv)
             }
             guard visible else { continue }
 
-            let area = (hi.x - lo.x) * (hi.y - lo.y)
+            let extent: simd_float2 = hi - lo
+            let area: Float = extent.x * extent.y
             guard area > 1 else { continue }
-            let clipLo = simd_max(lo, .zero)
-            let clipHi = simd_min(hi, simd_float2(frame.width, frame.height))
-            let inside = max(0, clipHi.x - clipLo.x) * max(0, clipHi.y - clipLo.y) / area
+            let imageSize = simd_float2(frame.width, frame.height)
+            let clipLo: simd_float2 = simd_max(lo, simd_float2(0, 0))
+            let clipHi: simd_float2 = simd_min(hi, imageSize)
+            let clipped: simd_float2 = simd_max(clipHi - clipLo, simd_float2(0, 0))
+            let inside: Float = clipped.x * clipped.y / area
             guard inside > 0.6 else { continue }
 
-            let center = (lo + hi) / 2
-            let offset = simd_length((center - simd_float2(frame.width, frame.height) / 2)
-                                     / simd_float2(frame.width, frame.height))
-            let distance = -(view * simd_float4(box.center, 1)).z
-            let score = inside - offset - 0.3 * abs(log(max(distance, 0.1) / 1.8))
+            let center: simd_float2 = (lo + hi) * 0.5
+            let offset: Float = simd_length((center - imageSize * 0.5) / imageSize)
+            let boxInView: simd_float4 = view * simd_float4(box.center, 1)
+            let distance: Float = max(-boxInView.z, 0.1)
+            let framing: Float = abs(log(distance / 1.8))
+            let score: Float = inside - offset - 0.3 * framing
             if best == nil || score > best!.score {
                 let rect = CGRect(x: CGFloat(lo.x), y: CGFloat(lo.y),
                                   width: CGFloat(hi.x - lo.x), height: CGFloat(hi.y - lo.y))
@@ -408,31 +422,34 @@ private struct RoomGeometry {
 
     init(room: CapturedRoom, points: [simd_float3]) {
         func slab(_ s: CapturedRoom.Surface) -> Slab {
-            Slab(inverse: simd_inverse(s.transform), half: simd_float2(s.dimensions.x, s.dimensions.y) / 2)
+            let half = simd_float2(s.dimensions.x, s.dimensions.y) * 0.5
+            return Slab(inverse: simd_inverse(s.transform), half: half)
         }
         walls = room.walls.map(slab)
         slabs = (room.walls + room.doors + room.windows + room.openings).map(slab)
-        solids = room.objects.map { Solid(inverse: simd_inverse($0.transform), half: $0.dimensions / 2) }
+        solids = room.objects.map { (o: CapturedRoom.Object) -> Solid in
+            Solid(inverse: simd_inverse(o.transform), half: o.dimensions * 0.5)
+        }
 
         var floor: Float? = nil
         if #available(iOS 17.0, *), !room.floors.isEmpty {
-            floor = room.floors.map { $0.transform.columns.3.y }.min()
+            floor = room.floors.map { (f: CapturedRoom.Surface) -> Float in f.transform.columns.3.y }.min()
         }
         if floor == nil, !room.walls.isEmpty {
-            floor = room.walls.map { $0.transform.columns.3.y - $0.dimensions.y / 2 }.min()
+            floor = room.walls.map { (w: CapturedRoom.Surface) -> Float in w.transform.columns.3.y - w.dimensions.y * 0.5 }.min()
         }
         if floor == nil, !points.isEmpty {
-            let ys = points.map(\.y).sorted()
+            let ys: [Float] = points.map { (p: simd_float3) -> Float in p.y }.sorted()
             floor = ys[ys.count / 50]
         }
         floorY = floor
-        ceilingY = room.walls.isEmpty ? nil : room.walls.map { $0.transform.columns.3.y + $0.dimensions.y / 2 }.max()
+        ceilingY = room.walls.map { (w: CapturedRoom.Surface) -> Float in w.transform.columns.3.y + w.dimensions.y * 0.5 }.max()
 
-        outline = room.walls.map { wall in
-            let c = wall.transform.columns.3
-            let axis = wall.transform.columns.0
-            let h = wall.dimensions.x / 2
-            return (simd_float2(c.x - axis.x * h, c.z - axis.z * h), simd_float2(c.x + axis.x * h, c.z + axis.z * h))
+        outline = room.walls.map { (wall: CapturedRoom.Surface) -> (simd_float2, simd_float2) in
+            let c = simd_float2(wall.transform.columns.3.x, wall.transform.columns.3.z)
+            let axis = simd_float2(wall.transform.columns.0.x, wall.transform.columns.0.z)
+            let reach: simd_float2 = axis * (wall.dimensions.x * 0.5)
+            return (c - reach, c + reach)
         }
     }
 
@@ -448,7 +465,9 @@ private struct RoomGeometry {
         }
         for o in solids {
             let l = o.inverse * h
-            if simd_reduce_max(simd_abs(simd_float3(l.x, l.y, l.z)) - o.half) < LeftoverScanner.objectMargin { return true }
+            let local = simd_abs(simd_float3(l.x, l.y, l.z))
+            let beyond: simd_float3 = local - o.half
+            if simd_reduce_max(beyond) < LeftoverScanner.objectMargin { return true }
         }
         return !inside(simd_float2(p.x, p.z))
     }
@@ -460,7 +479,8 @@ private struct RoomGeometry {
         guard outline.count >= 3 else { return true }
         var crossings = 0
         for (a, b) in outline where (a.y > q.y) != (b.y > q.y) {
-            let x = a.x + (q.y - a.y) / (b.y - a.y) * (b.x - a.x)
+            let t: Float = (q.y - a.y) / (b.y - a.y)
+            let x: Float = a.x + t * (b.x - a.x)
             if x > q.x { crossings += 1 }
         }
         return crossings % 2 == 1
@@ -516,15 +536,21 @@ private struct Box {
     let lengthAxis: simd_float2
     let widthAxis: simd_float2
 
-    var bottom: Float { center.y - dims.z / 2 }
+    var bottom: Float { center.y - dims.z * 0.5 }
+
+    /// Geometric volume in m³, without packing factor.
+    var volume: Float { dims.x * dims.y * dims.z }
 
     var corners: [simd_float3] {
         var result: [simd_float3] = []
         for a in [-0.5, 0.5] as [Float] {
             for b in [-0.5, 0.5] as [Float] {
                 for c in [-0.5, 0.5] as [Float] {
-                    let xz = lengthAxis * dims.x * a + widthAxis * dims.y * b
-                    result.append(center + simd_float3(xz.x, dims.z * c, xz.y))
+                    let along: simd_float2 = lengthAxis * (dims.x * a)
+                    let across: simd_float2 = widthAxis * (dims.y * b)
+                    let xz: simd_float2 = along + across
+                    let offset = simd_float3(xz.x, dims.z * c, xz.y)
+                    result.append(center + offset)
                 }
             }
         }
@@ -537,7 +563,7 @@ private struct Box {
     /// the customer walked past twice.
     static func fit(_ points: [simd_float3]) -> Box? {
         guard points.count >= 8 else { return nil }
-        let ys = points.map(\.y).sorted()
+        let ys: [Float] = points.map { (p: simd_float3) -> Float in p.y }.sorted()
         let loY = ys[Int(Float(ys.count - 1) * 0.01)]
         let hiY = ys[Int(Float(ys.count - 1) * 0.99)]
         guard hiY - loY > 0.03 else { return nil }
@@ -565,9 +591,12 @@ private struct Box {
 
         let normal = simd_float2(-best.axis.y, best.axis.x)
         let da = best.a.1 - best.a.0, db = best.b.1 - best.b.0
-        let mid = best.axis * (best.a.0 + best.a.1) / 2 + normal * (best.b.0 + best.b.1) / 2
+        let midA: simd_float2 = best.axis * ((best.a.0 + best.a.1) * 0.5)
+        let midB: simd_float2 = normal * ((best.b.0 + best.b.1) * 0.5)
+        let mid: simd_float2 = midA + midB
         let longIsA = da >= db
-        return Box(center: simd_float3(mid.x, (loY + hiY) / 2, mid.y),
+        let midY: Float = (loY + hiY) * 0.5
+        return Box(center: simd_float3(mid.x, midY, mid.y),
                    dims: simd_float3(max(da, db), min(da, db), hiY - loY),
                    lengthAxis: longIsA ? best.axis : normal,
                    widthAxis: longIsA ? normal : best.axis)
@@ -575,11 +604,13 @@ private struct Box {
 
     /// Convex hull of the x/z footprint (Andrew's monotone chain).
     private static func hullXZ(_ points: [simd_float3]) -> [simd_float2] {
-        let input = points.map { simd_float2($0.x, $0.z) }
-            .sorted { $0.x == $1.x ? $0.y < $1.y : $0.x < $1.x }
+        var input: [simd_float2] = points.map { (p: simd_float3) -> simd_float2 in simd_float2(p.x, p.z) }
+        input.sort { (a: simd_float2, b: simd_float2) -> Bool in a.x == b.x ? a.y < b.y : a.x < b.x }
         guard input.count >= 3 else { return input }
         func cross(_ o: simd_float2, _ a: simd_float2, _ b: simd_float2) -> Float {
-            (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+            let oa: simd_float2 = a - o
+            let ob: simd_float2 = b - o
+            return oa.x * ob.y - oa.y * ob.x
         }
         var hull: [simd_float2] = []
         for p in input {
