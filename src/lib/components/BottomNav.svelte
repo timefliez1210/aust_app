@@ -7,7 +7,7 @@
   const tabs = $derived([
     { href: '/', icon: House, label: 'Start', active: $page.url.pathname === '/', badge: false },
     {
-      href: capture.itemCount > 0 ? '/scan/resume' : '/scan',
+      href: '/scan',
       icon: Camera,
       label: 'Scan',
       active: $page.url.pathname.startsWith('/scan'),

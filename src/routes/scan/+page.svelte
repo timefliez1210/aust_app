@@ -1,467 +1,331 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { Capacitor } from '@capacitor/core';
-  import { capture } from '$lib/stores/capture.svelte';
-  import { DepthCapture } from '$lib/plugins/depth-capture';
-  import { tapHaptic, successHaptic } from '$lib/haptics';
-  import { X, Camera, Check, Plus, CircleAlert } from 'lucide-svelte';
+  import NavBar from '$lib/components/NavBar.svelte';
+  import Sheet from '$lib/components/Sheet.svelte';
+  import ItemSheet from '$lib/components/ItemSheet.svelte';
+  import { capture, MAX_BOXES, type NewItem, type Room, type StoredItem } from '$lib/stores/capture.svelte';
+  import { canScanRooms, movableObjects, RoomPlan } from '$lib/plugins/roomplan';
+  import { tapHaptic, successHaptic, errorHaptic } from '$lib/haptics';
+  import { Box, Camera, ChevronRight, CircleAlert, Minus, Plus, ScanLine, Package, X } from 'lucide-svelte';
 
-  // ── Mode ──────────────────────────────────────────────────────────────────
-  // iOS: fully native ARKit session (WebView hidden by the plugin).
-  // Android/web: guided in-page photo capture — same data shape, no depth/poses;
-  // the backend estimates volume server-side (VLM).
-  let mode: 'native' | 'web' | 'detecting' = $state('detecting');
-  let cameraError: string | null = $state(null);
+  const roomPresets = ['Wohnzimmer', 'Schlafzimmer', 'Küche', 'Kinderzimmer', 'Arbeitszimmer', 'Esszimmer', 'Flur', 'Bad', 'Keller', 'Dachboden', 'Garage', 'Balkon'];
 
-  // ── Native session ────────────────────────────────────────────────────────
-  let completeHandle: any;
-  let cancelHandle: any;
-  let savedHandle: any;
+  /** null until known; LiDAR iPhones scan rooms, everything else enters items by hand. */
+  let canScan: boolean | null = $state(null);
+  let scanningRoomId: string | null = $state(null);
+  let notice: { tone: 'error' | 'info'; text: string } | null = $state(null);
 
-  async function startNative() {
-    completeHandle = await DepthCapture.addListener('sessionComplete', async () => {
-      const { items } = await DepthCapture.getAllItems();
-      capture.clear();
-      for (const item of items) capture.addItem(item);
-      try {
-        capture.intrinsics = await DepthCapture.getIntrinsics();
-        capture.persistIntrinsics();
-      } catch { /* non-LiDAR or intrinsics unavailable */ }
-      await DepthCapture.stopSession();
-      goto('/scan/form');
-    });
+  let addRoomOpen = $state(false);
+  let newRoomName = $state('');
+  let menuRoom: Room | null = $state(null);
+  let renameValue = $state('');
+  let confirmDelete = $state(false);
+  let itemSheet: { roomId: string; item: StoredItem | null } | null = $state(null);
 
-    cancelHandle = await DepthCapture.addListener('sessionCancelled', async () => {
-      await DepthCapture.stopSession();
-      capture.clear();
-      goto('/');
-    });
+  onMount(async () => {
+    canScan = await canScanRooms();
+  });
 
-    savedHandle = await DepthCapture.addListener('itemSaved', () => {
-      // Native overlay handles all feedback.
-    });
+  const invalid = $derived(capture.invalidItemIds);
 
-    await DepthCapture.startSession();
+  function m3(v: number) {
+    return v.toFixed(v < 1 ? 2 : 1).replace('.', ',');
   }
 
-  // ── Web/Android capture flow ─────────────────────────────────────────────
-  // Photos first, name afterwards and only if the customer wants to: the volume
-  // (here: server-side from the photos) is what matters, the label is filled in
-  // by the backend when it's missing.
-  type WebState = 'idle' | 'capturing' | 'review' | 'manual';
-  let webState: WebState = $state('idle');
-  let stream: MediaStream | null = null;
-  let videoEl: HTMLVideoElement | undefined = $state();
-  let labelInput = $state('');
-  let currentFrames: string[] = $state([]);
-  let flash = $state(false);
-  let savedFlash: string | null = $state(null);
-
-  const suggestions = ['Sofa', 'Schrank', 'Bett', 'Tisch', 'Regal', 'Waschmaschine', 'Kommode', 'Kartons'];
-
-  // ── Manual entry ─────────────────────────────────────────────────────────
-  // Escape hatch for anything the photo estimate would get badly wrong, and the
-  // web counterpart of the native "Manuell" sheet. A customer-stated volume
-  // beats a guess, so it goes into the manifest exactly like a measured one.
-  /** Loading volume includes handling space — same factor the iOS OBB applies. */
-  const PACKING_FACTOR = 1.2;
-  let manualMode: 'dims' | 'volume' = $state('dims');
-  let manualName = $state('');
-  let manualL = $state('');
-  let manualW = $state('');
-  let manualH = $state('');
-  let manualVolume = $state('');
-  let manualError: string | null = $state(null);
-
-  /** Accepts German and English decimal separators. */
-  function parseNumber(raw: string): number | null {
-    const n = Number(raw.trim().replace(',', '.'));
-    return Number.isFinite(n) && n > 0 ? n : null;
+  function roomVolume(room: Room) {
+    return room.items.reduce((s, i) => s + (i.volumeM3 ?? 0), 0);
   }
 
-  function openManual() {
-    tapHaptic();
-    manualName = labelInput;
-    manualL = ''; manualW = ''; manualH = ''; manualVolume = '';
-    manualError = null;
-    manualMode = 'dims';
-    webState = 'manual';
+  function dimsText(dimsM: number[]) {
+    return dimsM.map(d => Math.round(d * 100)).join(' × ') + ' cm';
   }
 
-  function saveManual() {
-    let volumeM3: number | null = null;
-    let dimsM: number[] | null = null;
-
-    if (manualMode === 'dims') {
-      const l = parseNumber(manualL), b = parseNumber(manualW), h = parseNumber(manualH);
-      if (l == null || b == null || h == null) {
-        manualError = 'Bitte Länge, Breite und Höhe in Zentimetern angeben.';
-        return;
-      }
-      dimsM = [l / 100, b / 100, h / 100];
-      volumeM3 = dimsM[0] * dimsM[1] * dimsM[2] * PACKING_FACTOR;
-    } else {
-      const v = parseNumber(manualVolume);
-      if (v == null) {
-        manualError = 'Bitte ein Volumen in Kubikmetern angeben, z. B. 1,2.';
-        return;
-      }
-      volumeM3 = v;
-    }
-
-    // Backend rejects the whole manifest on an out-of-range volume, so catch it here.
-    if (volumeM3 < 0.005 || volumeM3 > 12) {
-      manualError = 'Das ergibt kein plausibles Volumen (0,005 – 12 m³).';
-      return;
-    }
-
-    // Keep a photo if we have one — the backend still names unlabelled items
-    // from it, and a frameless item would break the photo↔item mapping.
-    const frames = currentFrames.length > 0 ? currentFrames : snapshotFrame();
-    successHaptic();
-    const label = manualName.trim();
-    capture.addItem({
-      label,
-      frames: frames.map(f => ({ imageBase64: f, depthMapBase64: null, pose: null })),
-      arcDegrees: 0,
-      hasDepth: false,
-      volumeM3,
-      ...(dimsM ? { dimsM } : {}),
-      deviceConfidence: 0.85,
-    });
-    savedFlash = label || 'Objekt erfasst';
-    setTimeout(() => (savedFlash = null), 1400);
-    currentFrames = [];
-    labelInput = '';
-    webState = 'idle';
-  }
-
-  /** Grab a single frame off the live preview. Empty array if the camera failed. */
-  function snapshotFrame(): string[] {
-    if (!videoEl || videoEl.videoWidth === 0) return [];
-    const maxW = 1280;
-    const scale = Math.min(1, maxW / videoEl.videoWidth);
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.round(videoEl.videoWidth * scale);
-    canvas.height = Math.round(videoEl.videoHeight * scale);
-    canvas.getContext('2d')!.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
-    return [canvas.toDataURL('image/jpeg', 0.85).split(',')[1]];
-  }
-
-  async function startWeb() {
+  async function scan(room: Room, isNew: boolean) {
+    notice = null;
+    scanningRoomId = room.id;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
-      });
-      mode = 'web';
-      // videoEl binds after render
-      requestAnimationFrame(() => {
-        if (videoEl && stream) {
-          videoEl.srcObject = stream;
-          videoEl.play().catch(() => {});
-        }
-      });
-    } catch {
-      mode = 'web';
-      cameraError = 'Kamera nicht verfügbar. Bitte erlauben Sie den Kamerazugriff in den Einstellungen.';
+      const result = await RoomPlan.scanRoom({ roomName: room.name });
+      if (result.cancelled) {
+        // Backing out of the first scan of a room just created means "never mind".
+        if (isNew && room.items.length === 0) capture.removeRoom(room.id);
+        return;
+      }
+      const found = movableObjects(result.objects);
+      capture.applyScan(room.id, found.map(o => ({
+        label: o.label,
+        source: 'scan',
+        frames: [],
+        hasDepth: true,
+        volumeM3: o.volumeM3,
+        dimsM: o.dimsM,
+        deviceConfidence: o.confidence,
+      })));
+      successHaptic();
+      if (found.length === 0) {
+        notice = { tone: 'info', text: `In „${room.name}“ wurden keine Möbel erkannt. Sie können Gegenstände von Hand hinzufügen.` };
+      }
+    } catch (e: any) {
+      errorHaptic();
+      if (isNew && room.items.length === 0) capture.removeRoom(room.id);
+      notice = {
+        tone: 'error',
+        text: e?.code === 'CAMERA_DENIED'
+          ? 'Bitte erlauben Sie den Kamerazugriff in den Einstellungen, um Räume zu scannen.'
+          : 'Der Scan hat nicht geklappt. Bitte versuchen Sie es erneut.',
+      };
+    } finally {
+      scanningRoomId = null;
     }
   }
 
-  function snap() {
-    if (!videoEl || videoEl.videoWidth === 0) return;
+  function openAddRoom() {
     tapHaptic();
-    const maxW = 1280;
-    const scale = Math.min(1, maxW / videoEl.videoWidth);
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.round(videoEl.videoWidth * scale);
-    canvas.height = Math.round(videoEl.videoHeight * scale);
-    canvas.getContext('2d')!.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
-    currentFrames = [...currentFrames, canvas.toDataURL('image/jpeg', 0.85).split(',')[1]];
-    flash = true;
-    setTimeout(() => (flash = false), 120);
+    newRoomName = '';
+    addRoomOpen = true;
   }
 
-  function startItem() {
+  function createRoom(withScan: boolean) {
+    const name = newRoomName.trim();
+    if (!name) return;
     tapHaptic();
-    currentFrames = [];
-    labelInput = '';
-    webState = 'capturing';
+    addRoomOpen = false;
+    const room = capture.addRoom(name);
+    if (withScan) scan(room, true);
+    else itemSheet = { roomId: room.id, item: null };
   }
 
-  function reviewItem() {
-    if (currentFrames.length === 0) return;
+  function openRoomMenu(room: Room) {
     tapHaptic();
-    webState = 'review';
+    menuRoom = room;
+    renameValue = room.name;
+    confirmDelete = false;
   }
 
-  /** Save the item. An empty label is fine — the backend names it from the photos. */
-  function saveItem() {
-    if (currentFrames.length === 0) return;
-    successHaptic();
-    const label = labelInput.trim();
-    capture.addItem({
-      label,
-      frames: currentFrames.map(f => ({ imageBase64: f, depthMapBase64: null, pose: null })),
-      arcDegrees: 0,
-      hasDepth: false,
-    });
-    savedFlash = label || 'Objekt erfasst';
-    setTimeout(() => (savedFlash = null), 1400);
-    currentFrames = [];
-    labelInput = '';
-    webState = 'idle';
+  function saveItem(item: NewItem) {
+    if (!itemSheet) return;
+    if (itemSheet.item) capture.updateItem(itemSheet.roomId, itemSheet.item.id, item);
+    else capture.addItem(itemSheet.roomId, item);
+    itemSheet = null;
   }
 
-  function cancelItem() {
+  function setBoxes(n: number) {
+    capture.boxes = Math.max(0, Math.min(MAX_BOXES, Math.round(n) || 0));
+  }
+
+  function next() {
     tapHaptic();
-    currentFrames = [];
-    labelInput = '';
-    manualError = null;
-    webState = 'idle';
-  }
-
-  function stopWeb() {
-    stream?.getTracks().forEach(t => t.stop());
-    stream = null;
-  }
-
-  function finishWeb() {
-    if (capture.itemCount === 0) return;
-    successHaptic();
-    stopWeb();
     goto('/scan/form');
   }
-
-  function closeScan() {
-    tapHaptic();
-    stopWeb();
-    capture.clear();
-    goto('/');
-  }
-
-  // ── Lifecycle ─────────────────────────────────────────────────────────────
-  onMount(async () => {
-    capture.clear();
-    let useNative = false;
-    if (Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'ios') {
-      try {
-        const support = await DepthCapture.checkSupport();
-        useNative = support.supported;
-      } catch { /* plugin unavailable */ }
-    }
-    if (useNative) {
-      mode = 'native';
-      await startNative();
-    } else {
-      await startWeb();
-    }
-  });
-
-  onDestroy(() => {
-    completeHandle?.remove();
-    cancelHandle?.remove();
-    savedHandle?.remove();
-    stopWeb();
-  });
 </script>
 
-{#if mode === 'web'}
-  <div class="fixed inset-0 bg-black flex flex-col z-40">
-    {#if cameraError}
-      <!-- Permission / availability error -->
-      <div class="flex-1 flex flex-col items-center justify-center px-8 text-center"
-        style="padding-top: env(safe-area-inset-top, 0px);">
-        <div class="w-16 h-16 rounded-full bg-red-soft flex items-center justify-center mb-5 text-red">
-          <CircleAlert size={30} />
-        </div>
-        <h2 class="text-white text-[20px] font-bold mb-2">Kein Kamerazugriff</h2>
-        <p class="text-[15px] mb-8" style="color: rgba(255,255,255,0.6);">{cameraError}</p>
-        <button onclick={closeScan} class="btn-gray px-8" style="background: rgba(255,255,255,0.15); color: #fff;">
-          Zurück
-        </button>
+<NavBar title="Ihr Umzugsgut" back="/" />
+
+<main
+  class="px-4 max-w-lg mx-auto rise-in"
+  style="padding-top: calc(3rem + env(safe-area-inset-top, 0px) + 1rem); padding-bottom: calc(8rem + env(safe-area-inset-bottom, 0px));"
+>
+  {#if notice}
+    <div class="ios-card mb-5 p-4 flex gap-3 items-start"
+      style="background: {notice.tone === 'error' ? 'var(--ios-red-soft)' : 'var(--ios-tint-soft)'};">
+      <CircleAlert size={18} class="shrink-0 mt-0.5 {notice.tone === 'error' ? 'text-red' : 'text-tint'}" />
+      <p class="flex-1 text-[14px] text-label">{notice.text}</p>
+      <button onclick={() => (notice = null)} aria-label="Hinweis schließen" class="text-label-2"><X size={16} /></button>
+    </div>
+  {/if}
+
+  {#if capture.rooms.length === 0}
+    <div class="text-center pt-6 pb-8">
+      <div class="w-16 h-16 rounded-full bg-tint-soft text-tint flex items-center justify-center mx-auto mb-4">
+        {#if canScan}<ScanLine size={28} strokeWidth={1.8} />{:else}<Box size={28} strokeWidth={1.8} />{/if}
       </div>
-    {:else}
-      <!-- Camera preview -->
-      <!-- svelte-ignore a11y_media_has_caption -->
-      <video bind:this={videoEl} autoplay playsinline muted class="absolute inset-0 w-full h-full object-cover"></video>
-      {#if flash}
-        <div class="absolute inset-0 bg-white/70 z-10"></div>
-      {/if}
-
-      <!-- Top bar -->
-      <div class="relative z-20 flex items-center justify-between px-4"
-        style="padding-top: calc(env(safe-area-inset-top, 0px) + 8px);">
-        <div class="flex items-center gap-2 h-8 px-3 rounded-full" style="background: rgba(0,0,0,0.55); backdrop-filter: blur(10px);">
-          <span class="w-2 h-2 rounded-full {capture.itemCount > 0 ? 'bg-green' : 'bg-white/30'}"></span>
-          <span class="text-white text-[13px] font-semibold">
-            {capture.itemCount} {capture.itemCount === 1 ? 'Objekt' : 'Objekte'}
-          </span>
-        </div>
-        <button onclick={closeScan} aria-label="Schließen"
-          class="w-9 h-9 rounded-full flex items-center justify-center text-white"
-          style="background: rgba(0,0,0,0.55); backdrop-filter: blur(10px);">
-          <X size={18} />
-        </button>
-      </div>
-
-      <!-- Saved flash -->
-      {#if savedFlash}
-        <div class="absolute inset-0 z-30 flex flex-col items-center justify-center" style="background: rgba(0,0,0,0.55);">
-          <div class="w-16 h-16 rounded-full bg-green flex items-center justify-center mb-4">
-            <Check size={32} color="#fff" strokeWidth={3} />
-          </div>
-          <p class="text-white text-[20px] font-bold">{savedFlash}</p>
-          <p class="text-[14px]" style="color: rgba(255,255,255,0.7);">gespeichert</p>
-        </div>
-      {/if}
-
-      <!-- Bottom controls -->
-      <div class="relative z-20 mt-auto" style="padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);">
-        {#if webState === 'idle'}
-          <p class="text-center text-[13px] font-medium mb-4" style="color: rgba(255,255,255,0.75);">
-            {capture.itemCount === 0 ? 'Erfassen Sie Ihre Möbel Stück für Stück' : 'Weiteres Objekt hinzufügen oder abschließen'}
-          </p>
-          <div class="flex items-center justify-center gap-3 px-5">
-            <button onclick={startItem}
-              class="flex-1 h-[50px] rounded-full flex items-center justify-center gap-2 text-white text-[16px] font-semibold"
-              style="background: var(--aust-orange);">
-              <Plus size={20} strokeWidth={2.5} />
-              Objekt erfassen
-            </button>
-            {#if capture.itemCount > 0}
-              <button onclick={finishWeb}
-                class="h-[50px] px-6 rounded-full text-white text-[16px] font-semibold"
-                style="background: rgba(255,255,255,0.2); backdrop-filter: blur(10px);">
-                Fertig ({capture.itemCount})
-              </button>
-            {/if}
-          </div>
-          <div class="flex justify-center mt-3">
-            <button onclick={openManual} class="text-[13px] font-medium underline underline-offset-4"
-              style="color: rgba(255,255,255,0.7);">
-              Maße stattdessen eintippen
-            </button>
-          </div>
-
-        {:else if webState === 'capturing'}
-          <!-- Capturing: straight to the camera, no naming up front -->
-          <div class="px-5">
-            <div class="flex items-center justify-center mb-3">
-              <span class="text-[13px] font-medium px-3 h-8 rounded-full inline-flex items-center text-white"
-                style="background: rgba(0,0,0,0.55); backdrop-filter: blur(10px);">
-                {currentFrames.length} / 4 Fotos
-              </span>
-            </div>
-            <p class="text-center text-[13px] mb-4" style="color: rgba(255,255,255,0.75);">
-              Fotografieren Sie das Objekt aus 3–4 verschiedenen Winkeln
-            </p>
-            <div class="flex items-center justify-between">
-              <button onclick={cancelItem} class="w-[72px] text-left text-white/80 text-[15px] font-medium">
-                Abbruch
-              </button>
-              <!-- Shutter -->
-              <button onclick={snap} aria-label="Foto aufnehmen"
-                class="w-[74px] h-[74px] rounded-full border-4 border-white flex items-center justify-center active:scale-95 transition-transform">
-                <span class="w-[60px] h-[60px] rounded-full bg-white"></span>
-              </button>
-              <button onclick={reviewItem} disabled={currentFrames.length === 0}
-                class="w-[72px] text-right text-[15px] font-semibold {currentFrames.length > 0 ? 'text-white' : 'text-white/30'}">
-                Weiter
-              </button>
-            </div>
-          </div>
-
-        {:else if webState === 'manual'}
-          <!-- Manual entry: the customer's own numbers beat a photo estimate -->
-          <div class="mx-3 rounded-[20px] p-5" style="background: var(--ios-card);">
-            <p class="text-[17px] font-semibold text-label mb-1">Maße eintragen</p>
-            <p class="text-[12px] text-label-3 mb-3">
-              Für Objekte, die sich schlecht fotografieren lassen — oder wenn Sie die Maße kennen.
-            </p>
-            <input
-              bind:value={manualName}
-              placeholder="Bezeichnung (optional)"
-              class="ios-input bg-fill rounded-xl px-4 mb-3"
-            />
-            <div class="flex gap-2 mb-3">
-              <button onclick={() => { tapHaptic(); manualMode = 'dims'; manualError = null; }}
-                class="flex-1 h-9 rounded-full text-[13px] font-semibold {manualMode === 'dims' ? 'btn-filled' : 'bg-fill text-label'}">
-                Maße
-              </button>
-              <button onclick={() => { tapHaptic(); manualMode = 'volume'; manualError = null; }}
-                class="flex-1 h-9 rounded-full text-[13px] font-semibold {manualMode === 'volume' ? 'btn-filled' : 'bg-fill text-label'}">
-                Volumen
-              </button>
-            </div>
-            {#if manualMode === 'dims'}
-              <div class="flex gap-2 mb-2">
-                <input bind:value={manualL} inputmode="decimal" placeholder="Länge cm"
-                  class="ios-input bg-fill rounded-xl px-3 text-center flex-1" />
-                <input bind:value={manualW} inputmode="decimal" placeholder="Breite cm"
-                  class="ios-input bg-fill rounded-xl px-3 text-center flex-1" />
-                <input bind:value={manualH} inputmode="decimal" placeholder="Höhe cm"
-                  class="ios-input bg-fill rounded-xl px-3 text-center flex-1" />
-              </div>
-              <p class="text-[12px] text-label-3 mb-3">Außenmaße in Zentimetern. Ladespielraum rechnen wir dazu.</p>
-            {:else}
-              <input bind:value={manualVolume} inputmode="decimal" placeholder="Volumen in m³, z. B. 1,2"
-                class="ios-input bg-fill rounded-xl px-4 mb-2" />
-              <p class="text-[12px] text-label-3 mb-3">Volumen in Kubikmetern, so wie Sie es angeben.</p>
-            {/if}
-            {#if manualError}
-              <p class="text-[12px] text-red mb-3">{manualError}</p>
-            {/if}
-            <div class="flex gap-3">
-              <button onclick={cancelItem} class="btn-gray flex-1">Abbrechen</button>
-              <button onclick={saveManual} class="btn-filled flex-1">Sichern</button>
-            </div>
-          </div>
-
+      <h1 class="text-[22px] font-bold text-label tracking-tight mb-2">Raum für Raum</h1>
+      <p class="text-[15px] text-label-2 max-w-xs mx-auto">
+        {#if canScan}
+          Scannen Sie jeden Raum mit der Kamera — Möbel werden automatisch erkannt und vermessen.
         {:else}
-          <!-- Review: naming is optional, saving is one tap away -->
-          <div class="mx-3 rounded-[20px] p-5" style="background: var(--ios-card);">
-            <p class="text-[13px] font-semibold text-label-2 mb-1">
-              {currentFrames.length} {currentFrames.length === 1 ? 'Foto' : 'Fotos'} erfasst
-            </p>
-            <p class="text-[17px] font-semibold text-label mb-3">Bezeichnung (optional)</p>
-            <input
-              bind:value={labelInput}
-              placeholder="z. B. Sofa, Schrank, Bett …"
-              class="ios-input bg-fill rounded-xl px-4 mb-3"
-              onkeydown={(e) => e.key === 'Enter' && saveItem()}
-            />
-            <div class="flex flex-wrap gap-2 mb-3">
-              {#each suggestions as s}
-                <button onclick={() => { tapHaptic(); labelInput = s; }}
-                  class="h-8 px-3.5 rounded-full bg-fill text-label text-[13px] font-medium tappable">
-                  {s}
-                </button>
-              {/each}
-            </div>
-            <p class="text-[12px] text-label-3 mb-4">
-              Ohne Bezeichnung erkennen wir das Objekt automatisch.
-            </p>
-            <div class="flex gap-3">
-              <button onclick={() => { tapHaptic(); webState = 'capturing'; }} class="btn-gray flex-1">
-                Weitere Fotos
-              </button>
-              <button onclick={saveItem} class="btn-filled flex-1">Sichern</button>
-            </div>
-            <!-- Keeps the photos already taken and attaches them to the typed volume. -->
-            <button onclick={openManual}
-              class="w-full text-center text-[13px] font-medium text-label-2 underline underline-offset-4 mt-3">
-              Maße stattdessen eintragen
-            </button>
+          Tragen Sie Ihre Möbel je Raum ein — mit Maßen oder einem Foto.
+        {/if}
+      </p>
+    </div>
+  {/if}
+
+  {#each capture.rooms as room (room.id)}
+    <div class="ios-card mb-5 overflow-hidden">
+      <button onclick={() => openRoomMenu(room)} class="ios-row w-full flex items-center gap-3 px-4 py-3 text-left tappable">
+        <div class="flex-1 min-w-0">
+          <p class="text-[17px] font-semibold text-label truncate">{room.name}</p>
+          <p class="text-[13px] text-label-2">
+            {room.items.length} {room.items.length === 1 ? 'Gegenstand' : 'Gegenstände'}{#if room.items.length > 0}{` · ≈ ${m3(roomVolume(room))} m³`}{/if}
+          </p>
+        </div>
+        <ChevronRight size={18} class="text-label-3 shrink-0" />
+      </button>
+
+      {#if scanningRoomId === room.id}
+        <div class="ios-row flex items-center gap-3 px-4 py-3">
+          <span class="ios-spinner" style="width: 18px; height: 18px;"></span>
+          <span class="text-[15px] text-label-2">Scan läuft …</span>
+        </div>
+      {/if}
+
+      {#each room.items as item (item.id)}
+        <button onclick={() => { tapHaptic(); itemSheet = { roomId: room.id, item }; }}
+          class="ios-row w-full flex items-center gap-3 px-4 py-2.5 text-left tappable">
+          <div class="w-8 h-8 rounded-lg flex items-center justify-center shrink-0
+            {invalid.has(item.id) ? 'bg-red-soft text-red' : 'bg-tint-soft text-tint'}">
+            {#if item.source === 'scan'}<ScanLine size={15} />{:else if item.volumeM3 == null}<Camera size={15} />{:else}<Box size={15} />{/if}
           </div>
+          <div class="flex-1 min-w-0">
+            <p class="text-[15px] truncate {item.label ? 'text-label' : 'text-label-3 italic'}">{item.label || 'Ohne Bezeichnung'}</p>
+            <p class="text-[12px] text-label-2">
+              {#if item.dimsM}{dimsText(item.dimsM)}{:else if item.volumeM3 == null}Größe wird geschätzt{:else}Volumen angegeben{/if}
+            </p>
+          </div>
+          {#if invalid.has(item.id)}
+            <span class="text-[13px] font-semibold text-red">Prüfen</span>
+          {:else if item.volumeM3 != null}
+            <span class="text-[13px] font-semibold text-label">≈ {m3(item.volumeM3)} m³</span>
+          {/if}
+        </button>
+      {/each}
+
+      <div class="ios-row flex">
+        <button onclick={() => { tapHaptic(); itemSheet = { roomId: room.id, item: null }; }}
+          class="flex-1 h-11 flex items-center justify-center gap-1.5 text-[15px] text-tint tappable">
+          <Plus size={17} /> Gegenstand
+        </button>
+        {#if canScan}
+          <button onclick={() => { tapHaptic(); scan(room, false); }} disabled={scanningRoomId !== null}
+            class="flex-1 h-11 flex items-center justify-center gap-1.5 text-[15px] text-tint tappable border-l-[0.5px] border-separator disabled:opacity-40">
+            <ScanLine size={17} /> {room.scanned ? 'Erneut scannen' : 'Scannen'}
+          </button>
         {/if}
       </div>
+    </div>
+  {/each}
+
+  <button onclick={openAddRoom} disabled={scanningRoomId !== null}
+    class="{capture.rooms.length === 0 ? 'btn-filled' : 'btn-tinted'} w-full mb-8 disabled:opacity-40">
+    <Plus size={19} />
+    {capture.rooms.length === 0 ? 'Ersten Raum hinzufügen' : 'Raum hinzufügen'}
+  </button>
+
+  <p class="ios-section-header">Umzugskartons</p>
+  <div class="ios-card px-4 py-3 mb-2 flex items-center gap-3">
+    <Package size={20} class="text-tint shrink-0" />
+    <span class="flex-1 text-[15px] text-label">Für die ganze Wohnung</span>
+    <div class="flex items-center bg-fill rounded-lg">
+      <button onclick={() => { tapHaptic(); setBoxes(capture.boxes - 1); }} aria-label="Weniger Kartons"
+        class="w-9 h-8 flex items-center justify-center text-label disabled:opacity-30" disabled={capture.boxes === 0}>
+        <Minus size={16} />
+      </button>
+      <input
+        value={capture.boxes}
+        onchange={(e) => setBoxes(Number(e.currentTarget.value))}
+        inputmode="numeric"
+        aria-label="Anzahl Kartons"
+        class="w-11 h-8 text-center text-[15px] font-semibold text-label bg-transparent outline-none"
+      />
+      <button onclick={() => { tapHaptic(); setBoxes(capture.boxes + 1); }} aria-label="Mehr Kartons"
+        class="w-9 h-8 flex items-center justify-center text-label disabled:opacity-30" disabled={capture.boxes >= MAX_BOXES}>
+        <Plus size={16} />
+      </button>
+    </div>
+  </div>
+  <p class="text-[12px] text-label-2 px-4">Eine grobe Schätzung reicht. Wir rechnen 0,1 m³ pro Karton.</p>
+</main>
+
+<!-- Bottom action bar -->
+<div class="fixed bottom-0 left-0 w-full z-50 tab-bar" style="padding-bottom: env(safe-area-inset-bottom, 0px);">
+  <div class="max-w-lg mx-auto px-4 py-3 flex items-center gap-4">
+    <div class="flex-1 min-w-0">
+      {#if invalid.size > 0}
+        <p class="text-[13px] font-semibold text-red">Bitte markierte Gegenstände prüfen</p>
+      {:else if capture.itemCount === 0}
+        <p class="text-[15px] text-label-2">Noch nichts erfasst</p>
+      {:else}
+        <p class="text-[17px] font-bold text-label">≈ {m3(capture.knownVolumeM3)} m³</p>
+        <p class="text-[12px] text-label-2">{capture.itemCount} {capture.itemCount === 1 ? 'Position' : 'Positionen'}</p>
+      {/if}
+    </div>
+    <button onclick={next} disabled={capture.itemCount === 0 || invalid.size > 0 || scanningRoomId !== null}
+      class="btn-filled px-8">
+      Weiter
+    </button>
+  </div>
+</div>
+
+{#if addRoomOpen}
+  <Sheet title="Raum hinzufügen" onclose={() => (addRoomOpen = false)}>
+    <div class="flex flex-wrap gap-2 mb-4">
+      {#each roomPresets as preset}
+        <button onclick={() => { tapHaptic(); newRoomName = preset; }}
+          class="h-9 px-4 rounded-full text-[14px] font-medium {newRoomName === preset ? 'bg-tint text-on-tint' : 'bg-fill text-label'}">
+          {preset}
+        </button>
+      {/each}
+    </div>
+    <div class="ios-card px-4 mb-5">
+      <input bind:value={newRoomName} placeholder="Oder eigener Name" class="ios-input" />
+    </div>
+    {#if canScan}
+      <p class="text-[13px] text-label-2 px-1 mb-4">
+        Gehen Sie langsam durch den Raum und richten Sie die Kamera auf alle Möbel — auch in die Ecken.
+      </p>
+      <button onclick={() => createRoom(true)} disabled={!newRoomName.trim()} class="btn-filled w-full mb-2">
+        <ScanLine size={19} /> Raum scannen
+      </button>
+      <button onclick={() => createRoom(false)} disabled={!newRoomName.trim()} class="btn-gray w-full disabled:opacity-40">
+        Ohne Scan, selbst eintragen
+      </button>
+    {:else}
+      <button onclick={() => createRoom(false)} disabled={!newRoomName.trim()} class="btn-filled w-full">
+        Hinzufügen
+      </button>
     {/if}
-  </div>
-{:else if mode === 'detecting'}
-  <div class="fixed inset-0 bg-black flex items-center justify-center">
-    <div class="ios-spinner" style="border-top-color: #fff;"></div>
-  </div>
+  </Sheet>
 {/if}
 
-<!-- mode === 'native': the native ARKit UI covers the screen; WebView is hidden. -->
+{#if menuRoom}
+  {@const room = menuRoom}
+  <Sheet title={room.name} onclose={() => (menuRoom = null)}>
+    <p class="ios-section-header">Name</p>
+    <div class="ios-card px-4 mb-2 flex items-center gap-2">
+      <input bind:value={renameValue} class="ios-input" />
+      {#if renameValue.trim() && renameValue.trim() !== room.name}
+        <button onclick={() => { tapHaptic(); capture.renameRoom(room.id, renameValue); menuRoom = null; }}
+          class="text-[15px] font-semibold text-tint shrink-0">Sichern</button>
+      {/if}
+    </div>
+    {#if canScan && room.scanned}
+      <p class="text-[12px] text-label-2 px-4 mb-5">
+        Erneutes Scannen ersetzt die gescannten Möbel dieses Raums. Selbst eingetragene bleiben erhalten.
+      </p>
+    {:else}
+      <div class="mb-5"></div>
+    {/if}
+    <button
+      onclick={() => {
+        tapHaptic();
+        if (!confirmDelete) { confirmDelete = true; return; }
+        capture.removeRoom(room.id);
+        menuRoom = null;
+      }}
+      class="btn-gray w-full text-red"
+    >
+      {confirmDelete ? `„${room.name}“ wirklich löschen?` : 'Raum löschen'}
+    </button>
+  </Sheet>
+{/if}
+
+{#if itemSheet}
+  {@const target = itemSheet}
+  <ItemSheet
+    item={target.item}
+    requireSize={canScan === true}
+    onsave={saveItem}
+    ondelete={target.item ? () => { capture.removeItem(target.roomId, target.item!.id); itemSheet = null; } : undefined}
+    onclose={() => (itemSheet = null)}
+  />
+{/if}

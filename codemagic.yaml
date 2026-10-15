@@ -27,25 +27,8 @@ workflows:
       - name: Install dependencies
         script: npm ci
 
-      - name: Build depth-capture plugin
-        script: cd plugins/capacitor-depth-capture && npx tsc
-
-      - name: Export YOLO model to CoreML
-        script: |
-          # The coremltools <-> torch <-> numpy trio must be pinned together.
-          # Leaving them to pip pulls numpy 2.x + a too-new torch, and the
-          # CoreML Torch converter then dies with
-          #   TypeError: only 0-dimensional arrays can be converted to Python scalars
-          # (numpy-2 scalar-cast change hitting coremltools' `_int` op).
-          # coremltools 8.1 is new enough for the YOLO11 graph; numpy 1.26 + torch
-          # 2.4.0 are a proven-consistent set with it.
-          pip3 install --upgrade pip
-          pip3 install "numpy==1.26.4" "torch==2.4.0" "torchvision==0.19.0" "coremltools==8.1" ultralytics
-          python3 -c "
-          from ultralytics import YOLO
-          model = YOLO('yolo11n.pt')
-          model.export(format='coreml', nms=True, imgsz=640)
-          "
+      - name: Build RoomPlan plugin
+        script: cd plugins/capacitor-roomplan && npx tsc
 
       - name: Build web app
         script: npm run build
@@ -53,19 +36,8 @@ workflows:
       - name: Capacitor — add & sync iOS
         script: |
           npx cap add ios
+          ./scripts/ios-deployment-target.sh
           npx cap sync ios
-
-          # Compile YOLO model and add to iOS app resources
-          xcrun coremlcompiler compile yolo11n.mlpackage ios/App/App/
-          ruby -e "
-          require 'xcodeproj'
-          proj = Xcodeproj::Project.open('ios/App/App.xcodeproj')
-          target = proj.targets.find { |t| t.name == 'App' }
-          group = proj.main_group.find_subpath('App/App', true)
-          ref = group.new_reference('yolo11n.mlmodelc')
-          target.resources_build_phase.add_file_reference(ref)
-          proj.save
-          "
 
           /usr/libexec/PlistBuddy -c "Set :NSCameraUsageDescription 'Diese App benötigt Zugriff auf die Kamera, um Fotos Ihrer Möbel für die Umzugsplanung aufzunehmen.'" ios/App/App/Info.plist || /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string 'Diese App benötigt Zugriff auf die Kamera, um Fotos Ihrer Möbel für die Umzugsplanung aufzunehmen.'" ios/App/App/Info.plist
           /usr/libexec/PlistBuddy -c "Set :NSPhotoLibraryUsageDescription 'Diese App benötigt Zugriff auf Ihre Fotos, um Bilder für die Umzugsplanung hochzuladen.'" ios/App/App/Info.plist || /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryUsageDescription string 'Diese App benötigt Zugriff auf Ihre Fotos, um Bilder für die Umzugsplanung hochzuladen.'" ios/App/App/Info.plist

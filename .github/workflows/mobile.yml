@@ -133,6 +133,8 @@ jobs:
       # Generate the iOS Capacitor project (gitignored, created fresh each run).
       # Capacitor 8 generates an SPM-based project — no CocoaPods.
       - run: npx cap add ios
+      # RoomPlan needs iOS 16; must happen before sync (see the script).
+      - run: ./scripts/ios-deployment-target.sh
       - run: npx cap sync ios
 
       # Set up Ruby + Fastlane (Gemfile.lock ensures reproducible gem versions)

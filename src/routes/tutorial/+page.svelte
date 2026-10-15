@@ -9,7 +9,7 @@
     {
       icon: House,
       title: 'Jeden Raum zeigen',
-      desc: 'Öffnen Sie Schränke und zeigen Sie alle Möbel, die umgezogen werden sollen.',
+      desc: 'Zeigen Sie alle Möbel, die umgezogen werden sollen — auch in Ecken und Nischen.',
     },
     {
       icon: Lightbulb,
@@ -18,8 +18,8 @@
     },
     {
       icon: Camera,
-      title: 'Objekt für Objekt',
-      desc: 'Tippen Sie ein erkanntes Möbelstück an und bewegen Sie die Kamera langsam darum herum.',
+      title: 'Raum für Raum',
+      desc: 'Gehen Sie langsam durch jeden Raum. Möbel werden erkannt und vermessen — danach können Sie alles prüfen und ergänzen.',
     },
     {
       icon: Sparkles,

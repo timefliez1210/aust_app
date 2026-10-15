@@ -30,7 +30,7 @@
 		"@capacitor/core": "^8.1.0",
 		"@capacitor/haptics": "^8.0.0",
 		"@capacitor/ios": "^8.1.0",
-		"capacitor-depth-capture": "file:plugins/capacitor-depth-capture",
+		"capacitor-roomplan": "file:plugins/capacitor-roomplan",
 		"lucide-svelte": "^1.0.1"
 	}
 }

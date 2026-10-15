@@ -1,14 +1,14 @@
 {
-  "name": "capacitor-depth-capture",
+  "name": "capacitor-roomplan",
   "version": "0.0.1",
-  "description": "Capacitor plugin for depth-aware camera capture using ARKit/ARCore",
+  "description": "Capacitor plugin: scan one room with Apple RoomPlan and return its furniture",
   "main": "dist/esm/index.js",
   "module": "dist/esm/index.js",
   "types": "dist/esm/index.d.ts",
   "files": [
     "dist/",
     "ios/",
-    "android/"
+    "Package.swift"
   ],
   "scripts": {
     "build": "tsc",
@@ -17,9 +17,6 @@
   "capacitor": {
     "ios": {
       "src": "ios"
-    },
-    "android": {
-      "src": "android"
     }
   },
   "peerDependencies": {

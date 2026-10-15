@@ -300,3 +300,16 @@ body {
 .rise-in {
   animation: rise-in 0.35s cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
+
+/* Bottom sheet slide-up */
+@keyframes sheet-in {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+.sheet-in {
+  animation: sheet-in 0.3s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}

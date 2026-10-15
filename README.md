@@ -28,10 +28,10 @@ npm run build
 npm run preview           # preview the production web build
 ```
 
-The web build only exercises the Android/web in-page capture flow. Native iOS
-capture (`plugins/capacitor-depth-capture/`) requires the Capacitor iOS project
-and a real device with LiDAR to test meaningfully — Xcode builds happen in CI
-(Codemagic and `.github/workflows/mobile.yml`), not locally. See
+The web build runs the manual-entry capture. RoomPlan scanning
+(`plugins/capacitor-roomplan/`) needs an iPhone with LiDAR; in a browser,
+`localStorage.setItem('roomplan-demo', '1')` fakes a scan. Xcode builds happen in CI (Codemagic and
+`.github/workflows/mobile.yml`), not locally. See
 [AGENTS.md](AGENTS.md) for current CI status.
 
 ## Native projects
@@ -40,5 +40,6 @@ The `ios/`/`android/` Capacitor projects are generated, not committed:
 
 ```sh
 npx cap add ios
+./scripts/ios-deployment-target.sh   # RoomPlan needs iOS 16
 npx cap sync
 ```

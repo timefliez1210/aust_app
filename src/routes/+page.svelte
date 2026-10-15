@@ -56,7 +56,7 @@
     tapHaptic();
     await capture.waitReady();
     if (capture.items.length > 0) {
-      goto('/scan/resume');
+      goto('/scan');
       return;
     }
     if (auth.isAuthenticated) {
