@@ -43,7 +43,13 @@ nor depth, and the fallback is a custom ARSession shared with RoomPlan (iOS 17).
 - **Umzugskartons**: one count for the whole home, sent as a single item
   `"<n> Umzugskartons"`, 0.1 m³ each, capped at 120 (12 m³ backend item limit).
 - Measured leftovers ("other") are listed as "Unbekannter Gegenstand" with their
-  photo; the backend names them. Those under 0.05 m³ (`SMALL_ITEM_M3`) aren't
+  photo; the backend names them. Every scanned item also carries its footprint,
+  and the scan returns the walls: rows without a photo show a thumbnail floor
+  plan (`RoomSketch.svelte`) with the item highlighted, and the item sheet shows
+  it large ("Hier im Raum"), so "what is this?" has an answer even without a photo.
+- `SCAN_DEBUG` in `roomplan.ts` prints each scan's diagnostics under the room card
+  (points → kept → islands → measured, photos/keyframes, rejections). Turn it off
+  before release. Those under 0.05 m³ (`SMALL_ITEM_M3`) aren't
   listed one by one: each scan sums them into one item "Kleinteile (n Stück, ≈ k
   Kartons)", rounded up to whole 0.1 m³ boxes. Replaced by a rescan like any scan item.
 - Fixtures RoomPlan finds (sink, toilet, bathtub, fireplace, stairs) are dropped.

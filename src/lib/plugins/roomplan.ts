@@ -27,6 +27,9 @@ export const MAX_ITEM_M3 = 12;
  */
 export const SMALL_ITEM_M3 = 0.05;
 
+/** Shows each room's scan diagnostics under its card. For TestFlight builds only. */
+export const SCAN_DEBUG = true;
+
 /** RoomPlan category → German item name. Fixtures that don't move are absent. */
 const CATEGORY_LABELS: Record<string, string> = {
   storage: 'Schrank / Regal',
@@ -66,6 +69,7 @@ export interface MovableObject {
   volumeM3: number;
   confidence: number;
   imageBase64: string | null;
+  footprint: number[][] | null;
 }
 
 /**
@@ -74,14 +78,20 @@ export interface MovableObject {
  */
 export function movableObjects(objects: ScannedObject[]) {
   const items: MovableObject[] = [];
+  const fixtures: number[][][] = [];
+  const smallFootprints: number[][][] = [];
   let smallCount = 0;
   let smallVolumeM3 = 0;
   for (const o of objects) {
-    if (FIXTURES.has(o.category)) continue;
+    if (FIXTURES.has(o.category)) {
+      if (o.footprint) fixtures.push(o.footprint);
+      continue;
+    }
     const volumeM3 = boxVolume(o.dimsM);
     if (o.category === 'other' && volumeM3 < SMALL_ITEM_M3) {
       smallCount++;
       smallVolumeM3 += volumeM3;
+      if (o.footprint) smallFootprints.push(o.footprint);
       continue;
     }
     items.push({
@@ -90,10 +100,16 @@ export function movableObjects(objects: ScannedObject[]) {
       volumeM3,
       confidence: o.confidence,
       imageBase64: o.imageBase64 ?? null,
+      footprint: o.footprint ?? null,
     });
   }
   return {
     items,
-    small: { count: smallCount, boxes: smallCount > 0 ? Math.max(1, Math.ceil(smallVolumeM3 / BOX_VOLUME_M3)) : 0 },
+    fixtures,
+    small: {
+      count: smallCount,
+      boxes: smallCount > 0 ? Math.max(1, Math.ceil(smallVolumeM3 / BOX_VOLUME_M3)) : 0,
+      footprints: smallFootprints,
+    },
   };
 }

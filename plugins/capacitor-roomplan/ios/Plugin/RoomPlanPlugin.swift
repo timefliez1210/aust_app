@@ -3,6 +3,7 @@ import AVFoundation
 import Capacitor
 import RoomPlan
 import UIKit
+import simd
 
 /// Scans one room with Apple RoomPlan and returns its furniture.
 ///
@@ -53,6 +54,7 @@ public class RoomPlanPlugin: CAPPlugin, CAPBridgedPlugin {
                         call.resolve([
                             "cancelled": false,
                             "objects": room.objects.map(RoomPlanPlugin.json) + leftovers.map(RoomPlanPlugin.json),
+                            "walls": room.walls.map(RoomPlanPlugin.wallJSON),
                             "diagnostics": diagnostics,
                         ])
                     case .failed(let error):
@@ -70,11 +72,31 @@ public class RoomPlanPlugin: CAPPlugin, CAPBridgedPlugin {
         let d = object.dimensions
         let a = Double(d.x)
         let b = Double(d.z)
+        let t = object.transform
+        let center = simd_float2(t.columns.3.x, t.columns.3.z)
+        let xAxis: simd_float2 = simd_float2(t.columns.0.x, t.columns.0.z) * (d.x * 0.5)
+        let zAxis: simd_float2 = simd_float2(t.columns.2.x, t.columns.2.z) * (d.z * 0.5)
+        let back: simd_float2 = center - zAxis
+        let front: simd_float2 = center + zAxis
+        let footprint: [simd_float2] = [back - xAxis, back + xAxis, front + xAxis, front - xAxis]
         return [
             "category": categoryName(object.category),
             "dimsM": [max(a, b), min(a, b), Double(d.y)],
             "confidence": confidenceValue(object.confidence),
+            "footprint": footprint.map(pointJSON),
         ]
+    }
+
+    /// A wall as its two end points in world x/z — the floor plan's outline.
+    static func wallJSON(_ wall: CapturedRoom.Surface) -> [[Double]] {
+        let t = wall.transform
+        let center = simd_float2(t.columns.3.x, t.columns.3.z)
+        let reach: simd_float2 = simd_float2(t.columns.0.x, t.columns.0.z) * (wall.dimensions.x * 0.5)
+        return [pointJSON(center - reach), pointJSON(center + reach)]
+    }
+
+    static func pointJSON(_ p: simd_float2) -> [Double] {
+        [Double(p.x), Double(p.y)]
     }
 
     static func json(_ leftover: LeftoverScanner.Leftover) -> [String: Any] {
@@ -83,6 +105,7 @@ public class RoomPlanPlugin: CAPPlugin, CAPBridgedPlugin {
             "dimsM": [Double(leftover.dims.x), Double(leftover.dims.y), Double(leftover.dims.z)],
             // Our own box fit, on geometry RoomPlan didn't claim — no better than "low".
             "confidence": 0.3,
+            "footprint": leftover.footprint.map(pointJSON),
         ]
         if let image = leftover.imageBase64 { json["imageBase64"] = image }
         return json

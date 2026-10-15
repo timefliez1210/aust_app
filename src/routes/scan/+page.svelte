@@ -4,8 +4,9 @@
   import NavBar from '$lib/components/NavBar.svelte';
   import Sheet from '$lib/components/Sheet.svelte';
   import ItemSheet from '$lib/components/ItemSheet.svelte';
+  import RoomSketch from '$lib/components/RoomSketch.svelte';
   import { capture, MAX_BOXES, type NewItem, type Room, type StoredItem } from '$lib/stores/capture.svelte';
-  import { BOX_VOLUME_M3, canScanRooms, movableObjects, RoomPlan } from '$lib/plugins/roomplan';
+  import { BOX_VOLUME_M3, canScanRooms, movableObjects, RoomPlan, SCAN_DEBUG } from '$lib/plugins/roomplan';
   import { tapHaptic, successHaptic, errorHaptic } from '$lib/haptics';
   import { Box, Camera, ChevronRight, CircleAlert, Minus, Plus, ScanLine, Package, X } from 'lucide-svelte';
 
@@ -42,6 +43,14 @@
     return `Kleinteile (${count} Stück, ≈ ${boxes} ${boxes === 1 ? 'Karton' : 'Kartons'})`;
   }
 
+  /** One line of what the scan's leftover measurement saw, for TestFlight testing. */
+  function diagnosticsText(d: Record<string, unknown>) {
+    const rejected = Object.entries((d.rejected as Record<string, number>) ?? {}).map(([k, v]) => `${k} ${v}`).join(', ');
+    return `Scan: ${d.source} · ${d.points} Punkte → ${d.kept} übrig → ${d.clusters} Inseln → ${d.leftovers} vermessen`
+      + ` · Fotos ${d.photos ?? 0}/${d.leftovers} aus ${d.keyframes} Bildern`
+      + (rejected ? ` · verworfen: ${rejected}` : '');
+  }
+
   function dimsText(dimsM: number[]) {
     return dimsM.map(d => Math.round(d * 100)).join(' × ') + ' cm';
   }
@@ -57,7 +66,7 @@
         return;
       }
       if (result.diagnostics) console.info('RoomPlan leftovers', result.diagnostics);
-      const { items: found, small } = movableObjects(result.objects);
+      const { items: found, fixtures, small } = movableObjects(result.objects);
       const scanned: NewItem[] = found.map(o => ({
         label: o.label,
         source: 'scan',
@@ -66,6 +75,7 @@
         volumeM3: o.volumeM3,
         dimsM: o.dimsM,
         deviceConfidence: o.confidence,
+        ...(o.footprint ? { footprints: [o.footprint] } : {}),
       }));
       if (small.count > 0) {
         scanned.push({
@@ -76,9 +86,11 @@
           volumeM3: small.boxes * BOX_VOLUME_M3,
           dimsM: null,
           deviceConfidence: null,
+          footprints: small.footprints,
         });
       }
-      capture.applyScan(room.id, scanned);
+      const plan = result.walls ? { walls: result.walls, fixtures } : undefined;
+      capture.applyScan(room.id, scanned, plan, result.diagnostics);
       successHaptic();
       if (scanned.length === 0) {
         notice = { tone: 'info', text: `In „${room.name}“ wurden keine Möbel erkannt. Sie können Gegenstände von Hand hinzufügen.` };
@@ -193,6 +205,10 @@
           {#if item.frames[0]}
             <img src="data:image/jpeg;base64,{item.frames[0].imageBase64}" alt=""
               class="w-8 h-8 rounded-lg object-cover shrink-0 {invalid.has(item.id) ? 'ring-2 ring-red' : ''}" />
+          {:else if room.plan && item.footprints?.length && !invalid.has(item.id)}
+            <div class="w-8 h-8 rounded-lg bg-fill shrink-0 p-0.5">
+              <RoomSketch plan={room.plan} highlight={item.footprints} compact />
+            </div>
           {:else}
             <div class="w-8 h-8 rounded-lg flex items-center justify-center shrink-0
               {invalid.has(item.id) ? 'bg-red-soft text-red' : 'bg-tint-soft text-tint'}">
@@ -226,6 +242,9 @@
         {/if}
       </div>
     </div>
+    {#if SCAN_DEBUG && room.diagnostics}
+      <p class="text-[11px] text-label-3 px-4 -mt-3 mb-5 break-all">{diagnosticsText(room.diagnostics)}</p>
+    {/if}
   {/each}
 
   <button onclick={openAddRoom} disabled={scanningRoomId !== null}
@@ -347,8 +366,11 @@
 
 {#if itemSheet}
   {@const target = itemSheet}
+  {@const room = capture.rooms.find(r => r.id === target.roomId)}
   <ItemSheet
     item={target.item}
+    plan={room?.plan}
+    others={(room?.items ?? []).filter(i => i.id !== target.item?.id).flatMap(i => i.footprints ?? [])}
     requireSize={canScan === true}
     onsave={saveItem}
     ondelete={target.item ? () => { capture.removeItem(target.roomId, target.item!.id); itemSheet = null; } : undefined}

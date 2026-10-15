@@ -20,20 +20,31 @@ export class RoomPlanWeb extends WebPlugin implements RoomPlanPlugin {
     return {
       cancelled: false,
       objects: [
-        { category: 'sofa', dimsM: [2.24, 0.95, 0.86], confidence: 0.9 },
-        { category: 'table', dimsM: [1.2, 0.6, 0.45], confidence: 0.9 },
-        { category: 'storage', dimsM: [1.8, 0.42, 2.0], confidence: 0.6 },
-        { category: 'television', dimsM: [1.45, 0.08, 0.84], confidence: 0.6 },
-        { category: 'chair', dimsM: [0.62, 0.58, 0.9], confidence: 0.3 },
-        { category: 'other', dimsM: [0.62, 0.55, 0.52], confidence: 0.3 },
-        { category: 'other', dimsM: [0.45, 0.3, 1.6], confidence: 0.3 },
-        { category: 'other', dimsM: [0.3, 0.22, 0.25], confidence: 0.3 },
-        { category: 'other', dimsM: [0.25, 0.2, 0.12], confidence: 0.3 },
-        { category: 'other', dimsM: [0.4, 0.3, 0.2], confidence: 0.3 },
+        { category: 'sofa', dimsM: [2.24, 0.95, 0.86], confidence: 0.9, footprint: rect(0.2, 0.2, 2.24, 0.95) },
+        { category: 'table', dimsM: [1.2, 0.6, 0.45], confidence: 0.9, footprint: rect(0.7, 1.6, 1.2, 0.6) },
+        { category: 'storage', dimsM: [1.8, 0.42, 2.0], confidence: 0.6, footprint: rect(2.0, 3.5, 1.8, 0.42) },
+        { category: 'television', dimsM: [1.45, 0.08, 0.84], confidence: 0.6, footprint: rect(0.6, 3.82, 1.45, 0.08) },
+        { category: 'chair', dimsM: [0.62, 0.58, 0.9], confidence: 0.3, footprint: rect(3.2, 1.2, 0.62, 0.58) },
+        { category: 'other', dimsM: [0.62, 0.55, 0.52], confidence: 0.3, footprint: rect(3.0, 2.4, 0.62, 0.55) },
+        { category: 'other', dimsM: [0.45, 0.3, 1.6], confidence: 0.3, footprint: rect(3.4, 0.2, 0.45, 0.3) },
+        { category: 'other', dimsM: [0.3, 0.22, 0.25], confidence: 0.3, footprint: rect(1.5, 2.6, 0.3, 0.22) },
+        { category: 'other', dimsM: [0.25, 0.2, 0.12], confidence: 0.3, footprint: rect(2.2, 2.7, 0.25, 0.2) },
+        { category: 'other', dimsM: [0.4, 0.3, 0.2], confidence: 0.3, footprint: rect(0.3, 2.8, 0.4, 0.3) },
       ],
-      diagnostics: { source: 'demo' },
+      walls: [
+        [[0, 0], [4, 0]],
+        [[4, 0], [4, 4]],
+        [[4, 4], [0, 4]],
+        [[0, 4], [0, 0]],
+      ],
+      diagnostics: { source: 'demo', points: 41200, kept: 3100, clusters: 9, leftovers: 5, photos: 0, keyframes: 0, rejected: { hanging: 1 } },
     };
   }
+}
+
+/** Axis-aligned footprint with its corner at (x, z). */
+function rect(x: number, z: number, w: number, d: number): [number, number][] {
+  return [[x, z], [x + w, z], [x + w, z + d], [x, z + d]];
 }
 
 function demoEnabled(): boolean {

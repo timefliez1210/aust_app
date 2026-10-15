@@ -16,6 +16,8 @@ export interface RoomPlanPlugin {
 export interface RoomScanResult {
     cancelled: boolean;
     objects: ScannedObject[];
+    /** The room's walls as [[x, z], [x, z]] end points in metres — the floor plan's outline. */
+    walls?: [number, number][][];
     /** What the leftover measurement saw (point source, counts) — for debugging. */
     diagnostics?: Record<string, unknown>;
 }
@@ -37,4 +39,6 @@ export interface ScannedObject {
     confidence: number;
     /** "other" only: base64 JPEG of the object, cropped from the scan. */
     imageBase64?: string;
+    /** Footprint corners [[x, z] × 4] in metres, same frame as `walls`. */
+    footprint?: [number, number][];
 }

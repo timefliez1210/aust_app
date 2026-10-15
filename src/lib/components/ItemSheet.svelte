@@ -1,12 +1,15 @@
 <script lang="ts">
   import Sheet from './Sheet.svelte';
+  import RoomSketch from './RoomSketch.svelte';
   import { boxVolume, MAX_ITEM_M3, MIN_ITEM_M3 } from '$lib/plugins/roomplan';
-  import type { NewItem, StoredItem } from '$lib/stores/capture.svelte';
+  import type { NewItem, RoomSketchPlan, StoredItem } from '$lib/stores/capture.svelte';
   import { tapHaptic } from '$lib/haptics';
   import { Camera, Trash2 } from 'lucide-svelte';
 
   let {
     item = null,
+    plan,
+    others = [],
     requireSize,
     onsave,
     ondelete,
@@ -14,6 +17,10 @@
   }: {
     /** The item being edited, or null to add a new one. */
     item?: StoredItem | null;
+    /** The room's floor plan from its last scan, to show where a scanned item stands. */
+    plan?: RoomSketchPlan;
+    /** Footprints of the room's other items, drawn faintly for orientation. */
+    others?: number[][][];
     /**
      * On LiDAR phones every item needs a size: one photo-only item would send the
      * whole submission to server-side estimation and throw away the scanned volumes.
@@ -87,6 +94,8 @@
       dimsM: m.dimsM,
       // A scanned item's confidence only holds while its box is RoomPlan's own.
       deviceConfidence: sameDims ? (initial?.deviceConfidence ?? null) : null,
+      // Where it stands doesn't change with a corrected size.
+      ...(initial?.footprints ? { footprints: initial.footprints } : {}),
     });
   }
 
@@ -118,6 +127,13 @@
 </script>
 
 <Sheet title={initial ? 'Gegenstand bearbeiten' : 'Gegenstand hinzufügen'} {onclose}>
+  {#if plan && initial?.footprints?.length}
+    <p class="ios-section-header">Hier im Raum</p>
+    <div class="ios-card p-3 mb-5">
+      <RoomSketch {plan} {others} highlight={initial.footprints} />
+    </div>
+  {/if}
+
   <p class="ios-section-header">Bezeichnung</p>
   <div class="ios-card px-4 mb-2">
     <input bind:value={name} placeholder="Optional, z. B. Sofa" class="ios-input" />

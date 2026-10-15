@@ -29,6 +29,8 @@ final class LeftoverScanner {
         let dims: simd_float3
         /// JPEG, base64, upright — the keyframe crop that shows the object best.
         let imageBase64: String?
+        /// Its four footprint corners in world x/z, for the floor plan.
+        let footprint: [simd_float2]
     }
 
     private struct Keyframe {
@@ -276,53 +278,55 @@ final class LeftoverScanner {
         var accepted: [Box] = []
         for entry in boxes where !entry.rejected { accepted.append(entry.box) }
         accepted.sort { (a: Box, b: Box) -> Bool in a.volume > b.volume }
-        return accepted.enumerated().map { index, box in
-            Leftover(dims: box.dims, imageBase64: index < Self.maxPhotos ? photo(of: box) : nil)
+        var leftovers: [Leftover] = []
+        var photos = 0
+        for (index, box) in accepted.enumerated() {
+            let image = index < Self.maxPhotos ? photo(of: box) : nil
+            if image != nil { photos += 1 }
+            leftovers.append(Leftover(dims: box.dims, imageBase64: image, footprint: box.footprint))
         }
+        diagnostics["photos"] = photos
+        return leftovers
     }
 
     // MARK: Photos
 
-    /// Crop the keyframe that shows `box` most fully, most centred, from a
+    /// Crop the keyframe that shows `box` most centred, most fully, from a
     /// sensible distance — upright, as the customer held the phone.
+    ///
+    /// Only the box's centre has to be in view: close up, a tall object's top
+    /// is often cut off in every frame, and a partial photo still says what it is.
     private func photo(of box: Box) -> String? {
         let corners = box.corners
         var best: (score: Float, frame: Keyframe, rect: CGRect)?
         for frame in keyframes {
             let view = simd_inverse(frame.transform)
-            var lo = simd_float2(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
-            var hi = -lo
-            var visible = true
+            let imageSize = simd_float2(frame.width, frame.height)
+            guard let center = project(box.center, view: view, frame: frame) else { continue }
+            let margin: simd_float2 = imageSize * 0.05
+            guard center.x > margin.x, center.y > margin.y,
+                  center.x < imageSize.x - margin.x, center.y < imageSize.y - margin.y else { continue }
+
+            var lo = center, hi = center
             for c in corners {
-                let p: simd_float4 = view * simd_float4(c, 1)
-                guard p.z < -0.2 else { visible = false; break }
-                let depth: Float = -p.z
-                let u: Float = frame.fx * p.x / depth + frame.cx
-                let v: Float = frame.fy * -p.y / depth + frame.cy
-                let uv = simd_float2(u, v)
+                guard let uv = project(c, view: view, frame: frame) else { continue }
                 lo = simd_min(lo, uv); hi = simd_max(hi, uv)
             }
-            guard visible else { continue }
-
             let extent: simd_float2 = hi - lo
-            let area: Float = extent.x * extent.y
-            guard area > 1 else { continue }
-            let imageSize = simd_float2(frame.width, frame.height)
+            let area: Float = max(extent.x * extent.y, 1)
             let clipLo: simd_float2 = simd_max(lo, simd_float2(0, 0))
             let clipHi: simd_float2 = simd_min(hi, imageSize)
             let clipped: simd_float2 = simd_max(clipHi - clipLo, simd_float2(0, 0))
             let inside: Float = clipped.x * clipped.y / area
-            guard inside > 0.6 else { continue }
 
-            let center: simd_float2 = (lo + hi) * 0.5
             let offset: Float = simd_length((center - imageSize * 0.5) / imageSize)
             let boxInView: simd_float4 = view * simd_float4(box.center, 1)
             let distance: Float = max(-boxInView.z, 0.1)
             let framing: Float = abs(log(distance / 1.8))
-            let score: Float = inside - offset - 0.3 * framing
+            let score: Float = 0.5 * inside - offset - 0.3 * framing
             if best == nil || score > best!.score {
-                let rect = CGRect(x: CGFloat(lo.x), y: CGFloat(lo.y),
-                                  width: CGFloat(hi.x - lo.x), height: CGFloat(hi.y - lo.y))
+                let rect = CGRect(x: CGFloat(clipLo.x), y: CGFloat(clipLo.y),
+                                  width: CGFloat(clipped.x), height: CGFloat(clipped.y))
                 best = (score, frame, rect)
             }
         }
@@ -343,6 +347,16 @@ final class LeftoverScanner {
             upright.draw(in: CGRect(origin: .zero, size: upright.size))
         }
         return rendered.jpegData(compressionQuality: 0.8)?.base64EncodedString()
+    }
+
+    /// Pixel position of world point `p` in a keyframe, or nil when it is behind the camera.
+    private func project(_ p: simd_float3, view: simd_float4x4, frame: Keyframe) -> simd_float2? {
+        let c: simd_float4 = view * simd_float4(p, 1)
+        guard c.z < -0.2 else { return nil }
+        let depth: Float = -c.z
+        let u: Float = frame.fx * c.x / depth + frame.cx
+        let v: Float = frame.fy * -c.y / depth + frame.cy
+        return simd_float2(u, v)
     }
 
     // MARK: Mesh
@@ -537,6 +551,16 @@ private struct Box {
     let widthAxis: simd_float2
 
     var bottom: Float { center.y - dims.z * 0.5 }
+
+    /// The four footprint corners in x/z.
+    var footprint: [simd_float2] {
+        let c = simd_float2(center.x, center.z)
+        let l: simd_float2 = lengthAxis * (dims.x * 0.5)
+        let w: simd_float2 = widthAxis * (dims.y * 0.5)
+        let back: simd_float2 = c - w
+        let front: simd_float2 = c + w
+        return [back - l, back + l, front + l, front - l]
+    }
 
     /// Geometric volume in m³, without packing factor.
     var volume: Float { dims.x * dims.y * dims.z }

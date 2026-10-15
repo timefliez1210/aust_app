@@ -29,6 +29,12 @@ export interface StoredItem {
   /** Dims [length, width, height] in metres: RoomPlan's box, or typed measurements. */
   dimsM: number[] | null;
   deviceConfidence: number | null;
+  /**
+   * Where the item stands, for the room's floor plan: footprint corners [[x, z] × 4]
+   * in the scan's frame. One for a scanned object, several for a "Kleinteile"
+   * line, absent for anything added by hand.
+   */
+  footprints?: number[][][];
 }
 
 export type NewItem = Omit<StoredItem, 'id'>;
@@ -39,6 +45,15 @@ export interface Room {
   items: StoredItem[];
   /** Whether a RoomPlan scan has run for this room. */
   scanned: boolean;
+  /** Floor plan from the last scan: walls as end-point pairs, fixtures as footprints. */
+  plan?: RoomSketchPlan;
+  /** What the last scan's leftover measurement saw — shown while testing. */
+  diagnostics?: Record<string, unknown>;
+}
+
+export interface RoomSketchPlan {
+  walls: number[][][];
+  fixtures: number[][][];
 }
 
 /** Most boxes the backend accepts as one item (12 m³ per-item limit). */
@@ -65,9 +80,11 @@ class CaptureStore {
   }
 
   /** A (re)scan replaces the room's scanned items and keeps everything added by hand. */
-  applyScan(roomId: string, items: NewItem[]) {
+  applyScan(roomId: string, items: NewItem[], plan?: RoomSketchPlan, diagnostics?: Record<string, unknown>) {
     const room = this.room(roomId);
     if (!room) return;
+    room.plan = plan;
+    room.diagnostics = diagnostics;
     room.items = [
       ...items.map(i => ({ id: crypto.randomUUID(), ...i })),
       ...room.items.filter(i => i.source === 'manual'),
