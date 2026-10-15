@@ -16,11 +16,15 @@ export interface RoomPlanPlugin {
 export interface RoomScanResult {
     cancelled: boolean;
     objects: ScannedObject[];
+    /** What the leftover measurement saw (point source, counts) — for debugging. */
+    diagnostics?: Record<string, unknown>;
 }
 export interface ScannedObject {
     /**
      * RoomPlan's `CapturedRoom.Object.Category` case name, e.g. "sofa",
-     * "washerDryer", or "unknown" for a case this plugin predates.
+     * "washerDryer", or "unknown" for a case this plugin predates. "other" is
+     * something RoomPlan has no category for, measured by the plugin itself from
+     * the geometry RoomPlan left over.
      */
     category: string;
     /**
@@ -29,6 +33,8 @@ export interface ScannedObject {
      * per-category default.
      */
     dimsM: [number, number, number];
-    /** RoomPlan's confidence mapped to 0.3 (low) / 0.6 (medium) / 0.9 (high). */
+    /** RoomPlan's confidence mapped to 0.3 (low) / 0.6 (medium) / 0.9 (high); 0.3 for "other". */
     confidence: number;
+    /** "other" only: base64 JPEG of the object, cropped from the scan. */
+    imageBase64?: string;
 }

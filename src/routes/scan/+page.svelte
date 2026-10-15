@@ -5,7 +5,7 @@
   import Sheet from '$lib/components/Sheet.svelte';
   import ItemSheet from '$lib/components/ItemSheet.svelte';
   import { capture, MAX_BOXES, type NewItem, type Room, type StoredItem } from '$lib/stores/capture.svelte';
-  import { canScanRooms, movableObjects, RoomPlan } from '$lib/plugins/roomplan';
+  import { BOX_VOLUME_M3, canScanRooms, movableObjects, RoomPlan } from '$lib/plugins/roomplan';
   import { tapHaptic, successHaptic, errorHaptic } from '$lib/haptics';
   import { Box, Camera, ChevronRight, CircleAlert, Minus, Plus, ScanLine, Package, X } from 'lucide-svelte';
 
@@ -37,6 +37,11 @@
     return room.items.reduce((s, i) => s + (i.volumeM3 ?? 0), 0);
   }
 
+  /** "Kleinteile (14 Stück, ≈ 2 Kartons)" — the small leftovers of one scan. */
+  function smallItemsLabel(count: number, boxes: number) {
+    return `Kleinteile (${count} Stück, ≈ ${boxes} ${boxes === 1 ? 'Karton' : 'Kartons'})`;
+  }
+
   function dimsText(dimsM: number[]) {
     return dimsM.map(d => Math.round(d * 100)).join(' × ') + ' cm';
   }
@@ -51,18 +56,31 @@
         if (isNew && room.items.length === 0) capture.removeRoom(room.id);
         return;
       }
-      const found = movableObjects(result.objects);
-      capture.applyScan(room.id, found.map(o => ({
+      if (result.diagnostics) console.info('RoomPlan leftovers', result.diagnostics);
+      const { items: found, small } = movableObjects(result.objects);
+      const scanned: NewItem[] = found.map(o => ({
         label: o.label,
         source: 'scan',
-        frames: [],
+        frames: o.imageBase64 ? [{ imageBase64: o.imageBase64, depthMapBase64: null, pose: null }] : [],
         hasDepth: true,
         volumeM3: o.volumeM3,
         dimsM: o.dimsM,
         deviceConfidence: o.confidence,
-      })));
+      }));
+      if (small.count > 0) {
+        scanned.push({
+          label: smallItemsLabel(small.count, small.boxes),
+          source: 'scan',
+          frames: [],
+          hasDepth: true,
+          volumeM3: small.boxes * BOX_VOLUME_M3,
+          dimsM: null,
+          deviceConfidence: null,
+        });
+      }
+      capture.applyScan(room.id, scanned);
       successHaptic();
-      if (found.length === 0) {
+      if (scanned.length === 0) {
         notice = { tone: 'info', text: `In „${room.name}“ wurden keine Möbel erkannt. Sie können Gegenstände von Hand hinzufügen.` };
       }
     } catch (e: any) {
@@ -172,12 +190,17 @@
       {#each room.items as item (item.id)}
         <button onclick={() => { tapHaptic(); itemSheet = { roomId: room.id, item }; }}
           class="ios-row w-full flex items-center gap-3 px-4 py-2.5 text-left tappable">
-          <div class="w-8 h-8 rounded-lg flex items-center justify-center shrink-0
-            {invalid.has(item.id) ? 'bg-red-soft text-red' : 'bg-tint-soft text-tint'}">
-            {#if item.source === 'scan'}<ScanLine size={15} />{:else if item.volumeM3 == null}<Camera size={15} />{:else}<Box size={15} />{/if}
-          </div>
+          {#if item.frames[0]}
+            <img src="data:image/jpeg;base64,{item.frames[0].imageBase64}" alt=""
+              class="w-8 h-8 rounded-lg object-cover shrink-0 {invalid.has(item.id) ? 'ring-2 ring-red' : ''}" />
+          {:else}
+            <div class="w-8 h-8 rounded-lg flex items-center justify-center shrink-0
+              {invalid.has(item.id) ? 'bg-red-soft text-red' : 'bg-tint-soft text-tint'}">
+              {#if item.source === 'scan'}<ScanLine size={15} />{:else if item.volumeM3 == null}<Camera size={15} />{:else}<Box size={15} />{/if}
+            </div>
+          {/if}
           <div class="flex-1 min-w-0">
-            <p class="text-[15px] truncate {item.label ? 'text-label' : 'text-label-3 italic'}">{item.label || 'Ohne Bezeichnung'}</p>
+            <p class="text-[15px] truncate {item.label ? 'text-label' : 'text-label-3 italic'}">{item.label || (item.source === 'scan' ? 'Unbekannter Gegenstand' : 'Ohne Bezeichnung')}</p>
             <p class="text-[12px] text-label-2">
               {#if item.dimsM}{dimsText(item.dimsM)}{:else if item.volumeM3 == null}Größe wird geschätzt{:else}Volumen angegeben{/if}
             </p>
@@ -233,7 +256,10 @@
       </button>
     </div>
   </div>
-  <p class="text-[12px] text-label-2 px-4">Eine grobe Schätzung reicht. Wir rechnen 0,1 m³ pro Karton.</p>
+  <p class="text-[12px] text-label-2 px-4">
+    {#if capture.rooms.some(r => r.scanned)}Kleinteile, die beim Scan offen herumstanden, sind schon eingerechnet. Hier zählt, was in Schränken und Regalen steckt.{:else}Eine grobe Schätzung reicht.{/if}
+    Wir rechnen 0,1 m³ pro Karton.
+  </p>
 </main>
 
 <!-- Bottom action bar -->

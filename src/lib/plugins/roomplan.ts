@@ -20,6 +20,13 @@ export const BOX_VOLUME_M3 = 0.1;
 export const MIN_ITEM_M3 = 0.005;
 export const MAX_ITEM_M3 = 12;
 
+/**
+ * Measured leftovers smaller than this (loading volume) aren't listed one by
+ * one: toys, shoes, a vase. They go into moving boxes, so a scan sums them into
+ * one "Kleinteile" line counted in boxes.
+ */
+export const SMALL_ITEM_M3 = 0.05;
+
 /** RoomPlan category → German item name. Fixtures that don't move are absent. */
 const CATEGORY_LABELS: Record<string, string> = {
   storage: 'Schrank / Regal',
@@ -52,14 +59,41 @@ export function boxVolume(dimsM: number[]): number {
   return dimsM[0] * dimsM[1] * dimsM[2] * PACKING_FACTOR;
 }
 
-/** Movable objects from a scan, named and with their loading volume. */
+export interface MovableObject {
+  /** '' for objects RoomPlan has no category for — the backend names them from the photo. */
+  label: string;
+  dimsM: number[];
+  volumeM3: number;
+  confidence: number;
+  imageBase64: string | null;
+}
+
+/**
+ * Movable objects from a scan, named and with their loading volume, plus the
+ * small leftovers as a count and the boxes they fill.
+ */
 export function movableObjects(objects: ScannedObject[]) {
-  return objects
-    .filter(o => !FIXTURES.has(o.category))
-    .map(o => ({
+  const items: MovableObject[] = [];
+  let smallCount = 0;
+  let smallVolumeM3 = 0;
+  for (const o of objects) {
+    if (FIXTURES.has(o.category)) continue;
+    const volumeM3 = boxVolume(o.dimsM);
+    if (o.category === 'other' && volumeM3 < SMALL_ITEM_M3) {
+      smallCount++;
+      smallVolumeM3 += volumeM3;
+      continue;
+    }
+    items.push({
       label: CATEGORY_LABELS[o.category] ?? '',
       dimsM: [...o.dimsM],
-      volumeM3: boxVolume(o.dimsM),
+      volumeM3,
       confidence: o.confidence,
-    }));
+      imageBase64: o.imageBase64 ?? null,
+    });
+  }
+  return {
+    items,
+    small: { count: smallCount, boxes: smallCount > 0 ? Math.max(1, Math.ceil(smallVolumeM3 / BOX_VOLUME_M3)) : 0 },
+  };
 }

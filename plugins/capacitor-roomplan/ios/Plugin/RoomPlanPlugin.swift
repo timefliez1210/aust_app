@@ -6,12 +6,14 @@ import UIKit
 
 /// Scans one room with Apple RoomPlan and returns its furniture.
 ///
-/// All measurement is RoomPlan's: every `CapturedRoom.Object` carries a box
-/// fitted to the fused LiDAR geometry. This plugin only presents Apple's
-/// scanner, puts Abbrechen / Fertig / Übernehmen on top of it, and flattens the
-/// result to JSON. Naming, filtering fixtures and the volume maths live in the
-/// app (`src/lib/plugins/roomplan.ts`), where they can be changed without a
-/// native build.
+/// Two kinds of objects come back. RoomPlan's own: every `CapturedRoom.Object`
+/// carries a category and a box fitted to the fused LiDAR geometry. And
+/// "other": whatever RoomPlan has no category for, measured by
+/// `LeftoverScanner` from the same session's geometry, with a photo each.
+/// This plugin presents Apple's scanner, puts Abbrechen / Fertig / Übernehmen on
+/// top of it, and flattens the result to JSON. Naming, filtering fixtures and
+/// the volume maths live in the app (`src/lib/plugins/roomplan.ts`), where they
+/// can be changed without a native build.
 @objc(RoomPlanPlugin)
 public class RoomPlanPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "RoomPlanPlugin"
@@ -47,8 +49,12 @@ public class RoomPlanPlugin: CAPPlugin, CAPBridgedPlugin {
                     switch outcome {
                     case .cancelled:
                         call.resolve(["cancelled": true, "objects": [Any]()])
-                    case .finished(let room):
-                        call.resolve(["cancelled": false, "objects": room.objects.map(RoomPlanPlugin.json)])
+                    case .finished(let room, let leftovers, let diagnostics):
+                        call.resolve([
+                            "cancelled": false,
+                            "objects": room.objects.map(RoomPlanPlugin.json) + leftovers.map(RoomPlanPlugin.json),
+                            "diagnostics": diagnostics,
+                        ])
                     case .failed(let error):
                         call.reject("Der Raum konnte nicht ausgewertet werden.", "SCAN_FAILED", error)
                     }
@@ -69,6 +75,17 @@ public class RoomPlanPlugin: CAPPlugin, CAPBridgedPlugin {
             "dimsM": [max(a, b), min(a, b), Double(d.y)],
             "confidence": confidenceValue(object.confidence),
         ]
+    }
+
+    static func json(_ leftover: LeftoverScanner.Leftover) -> [String: Any] {
+        var json: [String: Any] = [
+            "category": "other",
+            "dimsM": [Double(leftover.dims.x), Double(leftover.dims.y), Double(leftover.dims.z)],
+            // Our own box fit, on geometry RoomPlan didn't claim — no better than "low".
+            "confidence": 0.3,
+        ]
+        if let image = leftover.imageBase64 { json["imageBase64"] = image }
+        return json
     }
 
     static func categoryName(_ category: CapturedRoom.Object.Category) -> String {
@@ -105,12 +122,12 @@ public class RoomPlanPlugin: CAPPlugin, CAPBridgedPlugin {
 
 /// Full-screen RoomPlan scanner for one room.
 ///
-/// scanning ──Fertig──► processing ──(RoomPlan done)──► reviewing ──Übernehmen──► finished
+/// scanning ──Fertig──► processing ──(RoomPlan, then leftovers done)──► reviewing ──Übernehmen──► finished
 ///     └──────────────────── Abbrechen (any phase) ──────────────────────────────► cancelled
 final class RoomScanViewController: UIViewController, RoomCaptureViewDelegate {
     enum Outcome {
         case cancelled
-        case finished(CapturedRoom)
+        case finished(CapturedRoom, [LeftoverScanner.Leftover], [String: Any])
         case failed(Error)
     }
 
@@ -123,6 +140,10 @@ final class RoomScanViewController: UIViewController, RoomCaptureViewDelegate {
 
     private var captureView: RoomCaptureView!
     private var result: CapturedRoom?
+    private let leftoverScanner = LeftoverScanner()
+    private var leftovers: [LeftoverScanner.Leftover] = []
+    private var diagnostics: [String: Any] = [:]
+    private var sampler: Timer?
     private var started = false
     private var done = false
     private var phase = Phase.scanning {
@@ -169,11 +190,17 @@ final class RoomScanViewController: UIViewController, RoomCaptureViewDelegate {
         started = true
         UIApplication.shared.isIdleTimerDisabled = true
         captureView.captureSession.run(configuration: RoomCaptureSession.Configuration())
+        // RoomPlan owns the session's delegate, so its frames are polled instead.
+        sampler = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self, let frame = self.captureView.captureSession.arSession.currentFrame else { return }
+            self.leftoverScanner.sample(frame)
+        }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         UIApplication.shared.isIdleTimerDisabled = false
+        stopSampling()
         if phase == .scanning {
             captureView.captureSession.stop()
         }
@@ -187,7 +214,10 @@ final class RoomScanViewController: UIViewController, RoomCaptureViewDelegate {
             return false
         }
         // The session can also end on its own (e.g. interrupted), not only via Fertig.
-        DispatchQueue.main.async { if self.phase == .scanning { self.phase = .processing } }
+        DispatchQueue.main.async {
+            self.stopSampling()
+            if self.phase == .scanning { self.phase = .processing }
+        }
         return true
     }
 
@@ -198,7 +228,12 @@ final class RoomScanViewController: UIViewController, RoomCaptureViewDelegate {
                 return
             }
             self.result = processedResult
-            self.phase = .reviewing
+            self.leftoverScanner.leftovers(in: processedResult) { leftovers, diagnostics in
+                self.leftovers = leftovers
+                self.diagnostics = diagnostics
+                NSLog("RoomPlan leftovers: %@", diagnostics.description)
+                self.phase = .reviewing
+            }
         }
     }
 
@@ -276,8 +311,11 @@ final class RoomScanViewController: UIViewController, RoomCaptureViewDelegate {
             config.title = "Übernehmen"
             config.showsActivityIndicator = false
             primaryButton.isEnabled = true
-            let count = result?.objects.count ?? 0
-            subtitleLabel.text = count == 1 ? "1 Objekt erkannt" : "\(count) Objekte erkannt"
+            let recognised = result?.objects.count ?? 0
+            let measured = leftovers.count
+            subtitleLabel.text = measured == 0
+                ? "\(recognised) erkannt"
+                : "\(recognised) erkannt · \(measured) weitere vermessen"
         }
         primaryButton.configuration = config
     }
@@ -286,12 +324,18 @@ final class RoomScanViewController: UIViewController, RoomCaptureViewDelegate {
         switch phase {
         case .scanning:
             phase = .processing
+            stopSampling()
             captureView.captureSession.stop()
         case .processing:
             break
         case .reviewing:
-            if let result { finish(.finished(result)) }
+            if let result { finish(.finished(result, leftovers, diagnostics)) }
         }
+    }
+
+    private func stopSampling() {
+        sampler?.invalidate()
+        sampler = nil
     }
 
     @objc private func cancelTapped() {

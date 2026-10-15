@@ -25,7 +25,13 @@ export class RoomPlanWeb extends WebPlugin implements RoomPlanPlugin {
         { category: 'storage', dimsM: [1.8, 0.42, 2.0], confidence: 0.6 },
         { category: 'television', dimsM: [1.45, 0.08, 0.84], confidence: 0.6 },
         { category: 'chair', dimsM: [0.62, 0.58, 0.9], confidence: 0.3 },
+        { category: 'other', dimsM: [0.62, 0.55, 0.52], confidence: 0.3 },
+        { category: 'other', dimsM: [0.45, 0.3, 1.6], confidence: 0.3 },
+        { category: 'other', dimsM: [0.3, 0.22, 0.25], confidence: 0.3 },
+        { category: 'other', dimsM: [0.25, 0.2, 0.12], confidence: 0.3 },
+        { category: 'other', dimsM: [0.4, 0.3, 0.2], confidence: 0.3 },
       ],
+      diagnostics: { source: 'demo' },
     };
   }
 }

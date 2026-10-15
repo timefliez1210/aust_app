@@ -13,8 +13,21 @@ optional throughout; the backend names unlabelled items from their photo.
 The previous capture (our own ARKit room-mesh subtraction in
 `capacitor-depth-capture`, silent YOLO, a per-object photo flow, `/scan/resume`)
 was deleted on 2026-10-15: both its UX and its boxes were poor. It lives in git
-history up to `5eb4218`. Don't rebuild a custom mesh pipeline; if RoomPlan's
-boxes turn out wrong for some category, correct them in `roomplan.ts`.
+history up to `5eb4218`. If RoomPlan's boxes turn out wrong for some category,
+correct them in `roomplan.ts`.
+
+**What RoomPlan has no category for, we measure ourselves** (walker, stroller,
+floor lamp, toys). RoomPlan knows only 16 furniture types. `LeftoverScanner.swift`
+polls the same ARSession during the scan (mesh anchors if the session has them,
+else fused LiDAR depth) and a photo per second; afterwards it deletes everything
+RoomPlan accounts for (walls, floor, ceiling, doors, windows, its object boxes,
+anything outside the walls), clusters the rest, and fits a box per island. Unlike
+the deleted pipeline it only ever measures the leftovers, never the sofa. Its
+results come back as `category: "other"` with a cropped photo; the scanner's
+review line says "N erkannt · M weitere vermessen", and the JS side logs
+`diagnostics` (point source, counts, rejections). Not yet tried on a device:
+if "weitere vermessen" never shows up, RoomPlan's session exposes neither mesh
+nor depth, and the fallback is a custom ARSession shared with RoomPlan (iOS 17).
 
 ## Capture (`/scan`)
 
@@ -29,6 +42,10 @@ boxes turn out wrong for some category, correct them in `roomplan.ts`.
 - **Rescanning a room replaces its scanned items and keeps manual ones** (`source: 'scan' | 'manual'`).
 - **Umzugskartons**: one count for the whole home, sent as a single item
   `"<n> Umzugskartons"`, 0.1 m³ each, capped at 120 (12 m³ backend item limit).
+- Measured leftovers ("other") are listed as "Unbekannter Gegenstand" with their
+  photo; the backend names them. Those under 0.05 m³ (`SMALL_ITEM_M3`) aren't
+  listed one by one: each scan sums them into one item "Kleinteile (n Stück, ≈ k
+  Kartons)", rounded up to whole 0.1 m³ boxes. Replaced by a rescan like any scan item.
 - Fixtures RoomPlan finds (sink, toilet, bathtub, fireplace, stairs) are dropped.
   Other categories get a German name (`CATEGORY_LABELS` in `src/lib/plugins/roomplan.ts`).
 - Items outside 0.005–12 m³, or with neither size nor photo, are marked "Prüfen"
@@ -69,7 +86,7 @@ capture store → /scan/form (contact + addresses + services)
 
 | File/dir | Purpose |
 |----------|---------|
-| `plugins/capacitor-roomplan/` | Capacitor plugin, iOS only (`ios/Plugin/RoomPlanPlugin.swift`): `isSupported`, `scanRoom({roomName})` → `{cancelled, objects: [{category, dimsM, confidence}]}`. Web impl = demo stub; no Android dir (Android never calls it). `dist/` is committed |
+| `plugins/capacitor-roomplan/` | Capacitor plugin, iOS only (`ios/Plugin/RoomPlanPlugin.swift`): `isSupported`, `scanRoom({roomName})` → `{cancelled, objects: [{category, dimsM, confidence, imageBase64?}], diagnostics}`; `LeftoverScanner.swift` measures the "other" objects. Web impl = demo stub; no Android dir (Android never calls it). `dist/` is committed |
 | `src/lib/plugins/roomplan.ts` | Plugin registration, category → German name, fixture filter, packing factor, box volume, backend volume limits |
 | `src/lib/components/ItemSheet.svelte`, `Sheet.svelte` | Item add/edit bottom sheet; generic bottom sheet |
 | `scripts/ios-deployment-target.sh` | Raises the generated iOS project to 16.0 — run between `cap add ios` and `cap sync ios` |
